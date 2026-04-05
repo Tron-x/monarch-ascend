@@ -6,6 +6,7 @@
 
 | 日期 | torch | torch_npu | Monarch 分支 | 备注 |
 |------|-------|-----------|-------------|------|
+| 2026-04-05 | 2.9.0 | 2.8.0.post2 | ascend/actor-plan | 合并 origin/main v0.4.1（89 commits），torchmonarch 0.5.0.dev0 |
 | 2026-03-26 | 2.8.0 | 2.8.0.post2 | ascend/actor-plan | 合并 origin/main（98 commits），Rust toolchain → nightly-2026-01-18 |
 | 2026-03-xx | 2.9.0 | 2.9.0 | ascend/actor-plan | 初始 Ascend NPU 支持 |
 
