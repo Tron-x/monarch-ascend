@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use hyperactor::reference::ProcId;
+use hyperactor_mesh::introspect::NodeRef;
+
 /// Result of handling a key event.
 #[derive(Debug)]
 pub(crate) enum KeyResult {
@@ -16,11 +19,11 @@ pub(crate) enum KeyResult {
     /// A filter/view setting changed; full tree refresh needed.
     NeedsRefresh,
     /// Lazily expand the node at the given (reference, depth).
-    ExpandNode(String, usize),
+    ExpandNode(NodeRef, usize),
     /// Start the self-diagnostic suite against the attached mesh.
     RunDiagnostics,
-    /// Fetch a py-spy stack dump for the given proc reference.
-    RunPySpy(String),
-    /// Fetch the config dump for the given proc reference.
-    RunConfig(String),
+    /// Fetch a py-spy stack dump for the given proc.
+    RunPySpy(ProcId),
+    /// Fetch the config dump for the given proc.
+    RunConfig(ProcId),
 }

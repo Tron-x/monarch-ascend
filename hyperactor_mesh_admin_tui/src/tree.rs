@@ -8,12 +8,17 @@
 
 //! Invariants:
 //!
-//! - **TR-1 (fold-result-safety):** In `fold_tree` and
-//!   `fold_tree_with_depth`, `result` is only set when the
-//!   callback returns `Break`. This guarantees the `unwrap()`
-//!   on `result` after the loop is safe.
+//! - **TR-1 (fold-result-safety):** In `find_node_mut` and
+//!   `find_node_at_depth_mut`, `result` is only set when the
+//!   callback returns `Break`. This is verified by a
+//!   `debug_assert_eq!(result.is_some(), flow.is_break())` after
+//!   the fold completes. The raw pointer is valid for the input
+//!   lifetime because the fold visits each node exactly once and
+//!   we break immediately after capturing the pointer.
 
 use std::collections::HashSet;
+
+use hyperactor_mesh::introspect::NodeRef;
 
 use crate::model::FlatRow;
 use crate::model::TreeNode;
@@ -132,12 +137,12 @@ where
 #[allow(dead_code)] // used by tests
 pub(crate) fn find_node_mut<'a>(
     node: &'a mut TreeNode,
-    reference: &str,
+    reference: &NodeRef,
 ) -> Option<&'a mut TreeNode> {
     use std::ops::ControlFlow;
     let mut result: Option<*mut TreeNode> = None;
     let flow = fold_tree_mut(node, &mut |n| {
-        if n.reference == reference {
+        if &n.reference == reference {
             result = Some(n as *mut TreeNode);
             ControlFlow::Break(())
         } else {
@@ -166,7 +171,7 @@ pub(crate) fn find_node_mut<'a>(
 #[allow(dead_code)] // used by tests
 pub(crate) fn find_node_at_depth_mut<'a>(
     node: &'a mut TreeNode,
-    reference: &str,
+    reference: &NodeRef,
     target_depth: usize,
     current_depth: usize,
     found_count: &mut usize,
@@ -174,7 +179,7 @@ pub(crate) fn find_node_at_depth_mut<'a>(
     use std::ops::ControlFlow;
     let mut result: Option<*mut TreeNode> = None;
     let flow = fold_tree_mut_with_depth(node, current_depth, &mut |n, d| {
-        if n.reference == reference && d == target_depth {
+        if &n.reference == reference && d == target_depth {
             if *found_count == 0 {
                 result = Some(n as *mut TreeNode);
                 return ControlFlow::Break(());
@@ -200,7 +205,7 @@ pub(crate) fn find_node_at_depth_mut<'a>(
 /// root-children search pattern used by expand and collapse.
 pub(crate) fn find_at_depth_from_root_mut<'a>(
     root: &'a mut TreeNode,
-    reference: &str,
+    reference: &NodeRef,
     depth: usize,
 ) -> Option<&'a mut TreeNode> {
     let mut count = 0;
@@ -217,10 +222,10 @@ pub(crate) fn find_at_depth_from_root_mut<'a>(
 /// Traverses ALL nodes regardless of expanded state, used for cache
 /// pruning.
 /// Collect all references using algebraic fold.
-pub(crate) fn collect_refs<'a>(node: &'a TreeNode, out: &mut HashSet<&'a str>) {
-    let all_refs = fold_tree(node, &|n, child_results: Vec<HashSet<&'a str>>| {
+pub(crate) fn collect_refs<'a>(node: &'a TreeNode, out: &mut HashSet<&'a NodeRef>) {
+    let all_refs = fold_tree(node, &|n, child_results: Vec<HashSet<&'a NodeRef>>| {
         let mut refs = HashSet::new();
-        refs.insert(n.reference.as_str());
+        refs.insert(&n.reference);
         for child_set in child_results {
             refs.extend(child_set);
         }
@@ -237,10 +242,10 @@ pub(crate) fn collect_refs<'a>(node: &'a TreeNode, out: &mut HashSet<&'a str>) {
 pub(crate) fn collect_expanded_refs(
     node: &TreeNode,
     depth: usize,
-    out: &mut HashSet<(String, usize)>,
+    out: &mut HashSet<(NodeRef, usize)>,
 ) {
     let refs = fold_tree_with_depth(node, depth, &|n, d, child_results| {
-        let mut result: HashSet<(String, usize)> = child_results.into_iter().flatten().collect();
+        let mut result: HashSet<(NodeRef, usize)> = child_results.into_iter().flatten().collect();
         if n.expanded {
             result.insert((n.reference.clone(), d));
         }
@@ -257,10 +262,10 @@ pub(crate) fn collect_expanded_refs(
 pub(crate) fn collect_failed_refs(
     node: &TreeNode,
     depth: usize,
-    out: &mut HashSet<(String, usize)>,
+    out: &mut HashSet<(NodeRef, usize)>,
 ) {
     let refs = fold_tree_with_depth(node, depth, &|n, d, child_results| {
-        let mut result: HashSet<(String, usize)> = child_results.into_iter().flatten().collect();
+        let mut result: HashSet<(NodeRef, usize)> = child_results.into_iter().flatten().collect();
         if n.failed {
             result.insert((n.reference.clone(), d));
         }
@@ -281,14 +286,34 @@ pub(crate) fn collapse_all(node: &mut TreeNode) {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::str::FromStr;
 
     use super::*;
     use crate::model::NodeType;
 
+    fn root() -> NodeRef {
+        NodeRef::Root
+    }
+
+    fn host(name: &str) -> NodeRef {
+        let id_str = format!("unix:@test,world,{}[0]", name);
+        NodeRef::Host(hyperactor::reference::ActorId::from_str(&id_str).unwrap())
+    }
+
+    fn proc_ref(name: &str) -> NodeRef {
+        let id_str = format!("unix:@test,{}", name);
+        NodeRef::Proc(hyperactor::reference::ProcId::from_str(&id_str).unwrap())
+    }
+
+    fn actor(name: &str) -> NodeRef {
+        let id_str = format!("unix:@test,world,{}[0]", name);
+        NodeRef::Actor(hyperactor::reference::ActorId::from_str(&id_str).unwrap())
+    }
+
     // Helper to find a node by reference using algebraic fold.
-    fn find_node_by_ref<'a>(node: &'a TreeNode, reference: &str) -> Option<&'a TreeNode> {
+    fn find_node_by_ref<'a>(node: &'a TreeNode, reference: &NodeRef) -> Option<&'a TreeNode> {
         fold_tree(node, &|n, child_results| {
-            if n.reference == reference {
+            if &n.reference == reference {
                 Some(n)
             } else {
                 child_results.into_iter().find_map(|x| x)
@@ -299,7 +324,7 @@ mod tests {
     #[test]
     fn flatten_collapsed_node_hides_children() {
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -309,7 +334,7 @@ mod tests {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: "host1".into(),
+                reference: host("host1"),
                 label: "Host 1".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -319,7 +344,7 @@ mod tests {
                 failed: false,
                 is_system: false,
                 children: vec![TreeNode {
-                    reference: "proc1".into(),
+                    reference: proc_ref("proc1"),
                     label: "Proc 1".into(),
                     node_type: NodeType::Proc,
                     expanded: false,
@@ -334,14 +359,14 @@ mod tests {
         };
         let rows = flatten_tree(&tree);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].node.reference, "host1");
+        assert_eq!(rows[0].node.reference, host("host1"));
         assert_eq!(rows[0].depth, 0);
     }
 
     #[test]
     fn flatten_expanded_node_shows_children() {
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -351,7 +376,7 @@ mod tests {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: "host1".into(),
+                reference: host("host1"),
                 label: "Host 1".into(),
                 node_type: NodeType::Host,
                 expanded: true,
@@ -361,7 +386,7 @@ mod tests {
                 failed: false,
                 is_system: false,
                 children: vec![TreeNode {
-                    reference: "proc1".into(),
+                    reference: proc_ref("proc1"),
                     label: "Proc 1".into(),
                     node_type: NodeType::Proc,
                     expanded: false,
@@ -376,16 +401,16 @@ mod tests {
         };
         let rows = flatten_tree(&tree);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].node.reference, "host1");
+        assert_eq!(rows[0].node.reference, host("host1"));
         assert_eq!(rows[0].depth, 0);
-        assert_eq!(rows[1].node.reference, "proc1");
+        assert_eq!(rows[1].node.reference, proc_ref("proc1"));
         assert_eq!(rows[1].depth, 1);
     }
 
     #[test]
     fn find_node_by_reference_works() {
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -395,7 +420,7 @@ mod tests {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: "child1".into(),
+                reference: actor("child1"),
                 label: "Child 1".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -407,15 +432,15 @@ mod tests {
                 children: vec![],
             }],
         };
-        let found = find_node_by_ref(&tree, "child1");
+        let found = find_node_by_ref(&tree, &actor("child1"));
         assert!(found.is_some());
-        assert_eq!(found.unwrap().reference, "child1");
+        assert_eq!(found.unwrap().reference, actor("child1"));
     }
 
     #[test]
     fn find_node_mut_works() {
         let mut tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -425,7 +450,7 @@ mod tests {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: "child1".into(),
+                reference: actor("child1"),
                 label: "Child 1".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -437,7 +462,7 @@ mod tests {
                 children: vec![],
             }],
         };
-        let found = find_node_mut(&mut tree, "child1");
+        let found = find_node_mut(&mut tree, &actor("child1"));
         assert!(found.is_some());
         found.unwrap().expanded = true;
         assert!(tree.children[0].expanded);
@@ -446,7 +471,7 @@ mod tests {
     #[test]
     fn collect_refs_visits_all_nodes() {
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -456,7 +481,7 @@ mod tests {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: "host1".into(),
+                reference: host("host1"),
                 label: "Host 1".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -466,7 +491,7 @@ mod tests {
                 failed: false,
                 is_system: false,
                 children: vec![TreeNode {
-                    reference: "proc1".into(),
+                    reference: proc_ref("proc1"),
                     label: "Proc 1".into(),
                     node_type: NodeType::Proc,
                     expanded: false,
@@ -482,15 +507,15 @@ mod tests {
         let mut refs = HashSet::new();
         collect_refs(&tree, &mut refs);
         assert_eq!(refs.len(), 3);
-        assert!(refs.contains("root"));
-        assert!(refs.contains("host1"));
-        assert!(refs.contains("proc1"));
+        assert!(refs.contains(&root()));
+        assert!(refs.contains(&host("host1")));
+        assert!(refs.contains(&proc_ref("proc1")));
     }
 
     #[test]
     fn dual_appearances_flatten_correctly() {
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -501,7 +526,7 @@ mod tests {
             is_system: false,
             children: vec![
                 TreeNode {
-                    reference: "proc1".into(),
+                    reference: proc_ref("proc1"),
                     label: "Proc 1".into(),
                     node_type: NodeType::Proc,
                     expanded: true,
@@ -511,7 +536,7 @@ mod tests {
                     failed: false,
                     is_system: false,
                     children: vec![TreeNode {
-                        reference: "actor1".into(),
+                        reference: actor("actor1"),
                         label: "Actor 1".into(),
                         node_type: NodeType::Actor,
                         expanded: false,
@@ -524,7 +549,7 @@ mod tests {
                     }],
                 },
                 TreeNode {
-                    reference: "actor1".into(),
+                    reference: actor("actor1"),
                     label: "Actor 1".into(),
                     node_type: NodeType::Actor,
                     expanded: false,
@@ -539,18 +564,18 @@ mod tests {
         };
         let rows = flatten_tree(&tree);
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].node.reference, "proc1");
+        assert_eq!(rows[0].node.reference, proc_ref("proc1"));
         assert_eq!(rows[0].depth, 0);
-        assert_eq!(rows[1].node.reference, "actor1");
+        assert_eq!(rows[1].node.reference, actor("actor1"));
         assert_eq!(rows[1].depth, 1);
-        assert_eq!(rows[2].node.reference, "actor1");
+        assert_eq!(rows[2].node.reference, actor("actor1"));
         assert_eq!(rows[2].depth, 0);
     }
 
     #[test]
     fn expansion_tracking_uses_depth_pairs() {
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -561,7 +586,7 @@ mod tests {
             is_system: false,
             children: vec![
                 TreeNode {
-                    reference: "proc1".into(),
+                    reference: proc_ref("proc1"),
                     label: "Proc 1".into(),
                     node_type: NodeType::Proc,
                     expanded: true,
@@ -571,7 +596,7 @@ mod tests {
                     failed: false,
                     is_system: false,
                     children: vec![TreeNode {
-                        reference: "actor1".into(),
+                        reference: actor("actor1"),
                         label: "Actor 1".into(),
                         node_type: NodeType::Actor,
                         expanded: true,
@@ -584,7 +609,7 @@ mod tests {
                     }],
                 },
                 TreeNode {
-                    reference: "actor1".into(),
+                    reference: actor("actor1"),
                     label: "Actor 1".into(),
                     node_type: NodeType::Actor,
                     expanded: false,
@@ -601,15 +626,15 @@ mod tests {
         for child in &tree.children {
             collect_expanded_refs(child, 0, &mut expanded_keys);
         }
-        assert!(expanded_keys.contains(&("proc1".to_string(), 0)));
-        assert!(expanded_keys.contains(&("actor1".to_string(), 1)));
-        assert!(!expanded_keys.contains(&("actor1".to_string(), 0)));
+        assert!(expanded_keys.contains(&(proc_ref("proc1"), 0)));
+        assert!(expanded_keys.contains(&(actor("actor1"), 1)));
+        assert!(!expanded_keys.contains(&(actor("actor1"), 0)));
     }
 
     #[test]
     fn find_node_at_depth_distinguishes_instances() {
         let mut tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -620,7 +645,7 @@ mod tests {
             is_system: false,
             children: vec![
                 TreeNode {
-                    reference: "proc1".into(),
+                    reference: proc_ref("proc1"),
                     label: "Proc 1".into(),
                     node_type: NodeType::Proc,
                     expanded: true,
@@ -630,7 +655,7 @@ mod tests {
                     failed: false,
                     is_system: false,
                     children: vec![TreeNode {
-                        reference: "actor1".into(),
+                        reference: actor("actor1"),
                         label: "Actor 1 in supervision".into(),
                         node_type: NodeType::Actor,
                         expanded: true,
@@ -643,7 +668,7 @@ mod tests {
                     }],
                 },
                 TreeNode {
-                    reference: "actor1".into(),
+                    reference: actor("actor1"),
                     label: "Actor 1 in flat list".into(),
                     node_type: NodeType::Actor,
                     expanded: false,
@@ -660,14 +685,14 @@ mod tests {
         let found_depth_1 = tree
             .children
             .iter_mut()
-            .find_map(|child| find_node_at_depth_mut(child, "actor1", 1, 0, &mut count));
+            .find_map(|child| find_node_at_depth_mut(child, &actor("actor1"), 1, 0, &mut count));
         assert!(found_depth_1.is_some());
         assert_eq!(found_depth_1.unwrap().label, "Actor 1 in supervision");
         let mut count = 0;
         let found_depth_0 = tree
             .children
             .iter_mut()
-            .find_map(|child| find_node_at_depth_mut(child, "actor1", 0, 0, &mut count));
+            .find_map(|child| find_node_at_depth_mut(child, &actor("actor1"), 0, 0, &mut count));
         assert!(found_depth_0.is_some());
         assert_eq!(found_depth_0.unwrap().label, "Actor 1 in flat list");
     }
@@ -675,7 +700,7 @@ mod tests {
     #[test]
     fn collapsed_nodes_stay_collapsed_after_refresh() {
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -685,7 +710,7 @@ mod tests {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: "proc1".into(),
+                reference: proc_ref("proc1"),
                 label: "Proc 1".into(),
                 node_type: NodeType::Proc,
                 expanded: false,
@@ -695,7 +720,7 @@ mod tests {
                 failed: false,
                 is_system: false,
                 children: vec![TreeNode {
-                    reference: "actor1".into(),
+                    reference: actor("actor1"),
                     label: "Actor 1".into(),
                     node_type: NodeType::Actor,
                     expanded: false,
@@ -712,14 +737,14 @@ mod tests {
         for child in &tree.children {
             collect_expanded_refs(child, 0, &mut expanded_keys);
         }
-        assert!(!expanded_keys.contains(&("proc1".to_string(), 0)));
-        assert!(!expanded_keys.contains(&("actor1".to_string(), 1)));
+        assert!(!expanded_keys.contains(&(proc_ref("proc1"), 0)));
+        assert!(!expanded_keys.contains(&(actor("actor1"), 1)));
     }
 
     #[test]
     fn fold_equivalence_flatten_tree() {
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -730,7 +755,7 @@ mod tests {
             is_system: false,
             children: vec![
                 TreeNode {
-                    reference: "host1".into(),
+                    reference: host("host1"),
                     label: "Host 1".into(),
                     node_type: NodeType::Host,
                     expanded: true,
@@ -740,7 +765,7 @@ mod tests {
                     failed: false,
                     is_system: false,
                     children: vec![TreeNode {
-                        reference: "proc1".into(),
+                        reference: proc_ref("proc1"),
                         label: "Proc 1".into(),
                         node_type: NodeType::Proc,
                         expanded: false,
@@ -750,7 +775,7 @@ mod tests {
                         failed: false,
                         is_system: false,
                         children: vec![TreeNode {
-                            reference: "actor1".into(),
+                            reference: actor("actor1"),
                             label: "Actor 1".into(),
                             node_type: NodeType::Actor,
                             expanded: false,
@@ -764,7 +789,7 @@ mod tests {
                     }],
                 },
                 TreeNode {
-                    reference: "host2".into(),
+                    reference: host("host2"),
                     label: "Host 2".into(),
                     node_type: NodeType::Host,
                     expanded: false,
@@ -779,18 +804,18 @@ mod tests {
         };
         let rows = flatten_tree(&tree);
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].node.reference, "host1");
+        assert_eq!(rows[0].node.reference, host("host1"));
         assert_eq!(rows[0].depth, 0);
-        assert_eq!(rows[1].node.reference, "proc1");
+        assert_eq!(rows[1].node.reference, proc_ref("proc1"));
         assert_eq!(rows[1].depth, 1);
-        assert_eq!(rows[2].node.reference, "host2");
+        assert_eq!(rows[2].node.reference, host("host2"));
         assert_eq!(rows[2].depth, 0);
     }
 
     #[test]
     fn fold_tree_mut_early_exit_stops_traversal() {
         let mut tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -801,7 +826,7 @@ mod tests {
             is_system: false,
             children: vec![
                 TreeNode {
-                    reference: "child1".into(),
+                    reference: actor("child1"),
                     label: "Child 1".into(),
                     node_type: NodeType::Host,
                     expanded: true,
@@ -811,7 +836,7 @@ mod tests {
                     failed: false,
                     is_system: false,
                     children: vec![TreeNode {
-                        reference: "target".into(),
+                        reference: actor("target"),
                         label: "Target".into(),
                         node_type: NodeType::Proc,
                         expanded: true,
@@ -824,7 +849,7 @@ mod tests {
                     }],
                 },
                 TreeNode {
-                    reference: "child2".into(),
+                    reference: actor("child2"),
                     label: "Child 2".into(),
                     node_type: NodeType::Host,
                     expanded: true,
@@ -834,7 +859,7 @@ mod tests {
                     failed: false,
                     is_system: false,
                     children: vec![TreeNode {
-                        reference: "should_not_visit".into(),
+                        reference: actor("should_not_visit"),
                         label: "Should Not Visit".into(),
                         node_type: NodeType::Proc,
                         expanded: true,
@@ -852,21 +877,21 @@ mod tests {
         let mut visited = Vec::new();
         let result = fold_tree_mut_with_depth(&mut tree, 0, &mut |n, _d| {
             visited.push(n.reference.clone());
-            if n.reference == "target" {
+            if n.reference == actor("target") {
                 ControlFlow::Break(())
             } else {
                 ControlFlow::Continue(())
             }
         });
         assert!(result.is_break());
-        assert_eq!(visited, vec!["root", "child1", "target"]);
-        assert!(!visited.contains(&"should_not_visit".to_string()));
+        assert_eq!(visited, vec![root(), actor("child1"), actor("target")]);
+        assert!(!visited.contains(&actor("should_not_visit")));
     }
 
     #[test]
     fn selection_restore_prefers_depth_match() {
         let mut tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -876,7 +901,7 @@ mod tests {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: "duplicate".into(),
+                reference: actor("duplicate"),
                 label: "Duplicate at depth 0".into(),
                 node_type: NodeType::Host,
                 expanded: true,
@@ -886,7 +911,7 @@ mod tests {
                 failed: false,
                 is_system: false,
                 children: vec![TreeNode {
-                    reference: "duplicate".into(),
+                    reference: actor("duplicate"),
                     label: "Duplicate at depth 1".into(),
                     node_type: NodeType::Proc,
                     expanded: true,
@@ -903,14 +928,14 @@ mod tests {
         let found_d0 = tree
             .children
             .iter_mut()
-            .find_map(|child| find_node_at_depth_mut(child, "duplicate", 0, 0, &mut count));
+            .find_map(|child| find_node_at_depth_mut(child, &actor("duplicate"), 0, 0, &mut count));
         assert!(found_d0.is_some());
         assert_eq!(found_d0.unwrap().label, "Duplicate at depth 0");
         let mut count = 0;
         let found_d1 = tree
             .children
             .iter_mut()
-            .find_map(|child| find_node_at_depth_mut(child, "duplicate", 1, 0, &mut count));
+            .find_map(|child| find_node_at_depth_mut(child, &actor("duplicate"), 1, 0, &mut count));
         assert!(found_d1.is_some());
         assert_eq!(found_d1.unwrap().label, "Duplicate at depth 1");
     }
@@ -918,7 +943,7 @@ mod tests {
     #[test]
     fn fold_vs_traversal_law_node_count() {
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -929,7 +954,7 @@ mod tests {
             is_system: false,
             children: vec![
                 TreeNode {
-                    reference: "host1".into(),
+                    reference: host("host1"),
                     label: "Host 1".into(),
                     node_type: NodeType::Host,
                     expanded: true,
@@ -939,7 +964,7 @@ mod tests {
                     failed: false,
                     is_system: false,
                     children: vec![TreeNode {
-                        reference: "proc1".into(),
+                        reference: proc_ref("proc1"),
                         label: "Proc 1".into(),
                         node_type: NodeType::Proc,
                         expanded: true,
@@ -952,7 +977,7 @@ mod tests {
                     }],
                 },
                 TreeNode {
-                    reference: "host2".into(),
+                    reference: host("host2"),
                     label: "Host 2".into(),
                     node_type: NodeType::Host,
                     expanded: true,
@@ -975,7 +1000,7 @@ mod tests {
     #[test]
     fn collapse_idempotence() {
         let mut tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -985,7 +1010,7 @@ mod tests {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: "child".into(),
+                reference: actor("child"),
                 label: "Child".into(),
                 node_type: NodeType::Host,
                 expanded: true,
@@ -1011,7 +1036,7 @@ mod tests {
     #[test]
     fn placeholder_refinement_transitions_fetched_state() {
         let mut tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1021,7 +1046,7 @@ mod tests {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: "placeholder".into(),
+                reference: actor("placeholder"),
                 label: "Loading...".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -1035,11 +1060,11 @@ mod tests {
         };
         use std::ops::ControlFlow;
         let _ = fold_tree_mut(&mut tree, &mut |n| {
-            if n.reference == "placeholder" && !n.fetched {
+            if n.reference == actor("placeholder") && !n.fetched {
                 n.fetched = true;
                 n.has_children = true;
                 n.children = vec![TreeNode {
-                    reference: "child".into(),
+                    reference: actor("child"),
                     label: "Child".into(),
                     node_type: NodeType::Proc,
                     expanded: false,
@@ -1055,20 +1080,20 @@ mod tests {
                 ControlFlow::Continue(())
             }
         });
-        let placeholder = find_node_by_ref(&tree, "placeholder");
+        let placeholder = find_node_by_ref(&tree, &actor("placeholder"));
         assert!(placeholder.is_some());
         let placeholder = placeholder.unwrap();
         assert!(placeholder.fetched);
         assert_eq!(placeholder.children.len(), 1);
         let initial_children = placeholder.children.len();
-        let _ = find_node_by_ref(&tree, "placeholder");
+        let _ = find_node_by_ref(&tree, &actor("placeholder"));
         assert_eq!(initial_children, 1);
     }
 
     #[test]
     fn cycle_guard_prevents_infinite_recursion() {
         let mut tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1078,7 +1103,7 @@ mod tests {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: "root".into(),
+                reference: root(),
                 label: "Self-reference".into(),
                 node_type: NodeType::Host,
                 expanded: true,
@@ -1110,7 +1135,7 @@ mod tests {
     #[test]
     fn fold_tree_mut_visits_in_preorder() {
         let mut tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1121,7 +1146,7 @@ mod tests {
             is_system: false,
             children: vec![
                 TreeNode {
-                    reference: "child1".into(),
+                    reference: actor("child1"),
                     label: "Child 1".into(),
                     node_type: NodeType::Host,
                     expanded: true,
@@ -1131,7 +1156,7 @@ mod tests {
                     failed: false,
                     is_system: false,
                     children: vec![TreeNode {
-                        reference: "grandchild1".into(),
+                        reference: actor("grandchild1"),
                         label: "Grandchild 1".into(),
                         node_type: NodeType::Proc,
                         expanded: false,
@@ -1144,7 +1169,7 @@ mod tests {
                     }],
                 },
                 TreeNode {
-                    reference: "child2".into(),
+                    reference: actor("child2"),
                     label: "Child 2".into(),
                     node_type: NodeType::Host,
                     expanded: false,
@@ -1166,10 +1191,10 @@ mod tests {
         assert_eq!(
             visit_order,
             vec![
-                ("root".to_string(), 0),
-                ("child1".to_string(), 1),
-                ("grandchild1".to_string(), 2),
-                ("child2".to_string(), 1),
+                (root(), 0),
+                (actor("child1"), 1),
+                (actor("grandchild1"), 2),
+                (actor("child2"), 1),
             ]
         );
     }
@@ -1177,7 +1202,7 @@ mod tests {
     #[test]
     fn fold_tree_with_depth_deterministic_preorder() {
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1188,7 +1213,7 @@ mod tests {
             is_system: false,
             children: vec![
                 TreeNode {
-                    reference: "a".into(),
+                    reference: actor("a"),
                     label: "A".into(),
                     node_type: NodeType::Host,
                     expanded: true,
@@ -1198,7 +1223,7 @@ mod tests {
                     failed: false,
                     is_system: false,
                     children: vec![TreeNode {
-                        reference: "a1".into(),
+                        reference: actor("a1"),
                         label: "A1".into(),
                         node_type: NodeType::Proc,
                         expanded: false,
@@ -1211,7 +1236,7 @@ mod tests {
                     }],
                 },
                 TreeNode {
-                    reference: "b".into(),
+                    reference: actor("b"),
                     label: "B".into(),
                     node_type: NodeType::Host,
                     expanded: false,
@@ -1227,7 +1252,7 @@ mod tests {
         let visit_order = fold_tree_with_depth(&tree, 0, &|n,
                                                            d,
                                                            child_orders: Vec<
-            Vec<(String, usize)>,
+            Vec<(NodeRef, usize)>,
         >| {
             let mut order = vec![(n.reference.clone(), d)];
             for child_order in child_orders {
@@ -1238,10 +1263,10 @@ mod tests {
         assert_eq!(
             visit_order,
             vec![
-                ("root".to_string(), 0),
-                ("a".to_string(), 1),
-                ("a1".to_string(), 2),
-                ("b".to_string(), 1),
+                (root(), 0),
+                (actor("a"), 1),
+                (actor("a1"), 2),
+                (actor("b"), 1),
             ]
         );
     }
@@ -1249,7 +1274,7 @@ mod tests {
     #[test]
     fn cycle_vs_duplicate_reference_allowed() {
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1260,7 +1285,7 @@ mod tests {
             is_system: false,
             children: vec![
                 TreeNode {
-                    reference: "branch_a".into(),
+                    reference: actor("branch_a"),
                     label: "Branch A".into(),
                     node_type: NodeType::Host,
                     expanded: true,
@@ -1270,7 +1295,7 @@ mod tests {
                     failed: false,
                     is_system: false,
                     children: vec![TreeNode {
-                        reference: "duplicate".into(),
+                        reference: actor("duplicate"),
                         label: "Duplicate in A".into(),
                         node_type: NodeType::Proc,
                         expanded: false,
@@ -1283,7 +1308,7 @@ mod tests {
                     }],
                 },
                 TreeNode {
-                    reference: "branch_b".into(),
+                    reference: actor("branch_b"),
                     label: "Branch B".into(),
                     node_type: NodeType::Host,
                     expanded: true,
@@ -1293,7 +1318,7 @@ mod tests {
                     failed: false,
                     is_system: false,
                     children: vec![TreeNode {
-                        reference: "duplicate".into(),
+                        reference: actor("duplicate"),
                         label: "Duplicate in B".into(),
                         node_type: NodeType::Proc,
                         expanded: false,
@@ -1314,7 +1339,7 @@ mod tests {
         let rows = flatten_tree(&tree);
         let duplicate_count = rows
             .iter()
-            .filter(|r| r.node.reference == "duplicate")
+            .filter(|r| r.node.reference == actor("duplicate"))
             .count();
         assert_eq!(duplicate_count, 2);
     }
@@ -1322,7 +1347,7 @@ mod tests {
     #[test]
     fn single_node_tree_expand_collapse() {
         let mut tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1332,7 +1357,7 @@ mod tests {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: "only_child".into(),
+                reference: actor("only_child"),
                 label: "Only Child".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -1346,8 +1371,8 @@ mod tests {
         };
         let rows = flatten_tree(&tree);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].node.reference, "only_child");
-        let child = find_node_mut(&mut tree, "only_child");
+        assert_eq!(rows[0].node.reference, actor("only_child"));
+        let child = find_node_mut(&mut tree, &actor("only_child"));
         assert!(child.is_some());
         let child = child.unwrap();
         assert!(!child.has_children);
@@ -1360,7 +1385,7 @@ mod tests {
     #[test]
     fn placeholder_with_has_children_true_awaits_fetch() {
         let mut tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1370,7 +1395,7 @@ mod tests {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: "placeholder".into(),
+                reference: actor("placeholder"),
                 label: "Loading...".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -1384,8 +1409,8 @@ mod tests {
         };
         let rows = flatten_tree(&tree);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].node.reference, "placeholder");
-        let placeholder = find_node_mut(&mut tree, "placeholder");
+        assert_eq!(rows[0].node.reference, actor("placeholder"));
+        let placeholder = find_node_mut(&mut tree, &actor("placeholder"));
         assert!(placeholder.is_some());
         let placeholder = placeholder.unwrap();
         assert!(placeholder.has_children);
@@ -1393,7 +1418,7 @@ mod tests {
         assert_eq!(placeholder.children.len(), 0);
         use std::ops::ControlFlow;
         let _ = fold_tree_mut(&mut tree, &mut |n| {
-            if n.reference == "placeholder" && !n.expanded {
+            if n.reference == actor("placeholder") && !n.expanded {
                 assert!(!n.expanded);
                 ControlFlow::Break(())
             } else {
@@ -1405,7 +1430,7 @@ mod tests {
     #[test]
     fn placeholder_noop_when_has_children_false() {
         let mut tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1415,7 +1440,7 @@ mod tests {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: "leaf".into(),
+                reference: actor("leaf"),
                 label: "Leaf Node".into(),
                 node_type: NodeType::Actor,
                 expanded: false,
@@ -1429,13 +1454,13 @@ mod tests {
         };
         use std::ops::ControlFlow;
         let _ = fold_tree_mut(&mut tree, &mut |n| {
-            if n.reference == "leaf" && !n.has_children {
+            if n.reference == actor("leaf") && !n.has_children {
                 assert_eq!(n.children.len(), 0);
                 assert!(!n.expanded);
             }
             ControlFlow::<()>::Continue(())
         });
-        let leaf = find_node_by_ref(&tree, "leaf");
+        let leaf = find_node_by_ref(&tree, &actor("leaf"));
         assert!(leaf.is_some());
         let leaf = leaf.unwrap();
         assert!(!leaf.expanded);
@@ -1446,7 +1471,7 @@ mod tests {
     #[test]
     fn expanded_node_with_empty_children_renders_safely() {
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1456,7 +1481,7 @@ mod tests {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: "empty_parent".into(),
+                reference: actor("empty_parent"),
                 label: "Empty Parent".into(),
                 node_type: NodeType::Host,
                 expanded: true,
@@ -1470,7 +1495,7 @@ mod tests {
         };
         let rows = flatten_tree(&tree);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].node.reference, "empty_parent");
+        assert_eq!(rows[0].node.reference, actor("empty_parent"));
         let count = fold_tree(&tree, &|_n, child_counts: Vec<usize>| {
             1 + child_counts.iter().sum::<usize>()
         });
@@ -1480,7 +1505,7 @@ mod tests {
     #[test]
     fn duplicate_references_expansion_targets_specific_instance() {
         let mut tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1491,7 +1516,7 @@ mod tests {
             is_system: false,
             children: vec![
                 TreeNode {
-                    reference: "duplicate".into(),
+                    reference: actor("duplicate"),
                     label: "Duplicate at 0".into(),
                     node_type: NodeType::Host,
                     expanded: false,
@@ -1501,7 +1526,7 @@ mod tests {
                     failed: false,
                     is_system: false,
                     children: vec![TreeNode {
-                        reference: "child_of_first".into(),
+                        reference: actor("child_of_first"),
                         label: "Child of First".into(),
                         node_type: NodeType::Proc,
                         expanded: false,
@@ -1514,7 +1539,7 @@ mod tests {
                     }],
                 },
                 TreeNode {
-                    reference: "duplicate".into(),
+                    reference: actor("duplicate"),
                     label: "Duplicate at 0 (second)".into(),
                     node_type: NodeType::Host,
                     expanded: false,
@@ -1524,7 +1549,7 @@ mod tests {
                     failed: false,
                     is_system: false,
                     children: vec![TreeNode {
-                        reference: "child_of_second".into(),
+                        reference: actor("child_of_second"),
                         label: "Child of Second".into(),
                         node_type: NodeType::Proc,
                         expanded: false,
@@ -1542,15 +1567,15 @@ mod tests {
         let first = tree
             .children
             .iter_mut()
-            .find_map(|child| find_node_at_depth_mut(child, "duplicate", 0, 0, &mut count));
+            .find_map(|child| find_node_at_depth_mut(child, &actor("duplicate"), 0, 0, &mut count));
         assert!(first.is_some());
         first.unwrap().expanded = true;
         assert!(tree.children[0].expanded);
         assert!(!tree.children[1].expanded);
         let rows = flatten_tree(&tree);
-        let refs: Vec<_> = rows.iter().map(|r| r.node.reference.as_str()).collect();
-        assert!(refs.contains(&"child_of_first"));
-        assert!(!refs.contains(&"child_of_second"));
+        let refs: Vec<_> = rows.iter().map(|r| &r.node.reference).collect();
+        assert!(refs.contains(&&actor("child_of_first")));
+        assert!(!refs.contains(&&actor("child_of_second")));
     }
 
     // Stopped nodes visible in flatten
@@ -1559,7 +1584,7 @@ mod tests {
         let tree = make_proc_with_stopped_children();
         let rows = flatten_tree(&tree);
         assert_eq!(rows.len(), 4);
-        assert!(rows.iter().any(|r| r.node.reference == "dead_actor"));
+        assert!(rows.iter().any(|r| r.node.reference == actor("dead_actor")));
     }
 
     #[test]
@@ -1568,12 +1593,12 @@ mod tests {
         let rows = flatten_tree(&tree);
         let dead = rows
             .iter()
-            .find(|r| r.node.reference == "dead_actor")
+            .find(|r| r.node.reference == actor("dead_actor"))
             .unwrap();
         assert!(dead.node.stopped);
         let live = rows
             .iter()
-            .find(|r| r.node.reference == "live_actor_1")
+            .find(|r| r.node.reference == actor("live_actor_1"))
             .unwrap();
         assert!(!live.node.stopped);
     }
@@ -1581,7 +1606,7 @@ mod tests {
     #[test]
     fn placeholder_stopped_visible_in_flatten() {
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1590,7 +1615,7 @@ mod tests {
             stopped: false,
             failed: false,
             is_system: false,
-            children: vec![TreeNode::placeholder_stopped("dead1".to_string())],
+            children: vec![TreeNode::placeholder_stopped(actor("dead1"))],
         };
         let rows = flatten_tree(&tree);
         assert_eq!(rows.len(), 1);
@@ -1601,7 +1626,7 @@ mod tests {
     // Helper for stopped-children tests
     fn make_proc_with_stopped_children() -> TreeNode {
         TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1611,7 +1636,7 @@ mod tests {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: "proc1".into(),
+                reference: proc_ref("proc1"),
                 label: "proc1".into(),
                 node_type: NodeType::Proc,
                 expanded: true,
@@ -1622,7 +1647,7 @@ mod tests {
                 is_system: false,
                 children: vec![
                     TreeNode {
-                        reference: "live_actor_1".into(),
+                        reference: actor("live_actor_1"),
                         label: "live_actor_1".into(),
                         node_type: NodeType::Actor,
                         expanded: false,
@@ -1634,7 +1659,7 @@ mod tests {
                         children: vec![],
                     },
                     TreeNode {
-                        reference: "live_actor_2".into(),
+                        reference: actor("live_actor_2"),
                         label: "live_actor_2".into(),
                         node_type: NodeType::Actor,
                         expanded: false,
@@ -1646,7 +1671,7 @@ mod tests {
                         children: vec![],
                     },
                     TreeNode {
-                        reference: "dead_actor".into(),
+                        reference: actor("dead_actor"),
                         label: "dead_actor".into(),
                         node_type: NodeType::Actor,
                         expanded: false,
@@ -1670,7 +1695,7 @@ mod tests {
             let mut children = Vec::new();
             for i in 0..scale {
                 children.push(TreeNode {
-                    reference: format!("node_{}", i),
+                    reference: actor(&format!("node_{}", i)),
                     label: format!("Node {}", i),
                     node_type: NodeType::Actor,
                     expanded: false,
@@ -1683,7 +1708,7 @@ mod tests {
                 });
             }
             let tree = TreeNode {
-                reference: "root".into(),
+                reference: root(),
                 label: "Root".into(),
                 node_type: NodeType::Root,
                 expanded: true,
@@ -1706,7 +1731,7 @@ mod tests {
     #[test]
     fn deep_chain_vs_wide_fanout_performance() {
         let mut deep = TreeNode {
-            reference: "deep_root".into(),
+            reference: actor("deep_root"),
             label: "Deep Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1720,7 +1745,7 @@ mod tests {
         let mut current = &mut deep;
         for i in 0..499 {
             current.children.push(TreeNode {
-                reference: format!("deep_{}", i),
+                reference: actor(&format!("deep_{}", i)),
                 label: format!("Deep {}", i),
                 node_type: NodeType::Host,
                 expanded: true,
@@ -1736,7 +1761,7 @@ mod tests {
         let mut wide_children = Vec::new();
         for i in 0..500 {
             wide_children.push(TreeNode {
-                reference: format!("wide_{}", i),
+                reference: actor(&format!("wide_{}", i)),
                 label: format!("Wide {}", i),
                 node_type: NodeType::Actor,
                 expanded: false,
@@ -1749,7 +1774,7 @@ mod tests {
             });
         }
         let wide = TreeNode {
-            reference: "wide_root".into(),
+            reference: actor("wide_root"),
             label: "Wide Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1773,7 +1798,7 @@ mod tests {
         let mut children = Vec::new();
         for i in 0..1000 {
             children.push(TreeNode {
-                reference: format!("node_{}", i),
+                reference: actor(&format!("node_{}", i)),
                 label: format!("Node {}", i),
                 node_type: NodeType::Actor,
                 expanded: false,
@@ -1786,7 +1811,7 @@ mod tests {
             });
         }
         let mut tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1818,7 +1843,7 @@ mod tests {
             let mut grandchildren = Vec::new();
             for j in 0..100 {
                 grandchildren.push(TreeNode {
-                    reference: format!("child_{}_{}", i, j),
+                    reference: actor(&format!("child_{}_{}", i, j)),
                     label: format!("Child {} {}", i, j),
                     node_type: NodeType::Actor,
                     expanded: false,
@@ -1831,7 +1856,7 @@ mod tests {
                 });
             }
             children.push(TreeNode {
-                reference: format!("parent_{}", i),
+                reference: actor(&format!("parent_{}", i)),
                 label: format!("Parent {}", i),
                 node_type: NodeType::Proc,
                 expanded: false,
@@ -1844,7 +1869,7 @@ mod tests {
             });
         }
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1864,7 +1889,7 @@ mod tests {
         let mut children = Vec::new();
         for depth in 0..100 {
             let mut node = TreeNode {
-                reference: "dup".into(),
+                reference: actor("dup"),
                 label: format!("Dup at depth {}", depth),
                 node_type: NodeType::Actor,
                 expanded: false,
@@ -1877,7 +1902,7 @@ mod tests {
             };
             for i in (0..depth).rev() {
                 node = TreeNode {
-                    reference: format!("wrapper_{}", i),
+                    reference: actor(&format!("wrapper_{}", i)),
                     label: format!("Wrapper {}", i),
                     node_type: NodeType::Host,
                     expanded: true,
@@ -1892,7 +1917,7 @@ mod tests {
             children.push(node);
         }
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1911,7 +1936,7 @@ mod tests {
     #[test]
     fn memory_stable_across_repeated_operations() {
         let mut tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1921,7 +1946,7 @@ mod tests {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: "child".into(),
+                reference: actor("child"),
                 label: "Child".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -1946,7 +1971,7 @@ mod tests {
         let mut children = Vec::new();
         for i in 0..1000 {
             children.push(TreeNode {
-                reference: format!("node_{}", i),
+                reference: actor(&format!("node_{}", i)),
                 label: format!("Node {}", i),
                 node_type: NodeType::Actor,
                 expanded: false,
@@ -1959,7 +1984,7 @@ mod tests {
             });
         }
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1983,7 +2008,7 @@ mod tests {
     fn failed_tracking_uses_depth_pairs() {
         // Mirrors expansion_tracking_uses_depth_pairs but for failed state.
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1994,7 +2019,7 @@ mod tests {
             is_system: false,
             children: vec![
                 TreeNode {
-                    reference: "proc1".into(),
+                    reference: proc_ref("proc1"),
                     label: "Proc 1".into(),
                     node_type: NodeType::Proc,
                     expanded: true,
@@ -2004,7 +2029,7 @@ mod tests {
                     failed: true, // failed proc
                     is_system: false,
                     children: vec![TreeNode {
-                        reference: "actor1".into(),
+                        reference: actor("actor1"),
                         label: "Actor 1".into(),
                         node_type: NodeType::Actor,
                         expanded: false,
@@ -2017,7 +2042,7 @@ mod tests {
                     }],
                 },
                 TreeNode {
-                    reference: "actor1".into(),
+                    reference: actor("actor1"),
                     label: "Actor 1 (flat)".into(),
                     node_type: NodeType::Actor,
                     expanded: false,
@@ -2035,11 +2060,11 @@ mod tests {
             collect_failed_refs(child, 0, &mut failed_keys);
         }
         // proc1 at depth 0 is failed.
-        assert!(failed_keys.contains(&("proc1".to_string(), 0)));
+        assert!(failed_keys.contains(&(proc_ref("proc1"), 0)));
         // actor1 at depth 1 (under proc1) is failed.
-        assert!(failed_keys.contains(&("actor1".to_string(), 1)));
+        assert!(failed_keys.contains(&(actor("actor1"), 1)));
         // actor1 at depth 0 (flat list) is NOT failed.
-        assert!(!failed_keys.contains(&("actor1".to_string(), 0)));
+        assert!(!failed_keys.contains(&(actor("actor1"), 0)));
     }
 
     #[test]
@@ -2048,7 +2073,7 @@ mod tests {
         // only if the host itself is marked failed (propagation happens
         // at build time, not in collect_failed_refs).
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -2058,7 +2083,7 @@ mod tests {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: "host1".into(),
+                reference: host("host1"),
                 label: "Host 1".into(),
                 node_type: NodeType::Host,
                 expanded: true,
@@ -2068,7 +2093,7 @@ mod tests {
                 failed: true, // propagated from child at build time
                 is_system: false,
                 children: vec![TreeNode {
-                    reference: "proc1".into(),
+                    reference: proc_ref("proc1"),
                     label: "Proc 1".into(),
                     node_type: NodeType::Proc,
                     expanded: false,
@@ -2085,7 +2110,7 @@ mod tests {
         for child in &tree.children {
             collect_failed_refs(child, 0, &mut failed_keys);
         }
-        assert!(failed_keys.contains(&("host1".to_string(), 0)));
-        assert!(failed_keys.contains(&("proc1".to_string(), 1)));
+        assert!(failed_keys.contains(&(host("host1"), 0)));
+        assert!(failed_keys.contains(&(proc_ref("proc1"), 1)));
     }
 }

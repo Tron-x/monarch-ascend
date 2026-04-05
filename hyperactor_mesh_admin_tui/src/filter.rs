@@ -47,97 +47,59 @@ pub(crate) fn is_system_node(properties: &NodeProperties) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use hyperactor_mesh::introspect::FailureInfo;
 
     use super::*;
 
-    #[test]
-    fn is_stopped_node_true_for_stopped_prefix() {
-        let props = NodeProperties::Actor {
-            actor_status: "stopped:sleep completed (2.3s)".to_string(),
+    fn mock_actor_id() -> hyperactor::reference::ActorId {
+        use std::str::FromStr;
+        hyperactor::reference::ActorId::from_str("unix:@test,world,a[0]").unwrap()
+    }
+
+    fn actor_props(status: &str) -> NodeProperties {
+        NodeProperties::Actor {
+            actor_status: status.to_string(),
             actor_type: "test".to_string(),
             messages_processed: 0,
-            created_at: "".to_string(),
+            created_at: Some(SystemTime::UNIX_EPOCH),
             last_message_handler: None,
             total_processing_time_us: 0,
             flight_recorder: None,
-
             failure_info: None,
             is_system: false,
-        };
-        assert!(is_stopped_node(&props));
+        }
+    }
+
+    #[test]
+    fn is_stopped_node_true_for_stopped_prefix() {
+        assert!(is_stopped_node(&actor_props(
+            "stopped:sleep completed (2.3s)"
+        )));
     }
 
     #[test]
     fn is_stopped_node_true_for_failed_prefix() {
-        let props = NodeProperties::Actor {
-            actor_status: "failed:panic in handler".to_string(),
-            actor_type: "test".to_string(),
-            messages_processed: 0,
-            created_at: "".to_string(),
-            last_message_handler: None,
-            total_processing_time_us: 0,
-            flight_recorder: None,
-
-            failure_info: None,
-            is_system: false,
-        };
-        assert!(is_stopped_node(&props));
+        assert!(is_stopped_node(&actor_props("failed:panic in handler")));
     }
 
     #[test]
     fn is_stopped_node_false_for_running() {
-        let props = NodeProperties::Actor {
-            actor_status: "Running".to_string(),
-            actor_type: "test".to_string(),
-            messages_processed: 0,
-            created_at: "".to_string(),
-            last_message_handler: None,
-            total_processing_time_us: 0,
-            flight_recorder: None,
-
-            failure_info: None,
-            is_system: false,
-        };
-        assert!(!is_stopped_node(&props));
+        assert!(!is_stopped_node(&actor_props("Running")));
     }
 
     #[test]
     fn is_stopped_node_false_without_colon() {
-        let props = NodeProperties::Actor {
-            actor_status: "stopped".to_string(),
-            actor_type: "test".to_string(),
-            messages_processed: 0,
-            created_at: "".to_string(),
-            last_message_handler: None,
-            total_processing_time_us: 0,
-            flight_recorder: None,
-
-            failure_info: None,
-            is_system: false,
-        };
-        assert!(!is_stopped_node(&props));
-
-        let props2 = NodeProperties::Actor {
-            actor_status: "failed".to_string(),
-            actor_type: "test".to_string(),
-            messages_processed: 0,
-            created_at: "".to_string(),
-            last_message_handler: None,
-            total_processing_time_us: 0,
-            flight_recorder: None,
-
-            failure_info: None,
-            is_system: false,
-        };
-        assert!(!is_stopped_node(&props2));
+        assert!(!is_stopped_node(&actor_props("stopped")));
+        assert!(!is_stopped_node(&actor_props("failed")));
     }
 
     #[test]
     fn is_stopped_node_false_for_non_actor_variants() {
         let root = NodeProperties::Root {
             num_hosts: 1,
-            started_at: "".to_string(),
+            started_at: SystemTime::UNIX_EPOCH,
             started_by: "".to_string(),
             system_children: vec![],
         };
@@ -153,7 +115,6 @@ mod tests {
         let proc_props = NodeProperties::Proc {
             proc_name: "proc".to_string(),
             num_actors: 0,
-
             system_children: vec![],
             stopped_children: vec![],
             stopped_retention_cap: 0,
@@ -169,16 +130,15 @@ mod tests {
             actor_status: "failed:panic".to_string(),
             actor_type: "test".to_string(),
             messages_processed: 0,
-            created_at: "".to_string(),
+            created_at: Some(SystemTime::UNIX_EPOCH),
             last_message_handler: None,
             total_processing_time_us: 0,
             flight_recorder: None,
-
             failure_info: Some(FailureInfo {
                 error_message: "boom".to_string(),
-                root_cause_actor: "a[0]".to_string(),
+                root_cause_actor: mock_actor_id(),
                 root_cause_name: None,
-                occurred_at: "2025-01-01T00:00:00Z".to_string(),
+                occurred_at: SystemTime::UNIX_EPOCH,
                 is_propagated: false,
             }),
             is_system: false,
@@ -188,19 +148,7 @@ mod tests {
 
     #[test]
     fn is_failed_node_without_failure_info() {
-        let props = NodeProperties::Actor {
-            actor_status: "Running".to_string(),
-            actor_type: "test".to_string(),
-            messages_processed: 0,
-            created_at: "".to_string(),
-            last_message_handler: None,
-            total_processing_time_us: 0,
-            flight_recorder: None,
-
-            failure_info: None,
-            is_system: false,
-        };
-        assert!(!is_failed_node(&props));
+        assert!(!is_failed_node(&actor_props("Running")));
     }
 
     #[test]
@@ -208,7 +156,6 @@ mod tests {
         let props = NodeProperties::Proc {
             proc_name: "myproc".to_string(),
             num_actors: 1,
-
             system_children: vec![],
             stopped_children: vec![],
             stopped_retention_cap: 0,
@@ -223,7 +170,6 @@ mod tests {
         let props = NodeProperties::Proc {
             proc_name: "myproc".to_string(),
             num_actors: 1,
-
             system_children: vec![],
             stopped_children: vec![],
             stopped_retention_cap: 0,

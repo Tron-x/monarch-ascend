@@ -12,9 +12,10 @@
 //! [`TuiConfig`], choosing HTTP vs HTTPS and configuring certificate
 //! verification when TLS material is available.
 //!
-//! MAST address resolution (`mast_conda:///` handles) is the
-//! responsibility of each binary, not this library. See the binary
-//! sources for `MastResolver` and `resolve_mast_addr`.
+//! Admin handle resolution (`mast_conda:///` and bare `host:port`) is
+//! performed in the binary via `AdminHandle::parse` before calling
+//! this library. By the time [`build_client`] is called, `addr` is
+//! always a concrete `https://host:port` URL.
 //!
 //! # Address handling
 //!

@@ -193,16 +193,16 @@ async fn probe(
     client: &reqwest::Client,
     base_url: &str,
     label: impl Into<String>,
-    reference: impl Into<String>,
+    reference: &hyperactor_mesh::introspect::NodeRef,
     phase: DiagPhase,
 ) -> (DiagResult, Option<hyperactor_mesh::introspect::NodePayload>) {
     let label = label.into();
-    let reference = reference.into();
+    let reference_str = reference.to_string();
     let t0 = Instant::now();
 
     let result = tokio::time::timeout(
         Duration::from_millis(TIMEOUT_MS),
-        fetch_node_raw(client, base_url, &reference),
+        fetch_node_raw(client, base_url, reference),
     )
     .await;
 
@@ -230,7 +230,7 @@ async fn probe(
     (
         DiagResult {
             label,
-            reference,
+            reference: reference_str,
             note: None,
             phase,
             outcome,
@@ -241,22 +241,20 @@ async fn probe(
 
 /// Derive a short human-readable label from the resolved NodePayload.
 fn label_from_payload(
-    reference: &str,
+    reference: &hyperactor_mesh::introspect::NodeRef,
     payload: &hyperactor_mesh::introspect::NodePayload,
 ) -> String {
+    use hyperactor_mesh::introspect::NodeRef;
     match &payload.properties {
         NodeProperties::Root { .. } => "root".to_string(),
         NodeProperties::Host { addr, .. } => addr.clone(),
         NodeProperties::Proc { proc_name, .. } => proc_name.clone(),
-        NodeProperties::Actor { .. } => {
-            // ActorId format: "proc_id,actor_name[rank]" — extract
-            // the last comma-separated component.
-            reference
-                .rsplit(',')
-                .next()
-                .unwrap_or(reference)
-                .to_string()
-        }
+        NodeProperties::Actor { .. } => match reference {
+            NodeRef::Actor(actor_id) => {
+                format!("{}[{}]", actor_id.name(), actor_id.pid())
+            }
+            other => other.to_string(),
+        },
         NodeProperties::Error { message, .. } => message.clone(),
     }
 }
@@ -277,9 +275,12 @@ fn proc_role(proc_name: &str) -> DiagNodeRole {
 async fn walk(client: &reqwest::Client, base_url: &str, tx: &mpsc::Sender<DiagResult>) {
     // Phase 1 — Admin Infra
 
+    use hyperactor_mesh::introspect::NodeRef;
+
     // Root.
+    let root_ref = NodeRef::Root;
     let (mut result, root_payload) =
-        probe(client, base_url, "root", "root", DiagPhase::AdminInfra).await;
+        probe(client, base_url, "root", &root_ref, DiagPhase::AdminInfra).await;
     result.note = Some(DiagNodeRole::AdminServer);
     emit!(tx, result);
     let root_payload = match root_payload {
@@ -289,24 +290,25 @@ async fn walk(client: &reqwest::Client, base_url: &str, tx: &mpsc::Sender<DiagRe
 
     // Root system_children is always empty (procs are never system,
     // standalone procs removed from root). Filter kept for robustness.
-    let root_system_refs: HashSet<&str> = match &root_payload.properties {
+    let root_system_refs: HashSet<&NodeRef> = match &root_payload.properties {
         NodeProperties::Root {
             system_children, ..
-        } => system_children.iter().map(|s| s.as_str()).collect(),
+        } => system_children.iter().collect(),
         _ => HashSet::new(),
     };
 
     for host_ref in root_payload
         .children
         .iter()
-        .filter(|r| !root_system_refs.contains(r.as_str()))
+        .filter(|r| !root_system_refs.contains(r))
     {
         // Host agent.
+        let host_label = host_ref.to_string();
         let (mut r, host_payload) = probe(
             client,
             base_url,
-            host_ref.as_str(),
-            host_ref.as_str(),
+            &host_label,
+            host_ref,
             DiagPhase::AdminInfra,
         )
         .await;
@@ -321,10 +323,10 @@ async fn walk(client: &reqwest::Client, base_url: &str, tx: &mpsc::Sender<DiagRe
             None => continue,
         };
 
-        let system_refs: HashSet<&str> = match &host_payload.properties {
+        let system_refs: HashSet<&NodeRef> = match &host_payload.properties {
             NodeProperties::Host {
                 system_children, ..
-            } => system_children.iter().map(|s| s.as_str()).collect(),
+            } => system_children.iter().collect(),
             _ => HashSet::new(),
         };
 
@@ -332,13 +334,14 @@ async fn walk(client: &reqwest::Client, base_url: &str, tx: &mpsc::Sender<DiagRe
         for proc_ref in host_payload
             .children
             .iter()
-            .filter(|r| system_refs.contains(r.as_str()))
+            .filter(|r| system_refs.contains(r))
         {
+            let proc_label = proc_ref.to_string();
             let (mut r, proc_payload) = probe(
                 client,
                 base_url,
-                proc_ref.as_str(),
-                proc_ref.as_str(),
+                &proc_label,
+                proc_ref,
                 DiagPhase::AdminInfra,
             )
             .await;
@@ -356,32 +359,41 @@ async fn walk(client: &reqwest::Client, base_url: &str, tx: &mpsc::Sender<DiagRe
 
             if let Some(proc_payload) = proc_payload {
                 for actor_ref in &proc_payload.children {
+                    let actor_label = actor_ref.to_string();
                     let (mut r, payload) = probe(
                         client,
                         base_url,
-                        actor_ref.as_str(),
-                        actor_ref.as_str(),
+                        &actor_label,
+                        actor_ref,
                         DiagPhase::AdminInfra,
                     )
                     .await;
                     // Use fetched label if available; otherwise derive
-                    // from ref string directly (same logic as
-                    // label_from_payload for Actor).
+                    // from the typed ref directly.
                     if let Some(p) = &payload {
                         r.label = format!("  {}", label_from_payload(actor_ref, p));
                     } else {
-                        let name = actor_ref.rsplit(',').next().unwrap_or(actor_ref.as_str());
-                        r.label = format!("  {}", name);
+                        let short = match actor_ref {
+                            NodeRef::Actor(id) => format!("{}[{}]", id.name(), id.pid()),
+                            other => other.to_string(),
+                        };
+                        r.label = format!("  {}", short);
                     }
-                    let actor_name = actor_ref.rsplit(',').next().unwrap_or("");
-                    r.note = if actor_name.starts_with(MESH_ADMIN_BRIDGE_NAME) {
-                        Some(DiagNodeRole::RootClientBridge)
-                    } else if actor_name.starts_with(MESH_ADMIN_ACTOR_NAME) {
-                        Some(DiagNodeRole::IntrospectionHandler)
-                    } else if actor_name.starts_with(HOST_MESH_AGENT_ACTOR_NAME) {
-                        Some(DiagNodeRole::ActorLifecycleManager)
-                    } else {
-                        None
+                    // Classify actor role from the typed ref.
+                    r.note = match actor_ref {
+                        NodeRef::Actor(actor_id) => {
+                            let actor_name = actor_id.name();
+                            if actor_name.starts_with(MESH_ADMIN_BRIDGE_NAME) {
+                                Some(DiagNodeRole::RootClientBridge)
+                            } else if actor_name.starts_with(MESH_ADMIN_ACTOR_NAME) {
+                                Some(DiagNodeRole::IntrospectionHandler)
+                            } else if actor_name.starts_with(HOST_MESH_AGENT_ACTOR_NAME) {
+                                Some(DiagNodeRole::ActorLifecycleManager)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
                     };
                     emit!(tx, r);
                 }
@@ -393,13 +405,14 @@ async fn walk(client: &reqwest::Client, base_url: &str, tx: &mpsc::Sender<DiagRe
         for user_proc_ref in host_payload
             .children
             .iter()
-            .filter(|r| !system_refs.contains(r.as_str()))
+            .filter(|r| !system_refs.contains(r))
         {
+            let proc_label = user_proc_ref.to_string();
             let (mut r, proc_payload) = probe(
                 client,
                 base_url,
-                user_proc_ref.as_str(),
-                user_proc_ref.as_str(),
+                &proc_label,
+                user_proc_ref,
                 DiagPhase::Mesh,
             )
             .await;
@@ -410,41 +423,45 @@ async fn walk(client: &reqwest::Client, base_url: &str, tx: &mpsc::Sender<DiagRe
             emit!(tx, r);
 
             if let Some(proc_payload) = proc_payload {
-                let proc_system_refs: HashSet<&str> = match &proc_payload.properties {
+                let proc_system_refs: HashSet<&NodeRef> = match &proc_payload.properties {
                     NodeProperties::Proc {
                         system_children, ..
-                    } => system_children.iter().map(|s| s.as_str()).collect(),
+                    } => system_children.iter().collect(),
                     _ => HashSet::new(),
+                };
+
+                // Derive actor role from a typed NodeRef.
+                let actor_role = |nr: &NodeRef| -> Option<DiagNodeRole> {
+                    match nr {
+                        NodeRef::Actor(actor_id) => {
+                            let name = actor_id.name();
+                            if name.starts_with(COMM_ACTOR_NAME) {
+                                Some(DiagNodeRole::CommActor)
+                            } else if name.starts_with(PROC_AGENT_ACTOR_NAME) {
+                                Some(DiagNodeRole::ProcAgent)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
                 };
 
                 // Probe every system actor on this user proc.
                 for actor_ref in proc_payload
                     .children
                     .iter()
-                    .filter(|r| proc_system_refs.contains(r.as_str()))
+                    .filter(|r| proc_system_refs.contains(r))
                 {
-                    let (mut r, payload) = probe(
-                        client,
-                        base_url,
-                        actor_ref.as_str(),
-                        actor_ref.as_str(),
-                        DiagPhase::Mesh,
-                    )
-                    .await;
+                    let alabel = actor_ref.to_string();
+                    let (mut r, payload) =
+                        probe(client, base_url, &alabel, actor_ref, DiagPhase::Mesh).await;
                     if let Some(p) = &payload {
                         r.label = format!("  {}", label_from_payload(actor_ref, p));
                     } else {
-                        let name = actor_ref.rsplit(',').next().unwrap_or(actor_ref.as_str());
-                        r.label = format!("  {}", name);
+                        r.label = format!("  {}", alabel);
                     }
-                    let actor_name = actor_ref.rsplit(',').next().unwrap_or("");
-                    r.note = if actor_name.starts_with(COMM_ACTOR_NAME) {
-                        Some(DiagNodeRole::CommActor)
-                    } else if actor_name.starts_with(PROC_AGENT_ACTOR_NAME) {
-                        Some(DiagNodeRole::ProcAgent)
-                    } else {
-                        None
-                    };
+                    r.note = actor_role(actor_ref);
                     emit!(tx, r);
                 }
 
@@ -452,21 +469,15 @@ async fn walk(client: &reqwest::Client, base_url: &str, tx: &mpsc::Sender<DiagRe
                 if let Some(actor_ref) = proc_payload
                     .children
                     .iter()
-                    .find(|r| !proc_system_refs.contains(r.as_str()))
+                    .find(|r| !proc_system_refs.contains(r))
                 {
-                    let (mut r, payload) = probe(
-                        client,
-                        base_url,
-                        actor_ref.as_str(),
-                        actor_ref.as_str(),
-                        DiagPhase::Mesh,
-                    )
-                    .await;
+                    let alabel = actor_ref.to_string();
+                    let (mut r, payload) =
+                        probe(client, base_url, &alabel, actor_ref, DiagPhase::Mesh).await;
                     if let Some(p) = &payload {
                         r.label = format!("  {}", label_from_payload(actor_ref, p));
                     } else {
-                        let name = actor_ref.rsplit(',').next().unwrap_or(actor_ref.as_str());
-                        r.label = format!("  {}", name);
+                        r.label = format!("  {}", alabel);
                     }
                     r.note = Some(DiagNodeRole::UserActor);
                     emit!(tx, r);

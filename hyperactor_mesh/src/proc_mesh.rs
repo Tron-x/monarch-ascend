@@ -1161,8 +1161,8 @@ impl ProcMeshRef {
                 Some(cx.instance().port().bind()),
                 statuses,
             );
-            // AI-3: controller name must include mesh identity for
-            // proc-wide ActorId uniqueness. A fixed base name alone
+            // hyperactor::proc AI-3: controller name must include mesh
+            // identity for proc-wide ActorId uniqueness. A fixed base name alone
             // collides across parents because pid allocation is
             // parent-scoped.
             let controller_name = format!(
@@ -1288,10 +1288,14 @@ impl ProcMeshRef {
                 initial_update_interval: None,
             },
         );
+        // Use WaitRankStatus instead of GetRankStatus so agents defer
+        // their reply until the actor reaches terminal state, rather
+        // than replying immediately with Stopping.
         agent_mesh.cast(
             cx,
-            resource::GetRankStatus {
+            resource::WaitRankStatus {
                 name: mesh_name,
+                min_status: Status::Stopped,
                 reply: port.bind(),
             },
         )?;

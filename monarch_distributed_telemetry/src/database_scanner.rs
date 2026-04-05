@@ -25,6 +25,7 @@ use monarch_hyperactor::actor::PythonActor;
 use monarch_hyperactor::context::PyInstance;
 use monarch_hyperactor::mailbox::PyPortId;
 use monarch_hyperactor::runtime::get_tokio_runtime;
+use monarch_record_batch::RecordBatchBuffer;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -38,7 +39,6 @@ use crate::pyspy_table::PySpyDumpBuffer;
 use crate::pyspy_table::PySpyFrameBuffer;
 use crate::pyspy_table::PySpyLocalVariableBuffer;
 use crate::pyspy_table::PySpyStackTraceBuffer;
-use crate::record_batch_sink::RecordBatchBuffer;
 use crate::serialize_batch;
 use crate::serialize_schema;
 use crate::timestamp_to_micros;
@@ -163,20 +163,22 @@ impl DatabaseScanner {
         for (name, batch) in [
             (
                 "pyspy_dumps",
-                PySpyDumpBuffer::default().to_record_batch().unwrap(),
+                PySpyDumpBuffer::default().drain_to_record_batch().unwrap(),
             ),
             (
                 "pyspy_stack_traces",
-                PySpyStackTraceBuffer::default().to_record_batch().unwrap(),
+                PySpyStackTraceBuffer::default()
+                    .drain_to_record_batch()
+                    .unwrap(),
             ),
             (
                 "pyspy_frames",
-                PySpyFrameBuffer::default().to_record_batch().unwrap(),
+                PySpyFrameBuffer::default().drain_to_record_batch().unwrap(),
             ),
             (
                 "pyspy_local_variables",
                 PySpyLocalVariableBuffer::default()
-                    .to_record_batch()
+                    .drain_to_record_batch()
                     .unwrap(),
             ),
         ] {
@@ -401,6 +403,8 @@ impl DatabaseScanner {
         proc_ref: &str,
         pyspy_result_json: &str,
     ) -> anyhow::Result<()> {
+        use monarch_record_batch::RecordBatchBuffer;
+
         use crate::pyspy_table::PySpyDump;
         use crate::pyspy_table::PySpyDumpBuffer;
         use crate::pyspy_table::PySpyFrame;
@@ -409,7 +413,6 @@ impl DatabaseScanner {
         use crate::pyspy_table::PySpyLocalVariableBuffer;
         use crate::pyspy_table::PySpyStackTrace;
         use crate::pyspy_table::PySpyStackTraceBuffer;
-        use crate::record_batch_sink::RecordBatchBuffer;
 
         let value: serde_json::Value = serde_json::from_str(pyspy_result_json)?;
         let ok = match value.get("Ok") {
@@ -436,7 +439,11 @@ impl DatabaseScanner {
             binary,
             proc_ref: proc_ref.to_string(),
         });
-        Self::push_batch_to_tables(&self.table_data, "pyspy_dumps", dump_buf.to_record_batch()?)?;
+        Self::push_batch_to_tables(
+            &self.table_data,
+            "pyspy_dumps",
+            dump_buf.drain_to_record_batch()?,
+        )?;
 
         // Insert stack trace, frame, and local variable rows
         let mut trace_buf = PySpyStackTraceBuffer::default();
@@ -531,17 +538,17 @@ impl DatabaseScanner {
         Self::push_batch_to_tables(
             &self.table_data,
             "pyspy_stack_traces",
-            trace_buf.to_record_batch()?,
+            trace_buf.drain_to_record_batch()?,
         )?;
         Self::push_batch_to_tables(
             &self.table_data,
             "pyspy_frames",
-            frame_buf.to_record_batch()?,
+            frame_buf.drain_to_record_batch()?,
         )?;
         Self::push_batch_to_tables(
             &self.table_data,
             "pyspy_local_variables",
-            local_buf.to_record_batch()?,
+            local_buf.drain_to_record_batch()?,
         )?;
         Ok(())
     }

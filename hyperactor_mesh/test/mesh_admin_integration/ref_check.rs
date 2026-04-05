@@ -15,19 +15,25 @@
 
 use hyperactor_mesh::introspect::NodePayload;
 use hyperactor_mesh::introspect::NodeProperties;
+use hyperactor_mesh::introspect::NodeRef;
 
 use crate::dining::DiningScenario;
 use crate::harness::WorkloadFixture;
 
-/// Extract the base actor name from a full actor reference string.
-/// Matches the harness's `classify_procs` parsing: take the last
-/// comma-separated segment, strip the `[index]` suffix.
-fn actor_base_name(actor_ref: &str) -> &str {
-    let name = actor_ref.rsplit(',').next().unwrap_or(actor_ref);
-    name.split('[').next().unwrap_or(name)
+/// Extract the base actor name from a typed `NodeRef`.
+/// Panics if the ref is not an actor — callers only pass actor children.
+fn actor_base_name(r: &NodeRef) -> &str {
+    match r {
+        NodeRef::Actor(id) => id.name(),
+        other => panic!("expected actor ref, got {other:?}"),
+    }
 }
 
-fn enc(s: &str) -> String {
+fn enc(r: &NodeRef) -> String {
+    urlencoding::encode(&r.to_string()).into_owned()
+}
+
+fn enc_str(s: &str) -> String {
     urlencoding::encode(s).into_owned()
 }
 
@@ -35,12 +41,12 @@ fn enc(s: &str) -> String {
 /// traversal (V1 scope).
 pub(crate) async fn check(s: &DiningScenario) {
     // MIT-20, MIT-21: root fetchable, typed correctly.
-    let root: NodePayload = s.fixture.get_json("/v1/root").await.unwrap();
+    let root: NodePayload = s.fixture.get_node_payload("/v1/root").await.unwrap();
     assert!(
         matches!(root.properties, NodeProperties::Root { .. }),
         "MIT-21: expected Root variant"
     );
-    assert_eq!(root.identity, "root", "MIT-22");
+    assert_eq!(root.identity, NodeRef::Root, "MIT-22");
 
     // MIT-20, MIT-21: first host fetchable.
     let host_ref = root
@@ -49,7 +55,7 @@ pub(crate) async fn check(s: &DiningScenario) {
         .expect("root should have at least one host child");
     let host: NodePayload = s
         .fixture
-        .get_json(&format!("/v1/{}", enc(host_ref)))
+        .get_node_payload(&format!("/v1/{}", enc(host_ref)))
         .await
         .unwrap();
     assert!(
@@ -61,25 +67,25 @@ pub(crate) async fn check(s: &DiningScenario) {
     // MIT-23 V1: classified service and worker procs fetchable.
     let service: NodePayload = s
         .fixture
-        .get_json(&format!("/v1/{}", enc(&s.service)))
+        .get_node_payload(&format!("/v1/{}", enc_str(&s.service)))
         .await
         .unwrap();
     assert!(
         matches!(service.properties, NodeProperties::Proc { .. }),
         "MIT-21"
     );
-    assert_eq!(service.identity, s.service, "MIT-22");
+    assert_eq!(service.identity.to_string(), s.service, "MIT-22");
 
     let worker: NodePayload = s
         .fixture
-        .get_json(&format!("/v1/{}", enc(&s.worker)))
+        .get_node_payload(&format!("/v1/{}", enc_str(&s.worker)))
         .await
         .unwrap();
     assert!(
         matches!(worker.properties, NodeProperties::Proc { .. }),
         "MIT-21"
     );
-    assert_eq!(worker.identity, s.worker, "MIT-22");
+    assert_eq!(worker.identity.to_string(), s.worker, "MIT-22");
 
     // MIT-24: service proc must expose host_agent, worker proc must
     // expose proc_agent.
@@ -96,7 +102,7 @@ async fn check_known_actors(
     let mut found = false;
     for actor_ref in &proc_node.children {
         let actor: NodePayload = fixture
-            .get_json(&format!("/v1/{}", enc(actor_ref)))
+            .get_node_payload(&format!("/v1/{}", enc(actor_ref)))
             .await
             .unwrap();
         assert!(

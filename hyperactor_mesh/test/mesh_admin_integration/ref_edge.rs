@@ -88,6 +88,10 @@ pub(crate) async fn check(s: &DiningScenario) {
 
     // --- MIT-31: valid ref round-trips through URL encoding ---
     let encoded = urlencoding::encode(&s.worker);
-    let node: NodePayload = s.fixture.get_json(&format!("/v1/{encoded}")).await.unwrap();
-    assert_eq!(node.identity, s.worker, "MIT-31");
+    let node: NodePayload = s
+        .fixture
+        .get_node_payload(&format!("/v1/{encoded}"))
+        .await
+        .unwrap();
+    assert_eq!(node.identity.to_string(), s.worker, "MIT-31");
 }

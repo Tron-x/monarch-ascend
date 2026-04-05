@@ -30,6 +30,7 @@ use hyperactor_mesh::ActorMeshRef;
 use hyperactor_mesh::comm::multicast::CastInfo;
 use hyperactor_mesh::context;
 use hyperactor_mesh::host_mesh::HostMesh;
+use hyperactor_mesh::host_mesh::spawn_admin;
 use ndslice::ViewExt;
 use ndslice::extent;
 use serde::Deserialize;
@@ -263,7 +264,7 @@ async fn main() -> Result<ExitCode> {
 
     // Start the mesh admin agent, which aggregates admin state
     // across all hosts and serves an HTTP API.
-    let mesh_admin_url = host_mesh.spawn_admin(instance, None).await?;
+    let mesh_admin_url = spawn_admin([&host_mesh], instance, None, None).await?;
     let mtls_flags = if mesh_admin_url.starts_with("https") {
         "--cacert /var/facebook/rootcanal/ca.pem \
          --cert /var/facebook/x509_identities/server.pem \

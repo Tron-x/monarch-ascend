@@ -24,9 +24,11 @@
 //! - `SpanBuffer` struct with `Vec<T>` for each field
 //! - `insert(&mut self, row: Span)` method
 //! - `schema() -> SchemaRef` method
-//! - `impl RecordBatchBuffer` with `len()` and `to_record_batch()` methods
+//! - `impl monarch_record_batch::RecordBatchBuffer` with `len()` and
+//!   `drain_to_record_batch()` methods
 //!
-//! The `RecordBatchBuffer` trait must be in scope where the derive is used.
+//! The consumer crate must depend on `monarch_record_batch` (for the trait)
+//! and `datafusion` (for Arrow types used in the generated code).
 
 use proc_macro::TokenStream;
 use quote::format_ident;
@@ -102,17 +104,17 @@ pub fn derive_record_batch_row(input: TokenStream) -> TokenStream {
             }
         }
 
-        impl RecordBatchBuffer for #buffer_name {
+        impl monarch_record_batch::RecordBatchBuffer for #buffer_name {
             fn len(&self) -> usize {
                 self.#first_field.len()
             }
 
-            fn to_record_batch(&mut self) -> anyhow::Result<datafusion::arrow::record_batch::RecordBatch> {
+            fn drain_to_record_batch(&mut self) -> Result<datafusion::arrow::record_batch::RecordBatch, datafusion::arrow::error::ArrowError> {
                 let schema = #buffer_name::schema();
                 let columns: Vec<datafusion::arrow::array::ArrayRef> = vec![
                     #(#column_conversions,)*
                 ];
-                Ok(datafusion::arrow::record_batch::RecordBatch::try_new(schema, columns)?)
+                datafusion::arrow::record_batch::RecordBatch::try_new(schema, columns)
             }
         }
     };

@@ -8,10 +8,12 @@
 
 use std::str::FromStr;
 use std::time::Duration;
+use std::time::SystemTime;
 
 use hyperactor::reference as hyperactor_reference;
 use hyperactor_mesh::introspect::NodePayload;
 use hyperactor_mesh::introspect::NodeProperties;
+use hyperactor_mesh::introspect::NodeRef;
 use serde_json::Value;
 
 /// Derive a human-friendly label for a resolved node payload.
@@ -76,27 +78,25 @@ pub(crate) fn derive_label(payload: &NodePayload) -> String {
                 base
             }
         }
-        NodeProperties::Actor { .. } => {
-            match hyperactor_reference::ActorId::from_str(&payload.identity) {
-                Ok(actor_id) => format!("{}[{}]", actor_id.name(), actor_id.pid()),
-                Err(_) => payload.identity.clone(),
-            }
-        }
+        NodeProperties::Actor { .. } => match &payload.identity {
+            NodeRef::Actor(actor_id) => format!("{}[{}]", actor_id.name(), actor_id.pid()),
+            other => other.to_string(),
+        },
         NodeProperties::Error { code, message } => {
             format!("[error] {}: {}", code, message)
         }
     }
 }
 
-/// Derive a display label from an opaque reference string without
+/// Derive a display label from a typed node reference without
 /// fetching.
 ///
-/// If the reference parses as an `ActorId`, format it as `name[pid]`;
-/// otherwise fall back to showing the raw reference.
-pub(crate) fn derive_label_from_ref(reference: &str) -> String {
-    match hyperactor_reference::ActorId::from_str(reference) {
-        Ok(actor_id) => format!("{}[{}]", actor_id.name(), actor_id.pid()),
-        Err(_) => reference.to_string(),
+/// For actor references, format as `name[pid]`; for all others, fall
+/// back to the `Display` representation.
+pub(crate) fn derive_label_from_ref(reference: &NodeRef) -> String {
+    match reference {
+        NodeRef::Actor(actor_id) => format!("{}[{}]", actor_id.name(), actor_id.pid()),
+        other => other.to_string(),
     }
 }
 
@@ -165,70 +165,103 @@ pub(crate) fn format_local_time(timestamp: &str) -> String {
         .unwrap_or_else(|_| timestamp.get(11..19).unwrap_or(timestamp).to_string())
 }
 
-/// Format an ISO-8601 timestamp as a human-readable relative time
-/// from now (e.g. "just now", "5s ago", "3m 12s ago", "1h 7m ago").
-pub(crate) fn format_relative_time(timestamp: &str) -> String {
-    match chrono::DateTime::parse_from_rfc3339(timestamp) {
-        Ok(parsed) => {
-            let now = chrono::Utc::now();
-            let duration = now.signed_duration_since(parsed);
-            let total_secs = duration.num_seconds();
-            if total_secs < 2 {
-                "just now".to_string()
-            } else if total_secs < 60 {
-                format!("{}s ago", total_secs)
-            } else if total_secs < 3600 {
-                let mins = total_secs / 60;
-                let secs = total_secs % 60;
-                format!("{}m {}s ago", mins, secs)
-            } else {
-                let hours = total_secs / 3600;
-                let mins = (total_secs % 3600) / 60;
-                format!("{}h {}m ago", hours, mins)
-            }
-        }
-        Err(_) => timestamp.to_string(),
+/// Convert a `SystemTime` to a `chrono::DateTime<Utc>`.
+fn system_time_to_chrono(t: &SystemTime) -> chrono::DateTime<chrono::Utc> {
+    let dur = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    chrono::DateTime::from_timestamp(dur.as_secs() as i64, dur.subsec_nanos()).unwrap_or_default()
+}
+
+/// Format a `SystemTime` as a local-timezone HH:MM:SS string.
+pub(crate) fn format_system_time_local(t: &SystemTime) -> String {
+    system_time_to_chrono(t)
+        .with_timezone(&chrono::Local)
+        .format("%H:%M:%S")
+        .to_string()
+}
+
+/// Format a `SystemTime` as a human-readable relative time from now
+/// (e.g. "just now", "5s ago", "3m 12s ago").
+pub(crate) fn format_system_time_relative(t: &SystemTime) -> String {
+    match t.elapsed() {
+        Ok(d) if d.as_secs() < 2 => "just now".to_string(),
+        Ok(d) => format!("{} ago", humantime::format_duration(d)),
+        Err(_) => "just now".to_string(),
     }
 }
 
-/// Format uptime duration from ISO-8601 start timestamp.
+/// Format uptime from a `SystemTime` start point.
 ///
 /// Rounds to nearest 30 seconds for cleaner display.
-pub(crate) fn format_uptime(started_at: &str) -> String {
-    match chrono::DateTime::parse_from_rfc3339(started_at) {
-        Ok(start_time) => {
-            let now = chrono::Utc::now();
-            let duration = now.signed_duration_since(start_time);
-            let total_secs = duration.num_seconds();
+pub(crate) fn format_system_time_uptime(started_at: &SystemTime) -> String {
+    match started_at.elapsed() {
+        Ok(d) => {
+            let total_secs = d.as_secs();
             let rounded_secs = ((total_secs + 15) / 30) * 30;
-            let std_duration = Duration::from_secs(rounded_secs as u64);
-            humantime::format_duration(std_duration).to_string()
+            humantime::format_duration(Duration::from_secs(rounded_secs)).to_string()
         }
         Err(_) => "unknown".to_string(),
     }
 }
 
+/// Format a `SystemTime` as an ISO-8601 string for display.
+pub(crate) fn format_system_time_iso(t: &SystemTime) -> String {
+    system_time_to_chrono(t).to_rfc3339()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+    use std::time::SystemTime;
+
+    use hyperactor::reference as hyperactor_reference;
     use hyperactor_mesh::introspect::NodePayload;
     use hyperactor_mesh::introspect::NodeProperties;
     use serde_json::Value;
 
     use super::*;
 
+    fn mock_actor_ref(name: &str) -> NodeRef {
+        let id_str = format!("unix:@test,world,{}[0]", name);
+        NodeRef::Actor(hyperactor_reference::ActorId::from_str(&id_str).unwrap())
+    }
+
+    fn mock_proc_ref(name: &str) -> NodeRef {
+        let id_str = format!("unix:@test,{}", name);
+        NodeRef::Proc(hyperactor_reference::ProcId::from_str(&id_str).unwrap())
+    }
+
+    fn mock_host_ref(name: &str) -> NodeRef {
+        let id_str = format!("unix:@test,world,{}[0]", name);
+        NodeRef::Host(hyperactor_reference::ActorId::from_str(&id_str).unwrap())
+    }
+
+    fn proc_payload(proc_name: &str, props: NodeProperties) -> NodePayload {
+        NodePayload {
+            identity: mock_proc_ref(proc_name),
+            properties: props,
+            children: vec![],
+            parent: None,
+            as_of: SystemTime::now(),
+        }
+    }
+
     #[test]
     fn derive_label_root_basic() {
         let payload = NodePayload {
-            identity: "root".to_string(),
+            identity: NodeRef::Root,
             properties: NodeProperties::Root {
                 num_hosts: 3,
-                started_at: "2026-01-01T00:00:00Z".to_string(),
+                started_at: SystemTime::UNIX_EPOCH,
                 started_by: "testuser".to_string(),
-                system_children: vec!["sys1".into()],
+                system_children: vec![mock_actor_ref("sys1")],
             },
-            children: vec!["h1".into(), "h2".into(), "h3".into()],
+            children: vec![
+                mock_host_ref("h1"),
+                mock_host_ref("h2"),
+                mock_host_ref("h3"),
+            ],
             parent: None,
-            as_of: "2026-01-01T00:00:00.000Z".to_string(),
+            as_of: SystemTime::now(),
         };
         assert_eq!(derive_label(&payload), "Mesh Root (3 hosts)");
     }
@@ -236,7 +269,7 @@ mod tests {
     #[test]
     fn derive_label_host_no_system_children() {
         let payload = NodePayload {
-            identity: "host:h1".to_string(),
+            identity: mock_host_ref("h1"),
             properties: NodeProperties::Host {
                 addr: "10.0.0.1:8000".to_string(),
                 num_procs: 3,
@@ -244,7 +277,7 @@ mod tests {
             },
             children: vec![],
             parent: None,
-            as_of: "".to_string(),
+            as_of: SystemTime::now(),
         };
         assert_eq!(derive_label(&payload), "10.0.0.1:8000  (3 procs)");
     }
@@ -252,15 +285,15 @@ mod tests {
     #[test]
     fn derive_label_host_with_system_children() {
         let payload = NodePayload {
-            identity: "host:h1".to_string(),
+            identity: mock_host_ref("h1"),
             properties: NodeProperties::Host {
                 addr: "10.0.0.1:8000".to_string(),
                 num_procs: 5,
-                system_children: vec!["sys1".into(), "sys2".into()],
+                system_children: vec![mock_actor_ref("sys1"), mock_actor_ref("sys2")],
             },
             children: vec![],
             parent: None,
-            as_of: "".to_string(),
+            as_of: SystemTime::now(),
         };
         assert_eq!(derive_label(&payload), "10.0.0.1:8000  (5 procs)");
     }
@@ -268,58 +301,50 @@ mod tests {
     #[test]
     fn derive_label_host_all_system() {
         let payload = NodePayload {
-            identity: "host:h1".to_string(),
+            identity: mock_host_ref("h1"),
             properties: NodeProperties::Host {
                 addr: "10.0.0.1:8000".to_string(),
                 num_procs: 2,
-                system_children: vec!["s1".into(), "s2".into()],
+                system_children: vec![mock_actor_ref("s1"), mock_actor_ref("s2")],
             },
             children: vec![],
             parent: None,
-            as_of: "".to_string(),
+            as_of: SystemTime::now(),
         };
         assert_eq!(derive_label(&payload), "10.0.0.1:8000  (2 procs)");
     }
 
     #[test]
     fn derive_label_proc_no_system_no_stopped() {
-        let payload = NodePayload {
-            identity: "myproc".to_string(),
-            properties: NodeProperties::Proc {
+        let payload = proc_payload(
+            "myproc",
+            NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 4,
-
                 system_children: vec![],
                 stopped_children: vec![],
                 stopped_retention_cap: 0,
                 is_poisoned: false,
                 failed_actor_count: 0,
             },
-            children: vec![],
-            parent: None,
-            as_of: "".to_string(),
-        };
+        );
         assert_eq!(derive_label(&payload), "myproc  (4 actors: 4 user)");
     }
 
     #[test]
     fn derive_label_proc_with_system_no_stopped() {
-        let payload = NodePayload {
-            identity: "myproc".to_string(),
-            properties: NodeProperties::Proc {
+        let payload = proc_payload(
+            "myproc",
+            NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 5,
-
-                system_children: vec!["sys1".into(), "sys2".into()],
+                system_children: vec![mock_actor_ref("sys1"), mock_actor_ref("sys2")],
                 stopped_children: vec![],
                 stopped_retention_cap: 0,
                 is_poisoned: false,
                 failed_actor_count: 0,
             },
-            children: vec![],
-            parent: None,
-            as_of: "".to_string(),
-        };
+        );
         assert_eq!(
             derive_label(&payload),
             "myproc  (5 actors: 2 system, 3 user)"
@@ -328,22 +353,18 @@ mod tests {
 
     #[test]
     fn derive_label_proc_with_stopped() {
-        let payload = NodePayload {
-            identity: "myproc".to_string(),
-            properties: NodeProperties::Proc {
+        let payload = proc_payload(
+            "myproc",
+            NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 3,
-
                 system_children: vec![],
-                stopped_children: vec!["s1".into(), "s2".into()],
+                stopped_children: vec![mock_actor_ref("s1"), mock_actor_ref("s2")],
                 stopped_retention_cap: 100,
                 is_poisoned: false,
                 failed_actor_count: 0,
             },
-            children: vec![],
-            parent: None,
-            as_of: "".to_string(),
-        };
+        );
         assert_eq!(
             derive_label(&payload),
             "myproc  (5 actors: 3 user, 2 stopped)"
@@ -352,43 +373,39 @@ mod tests {
 
     #[test]
     fn derive_label_proc_stopped_at_retention_cap() {
-        let payload = NodePayload {
-            identity: "myproc".to_string(),
-            properties: NodeProperties::Proc {
+        let payload = proc_payload(
+            "myproc",
+            NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 1,
-
                 system_children: vec![],
-                stopped_children: vec!["s1".into(), "s2".into(), "s3".into()],
+                stopped_children: vec![
+                    mock_actor_ref("s1"),
+                    mock_actor_ref("s2"),
+                    mock_actor_ref("s3"),
+                ],
                 stopped_retention_cap: 3,
                 is_poisoned: false,
                 failed_actor_count: 0,
             },
-            children: vec![],
-            parent: None,
-            as_of: "".to_string(),
-        };
+        );
         assert!(derive_label(&payload).contains("3 stopped (max retained)"));
     }
 
     #[test]
     fn derive_label_proc_stopped_retention_cap_zero_never_annotates() {
-        let payload = NodePayload {
-            identity: "myproc".to_string(),
-            properties: NodeProperties::Proc {
+        let payload = proc_payload(
+            "myproc",
+            NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 0,
-
                 system_children: vec![],
-                stopped_children: vec!["s1".into()],
+                stopped_children: vec![mock_actor_ref("s1")],
                 stopped_retention_cap: 0,
                 is_poisoned: false,
                 failed_actor_count: 0,
             },
-            children: vec![],
-            parent: None,
-            as_of: "".to_string(),
-        };
+        );
         let label = derive_label(&payload);
         assert!(label.contains("1 stopped"));
         assert!(!label.contains("max retained"));
@@ -396,22 +413,18 @@ mod tests {
 
     #[test]
     fn derive_label_proc_system_and_stopped_and_user() {
-        let payload = NodePayload {
-            identity: "myproc".to_string(),
-            properties: NodeProperties::Proc {
+        let payload = proc_payload(
+            "myproc",
+            NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 5,
-
-                system_children: vec!["sys1".into()],
-                stopped_children: vec!["dead1".into(), "dead2".into()],
+                system_children: vec![mock_actor_ref("sys1")],
+                stopped_children: vec![mock_actor_ref("dead1"), mock_actor_ref("dead2")],
                 stopped_retention_cap: 100,
                 is_poisoned: false,
                 failed_actor_count: 0,
             },
-            children: vec![],
-            parent: None,
-            as_of: "".to_string(),
-        };
+        );
         assert_eq!(
             derive_label(&payload),
             "myproc  (7 actors: 1 system, 4 user, 2 stopped)"
@@ -420,43 +433,39 @@ mod tests {
 
     #[test]
     fn derive_label_proc_all_stopped_none_user() {
-        let payload = NodePayload {
-            identity: "myproc".to_string(),
-            properties: NodeProperties::Proc {
+        let payload = proc_payload(
+            "myproc",
+            NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 0,
-
                 system_children: vec![],
-                stopped_children: vec!["d1".into(), "d2".into()],
+                stopped_children: vec![mock_actor_ref("d1"), mock_actor_ref("d2")],
                 stopped_retention_cap: 100,
                 is_poisoned: false,
                 failed_actor_count: 0,
             },
-            children: vec![],
-            parent: None,
-            as_of: "".to_string(),
-        };
+        );
         assert_eq!(derive_label(&payload), "myproc  (2 actors: 2 stopped)");
     }
 
     #[test]
     fn derive_label_proc_saturating_sub_prevents_underflow() {
-        let payload = NodePayload {
-            identity: "myproc".to_string(),
-            properties: NodeProperties::Proc {
+        let payload = proc_payload(
+            "myproc",
+            NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 1,
-
-                system_children: vec!["s1".into(), "s2".into(), "s3".into()],
+                system_children: vec![
+                    mock_actor_ref("s1"),
+                    mock_actor_ref("s2"),
+                    mock_actor_ref("s3"),
+                ],
                 stopped_children: vec![],
                 stopped_retention_cap: 0,
                 is_poisoned: false,
                 failed_actor_count: 0,
             },
-            children: vec![],
-            parent: None,
-            as_of: "".to_string(),
-        };
+        );
         let label = derive_label(&payload);
         assert!(label.contains("3 system"));
         assert!(!label.contains("user"));
@@ -464,57 +473,52 @@ mod tests {
 
     #[test]
     fn derive_label_proc_poisoned() {
-        let payload = NodePayload {
-            identity: "myproc".to_string(),
-            properties: NodeProperties::Proc {
+        let payload = proc_payload(
+            "myproc",
+            NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 2,
-
                 system_children: vec![],
-                stopped_children: vec!["dead1".into()],
+                stopped_children: vec![mock_actor_ref("dead1")],
                 stopped_retention_cap: 100,
                 is_poisoned: true,
                 failed_actor_count: 1,
             },
-            children: vec![],
-            parent: None,
-            as_of: "".to_string(),
-        };
+        );
         let label = derive_label(&payload);
         assert!(label.contains("[POISONED: 1 failed]"));
     }
 
     #[test]
     fn derive_label_proc_not_poisoned() {
-        let payload = NodePayload {
-            identity: "myproc".to_string(),
-            properties: NodeProperties::Proc {
+        let payload = proc_payload(
+            "myproc",
+            NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 3,
-
                 system_children: vec![],
                 stopped_children: vec![],
                 stopped_retention_cap: 100,
                 is_poisoned: false,
                 failed_actor_count: 0,
             },
-            children: vec![],
-            parent: None,
-            as_of: "".to_string(),
-        };
+        );
         let label = derive_label(&payload);
         assert!(!label.contains("POISONED"));
     }
 
     #[test]
     fn derive_label_actor_standard_actor_id() {
+        let actor_id =
+            hyperactor_reference::ActorId::from_str("unix:@abc123,myworld,worker[3]").unwrap();
+        let proc_id = hyperactor_reference::ProcId::from_str("unix:@abc123,myworld").unwrap();
         let payload = NodePayload {
-            identity: "unix:@abc123,myworld,worker[3]".to_string(),
+            identity: NodeRef::Actor(actor_id),
             properties: NodeProperties::Actor {
                 actor_status: "Running".to_string(),
                 actor_type: "Worker".to_string(),
                 messages_processed: 42,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
+                created_at: Some(SystemTime::UNIX_EPOCH),
                 last_message_handler: Some("handle_task".to_string()),
                 total_processing_time_us: 1000,
                 flight_recorder: None,
@@ -522,21 +526,23 @@ mod tests {
                 is_system: false,
             },
             children: vec![],
-            parent: Some("unix:@abc123,myworld".to_string()),
-            as_of: "2026-01-01T00:00:00.000Z".to_string(),
+            parent: Some(NodeRef::Proc(proc_id)),
+            as_of: SystemTime::now(),
         };
         assert_eq!(derive_label(&payload), "worker[3]");
     }
 
     #[test]
-    fn derive_label_actor_unparseable_identity() {
+    fn derive_label_actor_non_actor_identity_falls_back() {
+        // When an Actor node has a non-Actor identity (shouldn't
+        // happen in practice), derive_label falls back to Display.
         let payload = NodePayload {
-            identity: "not-a-valid-actor-id!!!".to_string(),
+            identity: NodeRef::Root,
             properties: NodeProperties::Actor {
                 actor_status: "Running".to_string(),
                 actor_type: "Unknown".to_string(),
                 messages_processed: 0,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
+                created_at: Some(SystemTime::UNIX_EPOCH),
                 last_message_handler: None,
                 total_processing_time_us: 0,
                 flight_recorder: None,
@@ -545,9 +551,9 @@ mod tests {
             },
             children: vec![],
             parent: None,
-            as_of: "2026-01-01T00:00:00.000Z".to_string(),
+            as_of: SystemTime::now(),
         };
-        assert_eq!(derive_label(&payload), "not-a-valid-actor-id!!!");
+        assert_eq!(derive_label(&payload), "root");
     }
 
     #[test]
@@ -617,15 +623,5 @@ mod tests {
     #[test]
     fn format_local_time_too_short_fallback() {
         assert_eq!(format_local_time("short"), "short");
-    }
-
-    #[test]
-    fn format_relative_time_parse_failure_fallback() {
-        assert_eq!(format_relative_time("not-a-date"), "not-a-date");
-    }
-
-    #[test]
-    fn format_uptime_parse_failure() {
-        assert_eq!(format_uptime("garbage"), "unknown");
     }
 }

@@ -50,8 +50,11 @@
 //! - **TUI-11 (selection-semantics):** Cursor restoration prefers
 //!   `(reference, depth)` to disambiguate; falls back to
 //!   reference-only if depth changes.
-//! - **TUI-12 (serial-fetches):** HTTP fetches are scheduled
-//!   serially; join semantics handle retries and reordering.
+//! - **TUI-12 (serial-topology-fetches):** Topology cache fetches
+//!   (via `fetch_with_join` / `build_tree_node`) are serial within
+//!   a refresh cycle; join semantics handle retries and reordering.
+//!   Overlay fetches (py-spy, config, diagnostics) are concurrent
+//!   via `tokio::spawn` and do not participate in the topology cache.
 //! - **TUI-13 (stopped-detection):** `is_stopped_node` matches
 //!   `Actor` variants whose `actor_status` starts with `"stopped:"`
 //!   or `"failed:"`. All other variants return false.
@@ -155,6 +158,12 @@
 //! # Terminal 2: Run this TUI (use the port printed by the application)
 //! buck2 run fbcode//monarch/hyperactor_mesh_admin_tui:hyperactor_mesh_admin_tui -- --addr 127.0.0.1:XXXXX
 //! ```
+
+// tokio is used extensively (tokio::spawn, tokio::time, tokio::sync)
+// but the unused-deps linter does not see through fbinit's runtime
+// provider. This suppresses the false positive while keeping tokio
+// in BUCK deps for autocargo.
+use tokio as _;
 
 mod actions;
 mod app;

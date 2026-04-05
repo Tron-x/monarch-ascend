@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
 use std::pin::Pin;
-use std::str::FromStr;
 use std::sync::OnceLock;
 
 use async_trait::async_trait;
@@ -34,14 +33,12 @@ use hyperactor::Proc;
 use hyperactor::RefClient;
 use hyperactor::channel::ChannelTransport;
 use hyperactor::context;
-use hyperactor::context::Mailbox as _;
 use hyperactor::host::Host;
 use hyperactor::host::HostError;
 use hyperactor::host::LOCAL_PROC_NAME;
 use hyperactor::host::LocalProcManager;
 use hyperactor::host::SERVICE_PROC_NAME;
 use hyperactor::mailbox::MailboxServerHandle;
-use hyperactor::mailbox::PortSender as _;
 use hyperactor::reference as hyperactor_reference;
 use hyperactor_config::Flattrs;
 use hyperactor_config::attrs::Attrs;
@@ -57,46 +54,11 @@ use crate::bootstrap::BootstrapProcConfig;
 use crate::bootstrap::BootstrapProcManager;
 use crate::config_dump::ConfigDump;
 use crate::config_dump::ConfigDumpResult;
-use crate::mesh_admin::MeshAdminMessageClient;
 use crate::proc_agent::ProcAgent;
 use crate::pyspy::PySpyDump;
 use crate::pyspy::PySpyWorker;
 use crate::resource;
 use crate::resource::ProcSpec;
-
-/// Typed host-node identifier for mesh admin navigation.
-///
-/// Wraps an [`ActorId`] (the `HostAgent`'s actor id) and
-/// serializes with a `host:` prefix so that the admin resolver can
-/// distinguish host-level references from plain actor references.
-/// The same `HostAgent` `ActorId` can appear as both a host
-/// (from root's children) and as an actor (from a proc's children);
-/// `HostId` makes the host case unambiguous.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HostId(pub hyperactor_reference::ActorId);
-
-/// Prefix used by [`HostId`] for display/parse round-tripping.
-const HOST_ID_PREFIX: &str = "host:";
-
-impl fmt::Display for HostId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{HOST_ID_PREFIX}{}", self.0)
-    }
-}
-
-impl FromStr for HostId {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let inner = s
-            .strip_prefix(HOST_ID_PREFIX)
-            .ok_or_else(|| anyhow::anyhow!("not a host reference: {}", s))?;
-        let actor_id: hyperactor_reference::ActorId = inner
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid actor id in host ref '{}': {}", s, e))?;
-        Ok(HostId(actor_id))
-    }
-}
 
 pub(crate) type ProcManagerSpawnFuture =
     Pin<Box<dyn Future<Output = anyhow::Result<ActorHandle<ProcAgent>>> + Send>>;
@@ -217,6 +179,21 @@ pub(crate) struct ProcCreationState {
 /// Actor name used when spawning the host mesh agent on the system proc.
 pub const HOST_MESH_AGENT_ACTOR_NAME: &str = "host_agent";
 
+/// Lifecycle state of the host managed by [`HostAgent`].
+enum HostAgentState {
+    /// Waiting for a client to attach. The host is idle and ready
+    /// to accept new proc spawn requests.
+    Detached(HostAgentMode),
+    /// Actively running procs for an attached client.
+    Attached(HostAgentMode),
+    /// Procs are being drained by a DrainWorker. The host has been
+    /// temporarily moved to the worker. The host agent remains
+    /// responsive; min_proc_status() returns Stopping.
+    Draining,
+    /// Host fully shut down.
+    Shutdown,
+}
+
 /// A mesh agent is responsible for managing a host in a [`HostMesh`],
 /// through the resource behaviors defined in [`crate::resource`].
 /// Self-notification sent by bridge tasks when a proc's status changes.
@@ -224,6 +201,66 @@ pub const HOST_MESH_AGENT_ACTOR_NAME: &str = "host_agent";
 #[derive(Debug, Serialize, Deserialize, Named)]
 struct ProcStatusChanged {
     name: Name,
+}
+
+/// Sent by DrainWorker back to HostAgent when draining completes.
+/// Not exported — delivered locally via PortHandle (no serialization).
+struct DrainComplete {
+    host: HostAgentMode,
+    ack: hyperactor_reference::PortRef<()>,
+}
+
+/// Child actor whose only job is to run `host.terminate_children()` in
+/// its `init()`, return the host and ack to the parent via DrainComplete,
+/// and exit. Runs on the same proc as the host agent so it gets its
+/// own `Instance` (required by `terminate_children`).
+#[hyperactor::export(handlers = [])]
+struct DrainWorker {
+    host: Option<HostAgentMode>,
+    timeout: Duration,
+    max_in_flight: usize,
+    ack: Option<hyperactor_reference::PortRef<()>>,
+    done_notify: PortHandle<DrainComplete>,
+}
+
+#[async_trait]
+impl Actor for DrainWorker {
+    async fn init(&mut self, this: &Instance<Self>) -> Result<(), anyhow::Error> {
+        if let Some(host) = self.host.as_mut() {
+            match host {
+                HostAgentMode::Process { host, .. } => {
+                    host.terminate_children(
+                        this,
+                        self.timeout,
+                        self.max_in_flight.clamp(1, 256),
+                        "drain host",
+                    )
+                    .await;
+                }
+                HostAgentMode::Local(host) => {
+                    host.terminate_children(this, self.timeout, self.max_in_flight, "drain host")
+                        .await;
+                }
+            }
+        }
+
+        // Bundle host + ack into DrainComplete so the parent sends the ack
+        // AFTER restoring state (prevents race with ShutdownHost).
+        if let (Some(host), Some(ack)) = (self.host.take(), self.ack.take()) {
+            let _ = self.done_notify.send(this, DrainComplete { host, ack });
+        }
+
+        Ok(())
+    }
+}
+
+impl fmt::Debug for DrainWorker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DrainWorker")
+            .field("timeout", &self.timeout)
+            .field("max_in_flight", &self.max_in_flight)
+            .finish()
+    }
 }
 
 #[hyperactor::export(
@@ -235,8 +272,7 @@ struct ProcStatusChanged {
         resource::WaitRankStatus { cast = true },
         resource::List,
         ShutdownHost,
-        StopHost,
-        SpawnMeshAdmin,
+        DrainHost,
         SetClientConfig,
         ProcStatusChanged,
         PySpyDump,
@@ -244,7 +280,7 @@ struct ProcStatusChanged {
     ]
 )]
 pub struct HostAgent {
-    pub(crate) host: Option<HostAgentMode>,
+    state: HostAgentState,
     pub(crate) created: HashMap<Name, ProcCreationState>,
     /// Pending `WaitRankStatus` waiters, keyed by resource name.
     /// Each entry is `(min_status, rank, reply_port)`. Only touched
@@ -277,7 +313,7 @@ impl HostAgent {
     /// Create a new host mesh agent running in the provided mode.
     pub fn new(host: HostAgentMode) -> Self {
         Self {
-            host: Some(host),
+            state: HostAgentState::Detached(host),
             created: HashMap::new(),
             pending_proc_waiters: HashMap::new(),
             watching: HashSet::new(),
@@ -287,18 +323,42 @@ impl HostAgent {
         }
     }
 
+    /// Minimum status floor derived from the host agent's lifecycle.
+    /// Procs on this host cannot be healthier than this.
+    fn min_proc_status(&self) -> resource::Status {
+        match &self.state {
+            HostAgentState::Detached(_) | HostAgentState::Attached(_) => resource::Status::Running,
+            HostAgentState::Draining => resource::Status::Stopping,
+            HostAgentState::Shutdown => resource::Status::Stopped,
+        }
+    }
+
+    fn host(&self) -> Option<&HostAgentMode> {
+        match &self.state {
+            HostAgentState::Detached(h) | HostAgentState::Attached(h) => Some(h),
+            _ => None,
+        }
+    }
+
+    fn host_mut(&mut self) -> Option<&mut HostAgentMode> {
+        match &mut self.state {
+            HostAgentState::Detached(h) | HostAgentState::Attached(h) => Some(h),
+            _ => None,
+        }
+    }
+
     /// Terminate all tracked children on the host and clear proc state.
     ///
     /// The host, system proc, mailbox server, and HostAgent all stay
     /// alive — only user procs are killed. After this returns the host
     /// is ready to accept new spawn requests with the same proc names.
-    async fn terminate_children_and_clear(
+    async fn drain(
         &mut self,
         cx: &Context<'_, Self>,
         timeout: std::time::Duration,
         max_in_flight: usize,
     ) {
-        if let Some(host_mode) = self.host.as_mut() {
+        if let Some(host_mode) = self.host_mut() {
             match host_mode {
                 HostAgentMode::Process { host, .. } => {
                     let summary = host
@@ -317,31 +377,33 @@ impl HostAgent {
         self.created.clear();
     }
 
-    /// Publish the current host properties and children list for
+    /// Publish the current host properties and child list for
     /// introspection. Called from init and after each state change
     /// (proc created/stopped).
     fn publish_introspect_properties(&self, cx: &Instance<Self>) {
-        let host = match self.host.as_ref() {
+        let host = match self.host() {
             Some(h) => h,
-            None => return, // host shut down
+            None => return, // host shut down or stopping
         };
 
         let addr = host.addr().to_string();
-        let mut children = Vec::new();
-        let system_children = Vec::new();
+        let mut children: Vec<hyperactor::introspect::IntrospectRef> = Vec::new();
+        let system_children: Vec<crate::introspect::NodeRef> = Vec::new();
 
         // Procs are not system — only actors are. Both service and
         // local appear as regular children; 's' in the TUI toggles
         // actor visibility, not proc visibility.
-        let sys_ref = host.system_proc().proc_id().to_string();
-        let local_ref = host.local_proc().proc_id().to_string();
-        children.push(sys_ref);
-        children.push(local_ref);
+        children.push(hyperactor::introspect::IntrospectRef::Proc(
+            host.system_proc().proc_id().clone(),
+        ));
+        children.push(hyperactor::introspect::IntrospectRef::Proc(
+            host.local_proc().proc_id().clone(),
+        ));
 
         // User procs.
         for state in self.created.values() {
             if let Ok((proc_id, _agent_ref)) = &state.created {
-                children.push(proc_id.to_string());
+                children.push(hyperactor::introspect::IntrospectRef::Proc(proc_id.clone()));
             }
         }
 
@@ -363,7 +425,7 @@ impl Actor for HostAgent {
         // Serve the host now that the agent is initialized. Make sure our port is
         // bound before serving.
         this.bind::<Self>();
-        match self.host.as_mut().unwrap() {
+        match self.host_mut().unwrap() {
             HostAgentMode::Process { host, .. } => {
                 self.mailbox_handle = host.serve();
                 let (directory, file) = hyperactor_telemetry::log_file_path(
@@ -387,7 +449,7 @@ impl Actor for HostAgent {
 
         // Register callback for QueryChild — resolves system procs
         // that are not independently addressable actors.
-        let host = self.host.as_ref().expect("host present");
+        let host = self.host().expect("host present");
         let system_proc = host.system_proc().clone();
         let local_proc = host.local_proc().clone();
         let self_id = this.self_id().clone();
@@ -423,16 +485,15 @@ impl Actor for HostAgent {
                     // actors) may appear but are harmless — the TUI
                     // handles "not found" gracefully.
                     let all_keys = proc.all_instance_keys();
-                    let mut actors = Vec::with_capacity(all_keys.len());
-                    let mut system_actors = Vec::new();
+                    let mut actors: Vec<hyperactor::introspect::IntrospectRef> =
+                        Vec::with_capacity(all_keys.len());
+                    let mut system_actors: Vec<crate::introspect::NodeRef> = Vec::new();
                     for id in all_keys {
-                        let ref_str = id.to_string();
                         if proc.get_instance(&id).is_some_and(|cell| cell.is_system()) {
-                            system_actors.push(ref_str.clone());
+                            system_actors.push(crate::introspect::NodeRef::Actor(id.clone()));
                         }
-                        actors.push(ref_str);
+                        actors.push(hyperactor::introspect::IntrospectRef::Actor(id));
                     }
-                    // Build attrs for this proc node.
                     let mut attrs = hyperactor_config::Attrs::new();
                     attrs.set(crate::introspect::NODE_TYPE, "proc".to_string());
                     attrs.set(crate::introspect::PROC_NAME, label.to_string());
@@ -442,12 +503,15 @@ impl Actor for HostAgent {
                         serde_json::to_string(&attrs).unwrap_or_else(|_| "{}".to_string());
 
                     IntrospectResult {
-                        identity: proc.proc_id().to_string(),
+                        identity: hyperactor::introspect::IntrospectRef::Proc(
+                            proc.proc_id().clone(),
+                        ),
                         attrs: attrs_json,
                         children: actors,
-                        parent: Some(HostId(self_id.clone()).to_string()),
-                        as_of: humantime::format_rfc3339_millis(std::time::SystemTime::now())
-                            .to_string(),
+                        parent: Some(hyperactor::introspect::IntrospectRef::Actor(
+                            self_id.clone(),
+                        )),
+                        as_of: std::time::SystemTime::now(),
                     }
                 }
                 None => {
@@ -457,14 +521,24 @@ impl Actor for HostAgent {
                         hyperactor::introspect::ERROR_MESSAGE,
                         format!("child {} not found", child_ref),
                     );
+                    let identity = match child_ref {
+                        hyperactor::reference::Reference::Proc(id) => {
+                            hyperactor::introspect::IntrospectRef::Proc(id.clone())
+                        }
+                        hyperactor::reference::Reference::Actor(id) => {
+                            hyperactor::introspect::IntrospectRef::Actor(id.clone())
+                        }
+                        hyperactor::reference::Reference::Port(id) => {
+                            hyperactor::introspect::IntrospectRef::Actor(id.actor_id().clone())
+                        }
+                    };
                     IntrospectResult {
-                        identity: String::new(),
+                        identity,
                         attrs: serde_json::to_string(&error_attrs)
                             .unwrap_or_else(|_| "{}".to_string()),
                         children: Vec::new(),
                         parent: None,
-                        as_of: humantime::format_rfc3339_millis(std::time::SystemTime::now())
-                            .to_string(),
+                        as_of: std::time::SystemTime::now(),
                     }
                 }
             }
@@ -498,7 +572,9 @@ impl Handler<resource::CreateOrUpdate<ProcSpec>> for HostAgent {
             return Ok(());
         }
 
-        let host = self.host.as_mut().expect("host present");
+        let host = self
+            .host_mut()
+            .ok_or_else(|| anyhow::anyhow!("HostAgent has already shut down"))?;
         let created = match host {
             HostAgentMode::Process { host, .. } => {
                 host.spawn(
@@ -526,10 +602,22 @@ impl Handler<resource::CreateOrUpdate<ProcSpec>> for HostAgent {
         if let Err(e) = &created {
             tracing::error!("failed to spawn proc {}: {}", create_or_update.name, e);
         }
+        let was_empty = self.created.is_empty();
         self.created.insert(
             create_or_update.name.clone(),
             ProcCreationState { rank, created },
         );
+
+        // Transition Detached → Attached on first proc creation.
+        if was_empty {
+            if let HostAgentState::Detached(_) = &self.state {
+                let host = match std::mem::replace(&mut self.state, HostAgentState::Shutdown) {
+                    HostAgentState::Detached(h) => h,
+                    _ => unreachable!(),
+                };
+                self.state = HostAgentState::Attached(host);
+            }
+        }
 
         // If any WaitRankStatus messages arrived before this proc
         // existed, their waiters were stashed with a sentinel rank.
@@ -577,8 +665,7 @@ impl Handler<resource::Stop> for HostAgent {
             "stopping proc"
         );
         let host = self
-            .host
-            .as_ref()
+            .host()
             .ok_or(anyhow::anyhow!("HostAgent has already shut down"))?;
         let timeout = hyperactor_config::global::get(hyperactor::config::PROCESS_EXIT_TIMEOUT);
 
@@ -614,11 +701,11 @@ impl Handler<resource::GetRankStatus> for HostAgent {
                 rank,
                 created: Ok((proc_id, _mesh_agent)),
             }) => {
-                let status = match self.host.as_ref() {
+                let raw_status = match self.host() {
                     Some(host) => host.proc_status(proc_id).await.0,
-                    None => Status::Stopped,
+                    None => resource::Status::Unknown,
                 };
-                (*rank, status)
+                (*rank, raw_status.clamp_min(self.min_proc_status()))
             }
             Some(ProcCreationState {
                 rank,
@@ -666,7 +753,7 @@ impl Handler<resource::WaitRankStatus> for HostAgent {
                 created: Ok((proc_id, _)),
             }) => {
                 let rank = *rank;
-                let status = match self.host.as_ref() {
+                let status = match self.host() {
                     Some(host) => host.proc_status(proc_id).await.0,
                     None => Status::Stopped,
                 };
@@ -726,7 +813,7 @@ impl Handler<ProcStatusChanged> for HostAgent {
             Some(ProcCreationState {
                 created: Ok((proc_id, _)),
                 ..
-            }) => match self.host.as_ref() {
+            }) => match self.host() {
                 Some(host) => host.proc_status(proc_id).await.0,
                 None => Status::Stopped,
             },
@@ -788,7 +875,7 @@ impl HostAgent {
             None => return,
         };
 
-        match self.host.as_ref() {
+        match self.host() {
             Some(HostAgentMode::Process { host, .. }) => {
                 if let Some(rx) = host.manager().watch(proc_id).await {
                     start_proc_watch(port, rx, name.clone(), |s| s.clone().into());
@@ -850,47 +937,67 @@ pub struct ShutdownHost {
 }
 wirevalue::register_type!(ShutdownHost);
 
-/// Stop the host: tear down all resources (procs, host, router) but
-/// keep the worker process alive so a new client can re-bootstrap.
-/// TODO: consider generalizing resource::StopAll to use for this case.
+/// Drain all user procs on this host but keep the host, service
+/// proc, and networking alive. Used during mesh stop/shutdown so
+/// that forwarder flushes can still reach remote hosts.
 #[derive(Serialize, Deserialize, Debug, Named, Handler, RefClient, HandleClient)]
-pub struct StopHost {
-    /// Grace window: send SIGTERM and wait this long before
-    /// escalating.
+pub struct DrainHost {
     pub timeout: std::time::Duration,
-    /// Max number of children to terminate concurrently on this host.
     pub max_in_flight: usize,
-    /// Ack that the agent finished stop work (best-effort).
     #[reply]
     pub ack: hyperactor::reference::PortRef<()>,
 }
-wirevalue::register_type!(StopHost);
+wirevalue::register_type!(DrainHost);
 
 #[async_trait]
-impl Handler<StopHost> for HostAgent {
-    async fn handle(&mut self, cx: &Context<Self>, msg: StopHost) -> anyhow::Result<()> {
-        // Terminate children BEFORE acking, so the caller's networking
-        // stays alive while children flush their forwarders during
-        // teardown. If we ack first, the caller proceeds to tear down
-        // the host proc's networking while children are still running,
-        // causing their forwarder flushes to hang until
-        // MESSAGE_DELIVERY_TIMEOUT expires.
-        self.terminate_children_and_clear(cx, msg.timeout, msg.max_in_flight)
-            .await;
+impl Handler<DrainHost> for HostAgent {
+    async fn handle(&mut self, cx: &Context<Self>, msg: DrainHost) -> anyhow::Result<()> {
+        let host = match std::mem::replace(&mut self.state, HostAgentState::Draining) {
+            HostAgentState::Attached(h) => h,
+            other @ (HostAgentState::Detached(_) | HostAgentState::Draining) => {
+                // Nothing to drain — ack immediately.
+                self.state = other;
+                msg.ack.send(cx, ())?;
+                return Ok(());
+            }
+            HostAgentState::Shutdown => {
+                self.state = HostAgentState::Shutdown;
+                msg.ack.send(cx, ())?;
+                return Ok(());
+            }
+        };
 
-        // Ack after children are terminated so the caller does not
-        // tear down the host's networking prematurely.
-        let (return_handle, mut return_receiver) = cx.mailbox().open_port();
-        cx.mailbox()
-            .serialize_and_send(&msg.ack, (), return_handle)?;
-        if return_receiver.recv().await.is_ok() {
-            tracing::warn!("failed to send ack");
-        }
-        tracing::info!(
-            proc_id = %cx.self_id().proc_id(),
-            actor_id = %cx.self_id(),
-            "host stopped, ready for new client"
-        );
+        // Do NOT clear `self.created` here: the DrainWorker
+        // terminates procs asynchronously, and concurrent GetState /
+        // GetRankStatus queries must still find the entries. With the
+        // host in Draining state (`self.host()` returns None), those
+        // handlers already report Status::Stopped for every known
+        // proc, which is the correct answer while draining is
+        // in progress.
+
+        let done_port = cx.port::<DrainComplete>();
+
+        cx.spawn_with_name(
+            "drain_worker",
+            DrainWorker {
+                host: Some(host),
+                timeout: msg.timeout,
+                max_in_flight: msg.max_in_flight,
+                ack: Some(msg.ack),
+                done_notify: done_port,
+            },
+        )?;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<DrainComplete> for HostAgent {
+    async fn handle(&mut self, cx: &Context<Self>, msg: DrainComplete) -> anyhow::Result<()> {
+        self.state = HostAgentState::Detached(msg.host);
+        self.created.clear();
+        msg.ack.send(cx, ())?;
         Ok(())
     }
 }
@@ -904,35 +1011,35 @@ impl Handler<ShutdownHost> for HostAgent {
         // the host proc's networking while children are still running,
         // causing their forwarder flushes to hang until
         // MESSAGE_DELIVERY_TIMEOUT expires.
-        self.terminate_children_and_clear(cx, msg.timeout, msg.max_in_flight)
-            .await;
+        if !self.created.is_empty() {
+            self.drain(cx, msg.timeout, msg.max_in_flight).await;
+        }
 
         // Ack after children are terminated so the caller does not
         // tear down the host's networking prematurely.
-        let (return_handle, mut return_receiver) = cx.mailbox().open_port();
-        cx.mailbox()
-            .serialize_and_send(&msg.ack, (), return_handle)?;
-
-        // If message is returned, it means the ack was not sent successfully.
-        if return_receiver.recv().await.is_ok() {
-            tracing::warn!("failed to send ack");
-        }
+        msg.ack.send(cx, ())?;
 
         // Drop the host and signal the bootstrap loop to drain the
         // mailbox and exit.
-        if let Some(HostAgentMode::Process {
-            shutdown_tx: Some(tx),
-            ..
-        }) = self.host.take()
-        {
-            tracing::info!(
-                proc_id = %cx.self_id().proc_id(),
-                actor_id = %cx.self_id(),
-                "host is shut down, sending mailbox handle to bootstrap for draining"
-            );
-            if let Some(handle) = self.mailbox_handle.take() {
-                let _ = tx.send(handle);
+        match std::mem::replace(&mut self.state, HostAgentState::Shutdown) {
+            HostAgentState::Detached(HostAgentMode::Process {
+                shutdown_tx: Some(tx),
+                ..
+            })
+            | HostAgentState::Attached(HostAgentMode::Process {
+                shutdown_tx: Some(tx),
+                ..
+            }) => {
+                tracing::info!(
+                    proc_id = %cx.self_id().proc_id(),
+                    actor_id = %cx.self_id(),
+                    "host is shut down, sending mailbox handle to bootstrap for draining"
+                );
+                if let Some(handle) = self.mailbox_handle.take() {
+                    let _ = tx.send(handle);
+                }
             }
+            _ => {}
         }
 
         Ok(())
@@ -961,13 +1068,14 @@ impl Handler<resource::GetState<ProcState>> for HostAgent {
                 rank,
                 created: Ok((proc_id, mesh_agent)),
             }) => {
-                let (status, proc_status, bootstrap_command) = match self.host.as_ref() {
+                let (raw_status, proc_status, bootstrap_command) = match self.host() {
                     Some(host) => {
                         let (status, proc_status) = host.proc_status(proc_id).await;
                         (status, proc_status, host.bootstrap_command())
                     }
-                    None => (resource::Status::Stopped, None, None),
+                    None => (resource::Status::Unknown, None, None),
                 };
+                let status = raw_status.clamp_min(self.min_proc_status());
                 resource::State {
                     name: get_state.name.clone(),
                     status,
@@ -1021,63 +1129,6 @@ impl Handler<resource::List> for HostAgent {
     async fn handle(&mut self, cx: &Context<Self>, list: resource::List) -> anyhow::Result<()> {
         list.reply
             .send(cx, self.created.keys().cloned().collect())?;
-        Ok(())
-    }
-}
-
-/// Message to spawn a [`MeshAdminAgent`] on this host's system proc.
-///
-/// The handler spawns the admin agent, queries its HTTP address via
-/// `GetAdminAddr`, and replies with the address string.
-#[derive(Serialize, Deserialize, Debug, Named, Handler, RefClient, HandleClient)]
-pub struct SpawnMeshAdmin {
-    /// All hosts in the mesh as `(address, agent_ref)` pairs. Passed
-    /// through to [`MeshAdminAgent::new`] so the admin can fan out
-    /// introspection queries to every host.
-    pub hosts: Vec<(String, hyperactor_reference::ActorRef<HostAgent>)>,
-
-    /// `ActorId` of the process-global root client, exposed as a
-    /// child node in the admin introspection tree. `None` if no root
-    /// client is available.
-    pub root_client_actor_id: Option<hyperactor_reference::ActorId>,
-
-    /// Explicit bind address for the admin HTTP server. When `None`,
-    /// the server reads `MESH_ADMIN_ADDR` from config.
-    pub admin_addr: Option<std::net::SocketAddr>,
-
-    /// Reply port for the admin HTTP address string (e.g.
-    /// `"myhost.facebook.com:8080"`).
-    #[reply]
-    pub addr: hyperactor::reference::PortRef<String>,
-}
-wirevalue::register_type!(SpawnMeshAdmin);
-
-#[async_trait]
-impl Handler<SpawnMeshAdmin> for HostAgent {
-    /// Spawns a [`MeshAdminAgent`] on this host's system proc, waits
-    /// for its HTTP server to bind, and replies with the listen
-    /// address.
-    async fn handle(&mut self, cx: &Context<Self>, msg: SpawnMeshAdmin) -> anyhow::Result<()> {
-        let proc = self
-            .host
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("host is not available"))?
-            .system_proc();
-
-        let agent_handle = proc.spawn(
-            crate::mesh_admin::MESH_ADMIN_ACTOR_NAME,
-            crate::mesh_admin::MeshAdminAgent::new(
-                msg.hosts,
-                msg.root_client_actor_id,
-                msg.admin_addr,
-            ),
-        )?;
-        let response = agent_handle.get_admin_addr(cx).await?;
-        let addr_str = response
-            .addr
-            .ok_or_else(|| anyhow::anyhow!("mesh admin agent did not report an address"))?;
-
-        msg.addr.send(cx, addr_str)?;
         Ok(())
     }
 }
@@ -1137,9 +1188,12 @@ impl Handler<GetLocalProc> for HostAgent {
         cx: &Context<Self>,
         GetLocalProc { proc_mesh_agent }: GetLocalProc,
     ) -> anyhow::Result<()> {
-        let agent = self.local_mesh_agent.get_or_init(|| {
-            ProcAgent::boot_v1(self.host.as_ref().unwrap().local_proc().clone(), None)
-        });
+        let host = self
+            .host()
+            .ok_or_else(|| anyhow::anyhow!("HostAgent has already shut down"))?;
+        let agent = self
+            .local_mesh_agent
+            .get_or_init(|| ProcAgent::boot_v1(host.local_proc().clone(), None));
 
         match agent {
             Err(e) => anyhow::bail!("error booting local proc: {}", e),

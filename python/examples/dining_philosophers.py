@@ -40,13 +40,12 @@ so the full dashboard UI is available out of the box.
 
 import argparse
 import asyncio
-import os
 from enum import auto, Enum
 from typing import Any, cast
 
 from monarch._src.actor.actor_mesh import ActorMesh
-from monarch.actor import Actor, current_rank, endpoint, this_host
-from monarch.distributed_telemetry.actor import start_telemetry
+from monarch.actor import Actor, current_rank, endpoint
+from monarch.job import ProcessJob, TelemetryConfig
 
 
 class ChopstickStatus(Enum):
@@ -158,13 +157,21 @@ async def async_main(
     dashboard_port: int = 8265,
     kill_waiter_after: float | None = None,
 ) -> None:
+    job = ProcessJob({"hosts": 1})
+    job.enable_admin()
     if dashboard:
-        start_telemetry(include_dashboard=True, dashboard_port=dashboard_port)
+        job.enable_telemetry(
+            TelemetryConfig(include_dashboard=True, dashboard_port=dashboard_port)
+        )
+    state = job.state(cached_path=None)
+    host = state.hosts
 
-    host = this_host()
+    telemetry_url = state.telemetry_url
+    if telemetry_url is not None:
+        print(f"  - Dashboard:     {telemetry_url}")
 
-    # Spawn the admin agent so the TUI can attach.
-    admin_url = await host._spawn_admin()
+    admin_url = state.admin_url
+    assert admin_url is not None
     mtls_flags = (
         "--cacert /var/facebook/rootcanal/ca.pem "
         "--cert /var/facebook/x509_identities/server.pem "
@@ -179,11 +186,6 @@ async def async_main(
     print(
         f"  - TUI:           buck2 run fbcode//monarch/hyperactor_mesh_admin_tui:hyperactor_mesh_admin_tui -- --addr {admin_url}"
     )
-    if dashboard:
-        dashboard_url = os.environ.get(
-            "MONARCH_DASHBOARD_URL", f"http://localhost:{dashboard_port}"
-        )
-        print(f"  - Dashboard:     {dashboard_url}")
     print("\nPress Ctrl+C to stop.\n", flush=True)
 
     # Spawn philosopher processes and actors.

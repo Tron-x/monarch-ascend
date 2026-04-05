@@ -79,7 +79,7 @@
 //! ### Tree endpoint
 //!
 //! - **MIT-13 (root-contract):** `/v1/root` returns `Root` variant
-//!   with `identity == "root"`, `num_hosts >= 1`, non-empty
+//!   with `identity == NodeRef::Root`, `num_hosts >= 1`, non-empty
 //!   `children`.
 //! - **MIT-14 (tree-format):** `/v1/tree` contains box-drawing
 //!   characters (`├──`/`└──`), clickable URLs, and workload-specific
@@ -120,8 +120,9 @@
 //!   node are fetchable via `/v1/{ref}`.
 //! - **MIT-21 (node-kind-typing):** Root returns `Root`, host returns
 //!   `Host`, proc returns `Proc`, actor returns `Actor` variant.
-//! - **MIT-22 (identity-consistency):** `node.identity` matches the
-//!   reference string used to fetch it.
+//! - **MIT-22 (identity-consistency):** `node.identity` (a typed
+//!   `NodeRef`) round-trips through its Display/FromStr to match
+//!   the HTTP path reference used to fetch it.
 //! - **MIT-23 (child-link-consistency):** Root, first host, classified
 //!   service proc, classified worker proc, and known actor refs are
 //!   fetchable.
@@ -169,11 +170,12 @@
 //! - **MIT-38 (openapi-resolvable):** All `$ref` targets resolve to
 //!   definitions that exist within the document.
 //! - **MIT-39 (openapi-routes-covered):** Every client-facing route
-//!   (`/v1/root`, `/v1/{reference}`, `/v1/config/{proc_reference}`,
-//!   `/v1/tree`, `/v1/schema`, `/v1/schema/error`) is present in
-//!   `paths`. The spec-serving endpoint `/v1/openapi.json` is also
-//!   verified to be live, though it is not required to appear in
-//!   `paths` since it is a meta-endpoint.
+//!   (`/v1/admin`, `/v1/root`, `/v1/{reference}`,
+//!   `/v1/config/{proc_reference}`, `/v1/tree`, `/v1/schema`,
+//!   `/v1/schema/admin`, `/v1/schema/error`) is present in `paths`.
+//!   The spec-serving endpoint `/v1/openapi.json` is also verified
+//!   to be live, though it is not required to appear in `paths`
+//!   since it is a meta-endpoint.
 //! - **MIT-40 (schemas-compile):** Every `components/schemas` entry
 //!   compiles via `jsonschema::JSONSchema::compile` when embedded in
 //!   a synthetic document that includes the full component set as
@@ -255,7 +257,31 @@
 //!
 //! - **MIT-62 (pyspy-content-type):** Both success and error
 //!   responses use `application/json` media type.
+//!
+//! ### Telemetry proxy endpoints
+//!
+//! - **MIT-63 (query-proxy-success):** `POST /v1/query` with valid
+//!   SQL returns a `QueryResponse` with non-empty rows.
+//! - **MIT-64 (query-proxy-invalid-sql):** `POST /v1/query` with
+//!   invalid SQL returns a non-success HTTP status.
+//! - **MIT-65 (query-proxy-telemetry-tables):** `POST /v1/query` can
+//!   query live telemetry tables (`meshes`, `actors`) populated by
+//!   the workload.
+//! - **MIT-66 (pyspy-dump-bogus-ref):** `POST /v1/pyspy_dump` with a
+//!   bogus proc reference returns `ApiErrorEnvelope`.
+//! - **MIT-67 (pyspy-dump-end-to-end):** Discover a proc via SQL
+//!   query, trigger a py-spy dump via `/v1/pyspy_dump`, then verify
+//!   the dump is stored and queryable via SQL.
+//! - **MIT-68 (query-no-dashboard-404):** `POST /v1/query` without a
+//!   configured dashboard returns 404 with `not_found` error code.
+//! - **MIT-69 (pyspy-dump-no-dashboard-404):** `POST /v1/pyspy_dump`
+//!   without a configured dashboard returns 404 with `not_found`
+//!   error code.
+//! - **MIT-70 (query-malformed-body):** `POST /v1/query` with a
+//!   malformed JSON body (missing required `sql` field) returns a
+//!   non-success status.
 
+mod admin;
 mod auth;
 mod config;
 mod dining;
@@ -264,6 +290,7 @@ mod openapi;
 mod pyspy;
 mod ref_check;
 mod ref_edge;
+mod telemetry;
 mod tree;
 
 // --- dining family ---
@@ -353,4 +380,48 @@ async fn test_auth_failures_rust() {
 #[tokio::test]
 async fn test_openapi_conformance_rust() {
     dining::run_openapi_conformance_rust().await;
+}
+
+// --- telemetry proxy family ---
+
+/// MIT-63: query proxy returns rows for valid SQL.
+#[tokio::test]
+async fn test_query_proxy_success() {
+    telemetry::run_query_success().await;
+}
+
+/// MIT-64: query proxy returns error for invalid SQL.
+#[tokio::test]
+async fn test_query_proxy_invalid_sql() {
+    telemetry::run_query_invalid_sql().await;
+}
+
+/// MIT-65: query proxy can query live telemetry tables.
+#[tokio::test]
+async fn test_query_proxy_telemetry_tables() {
+    telemetry::run_query_telemetry_tables().await;
+}
+
+/// MIT-66: pyspy_dump with bogus proc ref returns error envelope.
+#[tokio::test]
+async fn test_pyspy_dump_bogus_ref() {
+    telemetry::run_pyspy_dump_bogus_ref().await;
+}
+
+/// MIT-67: end-to-end SQL → pyspy dump → SQL verify.
+#[tokio::test]
+async fn test_pyspy_dump_and_query() {
+    telemetry::run_pyspy_dump_and_query().await;
+}
+
+/// MIT-68, MIT-69: /v1/query and /v1/pyspy_dump return 404 without dashboard.
+#[tokio::test]
+async fn test_no_dashboard_returns_404() {
+    telemetry::run_no_dashboard_returns_404().await;
+}
+
+/// MIT-70: /v1/query with malformed body returns error.
+#[tokio::test]
+async fn test_query_malformed_body() {
+    telemetry::run_query_malformed_body().await;
 }

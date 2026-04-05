@@ -17,7 +17,6 @@ use ratatui::widgets::Paragraph;
 
 use crate::ActiveJob;
 use crate::App;
-use crate::format::format_uptime;
 use crate::model::NodeType;
 use crate::theme::LangName;
 use crate::theme::ThemeName;
@@ -58,14 +57,19 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Ap
     };
 
     // Extract uptime and username from root node
-    let (uptime_str, username) = if let Some(root_payload) = app.get_cached_payload("root") {
+    let (uptime_str, username) = if let Some(root_payload) =
+        app.get_cached_payload(&hyperactor_mesh::introspect::NodeRef::Root)
+    {
         if let NodeProperties::Root {
             started_at,
             started_by,
             ..
         } = &root_payload.properties
         {
-            (Some(format_uptime(started_at)), Some(started_by.clone()))
+            (
+                Some(crate::format::format_system_time_uptime(started_at)),
+                Some(started_by.clone()),
+            )
         } else {
             (None, None)
         }

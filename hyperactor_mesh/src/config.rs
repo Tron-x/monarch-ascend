@@ -125,8 +125,7 @@ declare_attrs! {
     ///
     /// Parsed as a `SocketAddr` (e.g. `[::]:1729`, `0.0.0.0:8080`).
     /// Used as the bind address when no explicit address is provided
-    /// to `MeshAdminAgent`, and as the default address assumed by
-    /// admin clients connecting via `mast_conda:///`.
+    /// to `MeshAdminAgent`.
     @meta(CONFIG = ConfigAttr::new(
         Some("HYPERACTOR_MESH_ADMIN_ADDR".to_string()),
         Some("mesh_admin_addr".to_string()),

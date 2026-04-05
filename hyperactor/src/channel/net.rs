@@ -170,6 +170,56 @@ use session::Session;
 use crate::config;
 use crate::metrics;
 
+pub(crate) enum LinkStatus {
+    NeverConnected,
+    Connected(tokio::time::Instant),
+    Disconnected {
+        last_connected: tokio::time::Instant,
+        since: tokio::time::Instant,
+    },
+}
+
+impl LinkStatus {
+    fn connected(&mut self) {
+        *self = LinkStatus::Connected(tokio::time::Instant::now());
+    }
+
+    fn disconnected(&mut self) {
+        match *self {
+            LinkStatus::Connected(at) => {
+                *self = LinkStatus::Disconnected {
+                    last_connected: at,
+                    since: tokio::time::Instant::now(),
+                };
+            }
+            // Already disconnected or never connected — leave as is.
+            _ => {}
+        }
+    }
+}
+
+impl std::fmt::Display for LinkStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LinkStatus::NeverConnected => write!(f, "never connected"),
+            LinkStatus::Connected(at) => {
+                write!(f, "connected for {:.1}s", at.elapsed().as_secs_f64())
+            }
+            LinkStatus::Disconnected {
+                last_connected,
+                since,
+            } => {
+                write!(
+                    f,
+                    "last connected {:.1}s ago, disconnected for {:.1}s",
+                    last_connected.elapsed().as_secs_f64(),
+                    since.elapsed().as_secs_f64(),
+                )
+            }
+        }
+    }
+}
+
 /// Log a send-loop error and return `true` if the error is terminal
 /// (caller should exit), `false` if recoverable (caller should reconnect).
 fn log_send_error(
@@ -177,10 +227,11 @@ fn log_send_error(
     dest: &ChannelAddr,
     session_id: u64,
     mode: &str,
+    link_status: &LinkStatus,
 ) -> bool {
     match error {
         session::SendLoopError::Io(err) => {
-            tracing::info!(dest = %dest, session_id, error = %err, mode, "send error");
+            tracing::info!(dest = %dest, session_id, error = %err, mode, "send error; {link_status}");
             metrics::CHANNEL_ERRORS.add(
                 1,
                 hyperactor_telemetry::kv_pairs!(
@@ -194,23 +245,23 @@ fn log_send_error(
         }
         session::SendLoopError::AppClosed => true,
         session::SendLoopError::Rejected(reason) => {
-            tracing::error!(dest = %dest, session_id, mode, "server rejected connection: {reason}");
+            tracing::error!(dest = %dest, session_id, mode, "server rejected connection: {reason}; {link_status}");
             true
         }
         session::SendLoopError::ServerClosed => {
-            tracing::info!(dest = %dest, session_id, mode, "server closed the channel");
+            tracing::info!(dest = %dest, session_id, mode, "server closed the channel; {link_status}");
             true
         }
         session::SendLoopError::DeliveryTimeout => {
             let timeout = hyperactor_config::global::get(config::MESSAGE_DELIVERY_TIMEOUT);
             tracing::error!(
                 dest = %dest, session_id, mode,
-                "failed to receive ack within timeout {timeout:?}; link is currently connected"
+                "failed to receive ack within timeout {timeout:?}; link is currently connected; {link_status}"
             );
             true
         }
         session::SendLoopError::OversizedFrame(reason) => {
-            tracing::error!(dest = %dest, session_id, mode, "oversized frame: {reason}");
+            tracing::error!(dest = %dest, session_id, mode, "oversized frame: {reason}; {link_status}");
             true
         }
     }
@@ -246,12 +297,12 @@ pub(crate) fn spawn<M: RemoteMessage>(link: impl Link) -> NetTx<M> {
                         error = %err,
                         "failed to push message to outbox"
                     );
-                    let _ = notify.send(TxStatus::Closed);
+                    let _ = notify.send(TxStatus::Closed("failed to push to outbox".into()));
                     return;
                 }
             }
             None => {
-                let _ = notify.send(TxStatus::Closed);
+                let _ = notify.send(TxStatus::Closed("sender dropped".into()));
                 return;
             }
         }
@@ -264,6 +315,8 @@ pub(crate) fn spawn<M: RemoteMessage>(link: impl Link) -> NetTx<M> {
             .with_max_elapsed_time(None)
             .build();
 
+        let mut link_status = LinkStatus::NeverConnected;
+
         let reason: String = 'outer: loop {
             let connected = match deliveries.expiry_time() {
                 Some(deadline) => match session.connect_by(deadline).await {
@@ -272,11 +325,11 @@ pub(crate) fn spawn<M: RemoteMessage>(link: impl Link) -> NetTx<M> {
                         let timeout =
                             hyperactor_config::global::get(config::MESSAGE_DELIVERY_TIMEOUT);
                         let error_msg = if deliveries.outbox.is_expired(timeout) {
-                            format!("failed to deliver message within timeout {timeout:?}",)
+                            format!("failed to deliver message within timeout {timeout:?}; {link_status}")
                         } else {
                             format!(
                                 "failed to receive ack within timeout {timeout:?}; \
-                                 link is currently broken",
+                                 link is currently broken; {link_status}",
                             )
                         };
                         tracing::error!(
@@ -313,12 +366,16 @@ pub(crate) fn spawn<M: RemoteMessage>(link: impl Link) -> NetTx<M> {
             }
             deliveries.requeue_unacked();
 
+            link_status.connected();
             let connected_at = tokio::time::Instant::now();
+
             let result = {
                 let stream = connected.stream(INITIATOR_TO_ACCEPTOR);
                 session::send_connected(&stream, &mut deliveries, &mut receiver).await
             };
             session = connected.release();
+
+            link_status.disconnected();
 
             // Reset backoff if the connection was alive long enough to have
             // been useful (i.e. not an immediate EOF/error).
@@ -334,13 +391,13 @@ pub(crate) fn spawn<M: RemoteMessage>(link: impl Link) -> NetTx<M> {
                             dest = %dest,
                             session_id = session_id.0,
                             delay_ms = delay.as_millis() as u64,
-                            "send_connected returned EOF, reconnecting after backoff"
+                            "send_connected returned EOF, reconnecting after backoff; {link_status}"
                         );
                         tokio::time::sleep(delay).await;
                     }
                 }
                 Err(ref e) => {
-                    if log_send_error(e, &dest, session_id.0, "simplex") {
+                    if log_send_error(e, &dest, session_id.0, "simplex", &link_status) {
                         break 'outer format!("{log_id}: {e}");
                     }
                     // Recoverable error — reconnect after backoff.
@@ -350,7 +407,7 @@ pub(crate) fn spawn<M: RemoteMessage>(link: impl Link) -> NetTx<M> {
                             session_id = session_id.0,
                             delay_ms = delay.as_millis() as u64,
                             error = %e,
-                            "send_connected returned recoverable error, reconnecting after backoff"
+                            "send_connected returned recoverable error, reconnecting after backoff; {link_status}"
                         );
                         tokio::time::sleep(delay).await;
                     }
@@ -377,7 +434,7 @@ pub(crate) fn spawn<M: RemoteMessage>(link: impl Link) -> NetTx<M> {
             });
         }
 
-        let _ = notify.send(TxStatus::Closed);
+        let _ = notify.send(TxStatus::Closed(reason.into()));
     });
     tx
 }
@@ -634,10 +691,11 @@ impl<M: RemoteMessage> Tx<M> for NetTx<M> {
             self.sender
                 .send((message, return_channel, tokio::time::Instant::now()))
         {
+            let reason = self.status.borrow().as_closed().map(|r| r.to_string());
             let _ = return_channel.send(SendError {
                 error: ChannelError::Closed,
                 message,
-                reason: None,
+                reason,
             });
         }
     }
@@ -2690,8 +2748,8 @@ mod tests {
     async fn verify_tx_closed(tx_status: &mut watch::Receiver<TxStatus>, expected_log: &str) {
         match tokio::time::timeout(Duration::from_secs(5), tx_status.changed()).await {
             Ok(Ok(())) => {
-                let current_status = *tx_status.borrow();
-                assert_eq!(current_status, TxStatus::Closed);
+                let current_status = tx_status.borrow().clone();
+                assert!(current_status.is_closed());
                 logs_assert_unscoped(|logs| {
                     if logs.iter().any(|log| log.contains(expected_log)) {
                         Ok(())
@@ -3427,10 +3485,10 @@ mod tests {
         tx.post(101);
         let mut watcher = tx.status().clone();
         // When NetRx exits, it should notify NetTx to exit as well.
-        let _ = watcher.wait_for(|val| *val == TxStatus::Closed).await;
+        let _ = watcher.wait_for(|val| val.is_closed()).await;
         // wait_for could return Err due to race between when watch's sender was
         // dropped and when wait_for was called. So we still need to do an
         // equality check.
-        assert_eq!(*watcher.borrow(), TxStatus::Closed);
+        assert!(watcher.borrow().is_closed());
     }
 }

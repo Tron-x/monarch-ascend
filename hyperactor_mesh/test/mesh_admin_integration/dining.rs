@@ -146,6 +146,8 @@ impl Drop for ShutdownGuard<'_> {
 async fn check_dining_endpoints(bin: &Path) {
     DiningScenario::run(bin, |s| {
         Box::pin(async move {
+            crate::admin::assert_admin_info(s).await;
+            crate::admin::assert_admin_schema(s).await;
             crate::config::check(s).await;
             crate::tree::check(s).await;
         })

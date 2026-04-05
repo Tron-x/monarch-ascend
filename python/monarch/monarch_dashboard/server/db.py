@@ -48,6 +48,12 @@ class DBAdapter(ABC):
         rows = self.query(sql)
         return rows[0] if rows else None
 
+    def store_pyspy_dump(  # noqa: B027
+        self, dump_id: str, proc_ref: str, pyspy_result_json: str
+    ) -> None:
+        """Store a py-spy dump result. No-op by default."""
+        pass
+
 
 # ---------------------------------------------------------------------------
 # SQLite adapter — local dev/testing
@@ -109,6 +115,16 @@ def _get_adapter() -> DBAdapter:
     if _adapter is None:
         raise RuntimeError("db.init() or db.set_adapter() must be called first")
     return _adapter
+
+
+def raw_query(sql: str) -> list[dict[str, Any]]:
+    """Execute a raw SQL query (no placeholder substitution)."""
+    return _get_adapter().query(sql)
+
+
+def store_pyspy_dump(dump_id: str, proc_ref: str, pyspy_result_json: str) -> None:
+    """Store a py-spy dump result via the current adapter."""
+    _get_adapter().store_pyspy_dump(dump_id, proc_ref, pyspy_result_json)
 
 
 def _sql_literal(value: Any) -> str:
@@ -466,13 +482,18 @@ def list_sent_messages(
 # ---------------------------------------------------------------------------
 
 
-def get_dag_data() -> dict[str, Any]:
+def get_dag_data(system_names: set[str] | None = None) -> dict[str, Any]:
     """Return classified nodes and edges for the DAG visualization.
 
     Fetches all meshes, actors (with latest status), and messages in a single
     connection, then builds the 6-tier graph structure server-side:
 
       host_mesh -> host_unit -> proc_mesh -> proc_unit -> actor_mesh -> actor
+
+    Args:
+        system_names: If provided, actors whose ``full_name`` is in this set
+            are excluded from the DAG.  Meshes that become empty after
+            filtering are also pruned.
 
     Returns ``{"nodes": [...], "edges": [...]}``.
     """
@@ -511,6 +532,35 @@ def get_dag_data() -> dict[str, Any]:
         else:
             regular_actors.append(a)
 
+    # -- Filter system actors if requested --
+    # Strategy: remove actors whose full_name matches a system name,
+    # then prune actor meshes with no remaining actors, then prune
+    # proc meshes with no remaining actor meshes, keeping the host
+    # layer intact as structural context.
+    if system_names:
+        _system_names = system_names  # local binding for Pyre narrowing
+
+        def _is_system(name: str) -> bool:
+            return any(sn in name for sn in _system_names)
+
+        regular_actors = [a for a in regular_actors if not _is_system(a["full_name"])]
+
+        # Find actor mesh IDs that still have at least one non-system actor.
+        live_actor_mesh_ids = {a["mesh_id"] for a in regular_actors}
+        actor_meshes = [m for m in actor_meshes if m["id"] in live_actor_mesh_ids]
+
+        # Find proc mesh IDs that still have at least one non-system actor mesh child.
+        live_proc_mesh_ids = {
+            m["parent_mesh_id"] for m in actor_meshes if m["parent_mesh_id"] is not None
+        }
+        proc_meshes = [m for m in proc_meshes if m["id"] in live_proc_mesh_ids]
+
+        # Rebuild proc agents to only include procs that survived.
+        surviving_proc_mesh_ids = {m["id"] for m in proc_meshes}
+        proc_agents_by_mesh = {
+            k: v for k, v in proc_agents_by_mesh.items() if k in surviving_proc_mesh_ids
+        }
+
     # -- Actor statuses --
     actor_statuses: dict[int, str] = {}
     for a in actors:
@@ -545,9 +595,10 @@ def get_dag_data() -> dict[str, Any]:
                     "id": f"host_unit-{agent['id']}",
                     "entity_id": agent["id"],
                     "tier": "host_unit",
-                    "label": _leaf_name(agent["full_name"]),
+                    "label": f"Host Unit {agent['rank']}",
                     "subtitle": "Host",
                     "status": actor_statuses.get(agent["id"], "unknown"),
+                    "rank": agent["rank"],
                 }
             )
 
@@ -570,9 +621,10 @@ def get_dag_data() -> dict[str, Any]:
                     "id": f"proc_unit-{agent['id']}",
                     "entity_id": agent["id"],
                     "tier": "proc_unit",
-                    "label": _leaf_name(agent["full_name"]),
+                    "label": f"Proc Unit {agent['rank']}",
                     "subtitle": "Proc",
                     "status": actor_statuses.get(agent["id"], "unknown"),
+                    "rank": agent["rank"],
                 }
             )
 
@@ -597,6 +649,7 @@ def get_dag_data() -> dict[str, Any]:
                 "label": _leaf_name(a["full_name"]),
                 "subtitle": f"rank {a['rank']}",
                 "status": actor_statuses.get(a["id"], "unknown"),
+                "rank": a["rank"],
             }
         )
 

@@ -30,7 +30,8 @@ Press Ctrl+C in this terminal to exit.
 import argparse
 import asyncio
 
-from monarch.actor import Actor, current_rank, endpoint, this_host
+from monarch.actor import Actor, current_rank, endpoint
+from monarch.job import ProcessJob
 
 
 class Worker(Actor):
@@ -43,9 +44,12 @@ class Worker(Actor):
 
 
 async def async_main(num_procs: int) -> None:
-    host = this_host()
+    job = ProcessJob({"hosts": 1}).enable_admin()
+    state = job.state(cached_path=None)
+    host = state.hosts
 
-    admin_url = await host._spawn_admin()
+    admin_url = state.admin_url
+    assert admin_url is not None
     mtls_flags = (
         "--cacert /var/facebook/rootcanal/ca.pem "
         "--cert /var/facebook/x509_identities/server.pem "

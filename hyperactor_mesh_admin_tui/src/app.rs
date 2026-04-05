@@ -19,6 +19,7 @@ use crossterm::event::KeyModifiers;
 use futures::StreamExt;
 use hyperactor_mesh::introspect::NodePayload;
 use hyperactor_mesh::introspect::NodeProperties;
+use hyperactor_mesh::introspect::NodeRef;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::text::Line;
@@ -107,7 +108,7 @@ pub(crate) struct App {
     pub(crate) show_stopped: bool,
 
     /// Fetch cache with generation-based staleness.
-    pub(crate) fetch_cache: HashMap<String, FetchState<NodePayload>>,
+    pub(crate) fetch_cache: HashMap<NodeRef, FetchState<NodePayload>>,
     /// Current refresh generation for cache invalidation.
     pub(crate) refresh_gen: u64,
     /// Monotonic sequence counter for timestamp ordering.
@@ -206,7 +207,7 @@ impl App {
     /// - Stale entries (`generation < refresh_gen`) are refetched.
     pub(crate) async fn fetch_node_state(
         &mut self,
-        reference: &str,
+        reference: &NodeRef,
         force: bool,
     ) -> FetchState<NodePayload> {
         fetch_with_join(
@@ -222,7 +223,7 @@ impl App {
     }
 
     /// Extract a payload from FetchState if Ready, otherwise None.
-    pub(crate) fn get_cached_payload(&self, reference: &str) -> Option<&NodePayload> {
+    pub(crate) fn get_cached_payload(&self, reference: &NodeRef) -> Option<&NodePayload> {
         get_cached_payload(&self.fetch_cache, reference)
     }
 
@@ -253,10 +254,9 @@ impl App {
     ///
     /// Returns `None` if the selection is out of range (e.g. the tree
     /// is empty).
-    pub(crate) fn selected_reference(&self) -> Option<&str> {
+    pub(crate) fn selected_reference(&self) -> Option<&NodeRef> {
         let rows = self.visible_rows();
-        rows.get(&self.cursor)
-            .map(|row| row.node.reference.as_str())
+        rows.get(&self.cursor).map(|row| &row.node.reference)
     }
 
     /// Refresh the in-memory topology model by re-walking the
@@ -287,7 +287,8 @@ impl App {
             .map(|row| (row.node.reference.clone(), row.depth));
 
         // Fetch root using centralized fetch with force=true.
-        let root_state = self.fetch_node_state("root", true).await;
+        let root_ref = NodeRef::Root;
+        let root_state = self.fetch_node_state(&root_ref, true).await;
         let root_payload = match root_state {
             FetchState::Ready { value, .. } => value,
             FetchState::Error { msg, .. } => {
@@ -298,8 +299,8 @@ impl App {
         };
 
         // Path for cycle detection: tracks current path from root to
-        // Node being built. Start with "root" in the path.
-        let mut path = vec!["root".to_string()];
+        // Node being built. Start with root in the path.
+        let mut path = vec![NodeRef::Root];
 
         // Build tree recursively from root's children.
         let mut root_children = Vec::new();
@@ -328,7 +329,7 @@ impl App {
 
         // Create synthetic root node.
         self.set_tree(Some(TreeNode {
-            reference: "root".to_string(),
+            reference: NodeRef::Root,
             label: "Root".to_string(),
             node_type: NodeType::Root,
             expanded: true,
@@ -341,15 +342,15 @@ impl App {
         }));
 
         // Prune stale cache entries (collect owned refs to avoid borrow issues).
-        let live_refs: HashSet<String> = if let Some(root) = self.tree() {
+        let live_refs: HashSet<NodeRef> = if let Some(root) = self.tree() {
             let mut refs = HashSet::new();
             collect_refs(root, &mut refs);
-            refs.into_iter().map(|s| s.to_string()).collect()
+            refs.into_iter().cloned().collect()
         } else {
             HashSet::new()
         };
         self.fetch_cache
-            .retain(|k, _| k == "root" || live_refs.contains(k.as_str()));
+            .retain(|k, _| matches!(k, NodeRef::Root) || live_refs.contains(k));
 
         // Restore selection position.
         let rows = self.visible_rows();
@@ -383,7 +384,7 @@ impl App {
     /// fetches from the admin API. For Proc/Actor parents, children
     /// are inserted as placeholders (lazy fetching). For Root/Host
     /// parents, children are eagerly fetched.
-    pub(crate) async fn expand_node(&mut self, reference: &str, depth: usize) -> bool {
+    pub(crate) async fn expand_node(&mut self, reference: &NodeRef, depth: usize) -> bool {
         // Early check: bail if no tree.
         if self.tree.is_none() {
             return false;
@@ -409,7 +410,7 @@ impl App {
         );
 
         // Extract system_children from the parent for lazy filtering.
-        let system_children: HashSet<&str> = match &payload.properties {
+        let system_children: HashSet<&NodeRef> = match &payload.properties {
             NodeProperties::Root {
                 system_children, ..
             }
@@ -418,41 +419,38 @@ impl App {
             }
             | NodeProperties::Proc {
                 system_children, ..
-            } => system_children.iter().map(|s| s.as_str()).collect(),
+            } => system_children.iter().collect(),
             _ => HashSet::new(),
         };
 
         // Extract stopped_children from proc payloads for lazy
         // filtering/graying without per-child fetches.
-        let (stopped_children, parent_is_poisoned): (HashSet<&str>, bool) =
+        let (stopped_children, parent_is_poisoned): (HashSet<&NodeRef>, bool) =
             match &payload.properties {
                 NodeProperties::Proc {
                     stopped_children,
                     is_poisoned,
                     ..
-                } => (
-                    stopped_children.iter().map(|s| s.as_str()).collect(),
-                    *is_poisoned,
-                ),
+                } => (stopped_children.iter().collect(), *is_poisoned),
                 _ => (HashSet::new(), false),
             };
 
         let mut child_nodes = Vec::new();
         for child_ref in &children {
             // Filter order: system first, then stopped.
-            if !self.show_system && system_children.contains(child_ref.as_str()) {
+            if !self.show_system && system_children.contains(child_ref) {
                 continue;
             }
 
-            let child_is_stopped = stopped_children.contains(child_ref.as_str());
-            let child_is_system = system_children.contains(child_ref.as_str());
+            let child_is_stopped = stopped_children.contains(child_ref);
+            let child_is_system = system_children.contains(child_ref);
 
             // TUI-4: failed nodes always visible.
             // If the parent proc is poisoned, its stopped children may be
             // failed — don't filter them out (cache may be empty on first load).
             let child_is_failed = parent_is_poisoned
                 || self
-                    .get_cached_payload(child_ref.as_str())
+                    .get_cached_payload(child_ref)
                     .is_some_and(|c| is_failed_node(&c.properties));
             if !self.show_stopped && child_is_stopped && !child_is_failed {
                 continue;
@@ -460,7 +458,7 @@ impl App {
 
             if is_proc_or_actor {
                 // Lazy: use placeholder or cached payload.
-                if let Some(cached) = self.get_cached_payload(child_ref.as_str()) {
+                if let Some(cached) = self.get_cached_payload(child_ref) {
                     // Fallback: also check cached payload in case proc
                     // payload is stale.
                     if !self.show_stopped
@@ -551,10 +549,10 @@ impl App {
         self.detail_error = None;
 
         // Get reference first (releases tree borrow).
-        let reference = self.selected_reference().map(|s| s.to_string());
+        let reference = self.selected_reference().cloned();
 
-        if let Some(ref_str) = reference {
-            let state = self.fetch_node_state(&ref_str, false).await;
+        if let Some(node_ref) = reference {
+            let state = self.fetch_node_state(&node_ref, false).await;
             match state {
                 FetchState::Ready { value, .. } => {
                     self.detail = Some(value);
@@ -594,12 +592,15 @@ impl App {
     /// - Proc selected → proc's own reference.
     /// - Actor selected → owning proc from `detail.parent`.
     /// - Root/Host selected → `None` (PY-4).
-    pub(crate) fn pyspy_proc_ref(&self) -> Option<String> {
+    pub(crate) fn pyspy_proc_ref(&self) -> Option<hyperactor::reference::ProcId> {
         let rows = self.visible_rows();
         let row = rows.get(&self.cursor)?;
-        match row.node.node_type {
-            NodeType::Proc => Some(row.node.reference.clone()),
-            NodeType::Actor => self.detail.as_ref().and_then(|p| p.parent.clone()),
+        match (&row.node.node_type, &row.node.reference) {
+            (NodeType::Proc, NodeRef::Proc(proc_id)) => Some(proc_id.clone()),
+            (NodeType::Actor, _) => self.detail.as_ref().and_then(|p| match &p.parent {
+                Some(NodeRef::Proc(proc_id)) => Some(proc_id.clone()),
+                _ => None,
+            }),
             _ => None,
         }
     }
@@ -636,12 +637,9 @@ impl App {
     ///
     /// Calls `set_job` which drops any prior variant and its receiver,
     /// cancelling any in-flight fetch (PY-1/PY-2).
-    pub(crate) fn start_pyspy(&mut self, proc_ref: String) {
-        let short = proc_ref
-            .split(',')
-            .next_back()
-            .unwrap_or(&proc_ref)
-            .to_string();
+    pub(crate) fn start_pyspy(&mut self, proc_id: hyperactor::reference::ProcId) {
+        let proc_ref = proc_id.to_string();
+        let short = proc_id.name().to_string();
         let scheme = self.theme.scheme; // ColorScheme: Copy
         let client = self.client.clone();
         let base_url = self.base_url.clone();
@@ -676,12 +674,9 @@ impl App {
     ///
     /// Calls `set_job` which drops any prior variant and its receiver,
     /// cancelling any in-flight fetch (CFG-1/CFG-2).
-    pub(crate) fn start_config(&mut self, proc_ref: String) {
-        let short = proc_ref
-            .split(',')
-            .next_back()
-            .unwrap_or(&proc_ref)
-            .to_string();
+    pub(crate) fn start_config(&mut self, proc_id: hyperactor::reference::ProcId) {
+        let proc_ref = proc_id.to_string();
+        let short = proc_id.name().to_string();
         let scheme = self.theme.scheme; // ColorScheme: Copy
         let client = self.client.clone();
         let base_url = self.base_url.clone();
@@ -1329,11 +1324,11 @@ pub(crate) async fn run_app(
                                     completed_at: None,
                                 });
                             }
-                            KeyResult::RunPySpy(proc_ref) => {
-                                app.start_pyspy(proc_ref);
+                            KeyResult::RunPySpy(proc_id) => {
+                                app.start_pyspy(proc_id);
                             }
-                            KeyResult::RunConfig(proc_ref) => {
-                                app.start_config(proc_ref);
+                            KeyResult::RunConfig(proc_id) => {
+                                app.start_config(proc_id);
                             }
                             KeyResult::None => {}
                         }

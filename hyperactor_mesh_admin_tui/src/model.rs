@@ -8,6 +8,7 @@
 
 use hyperactor_mesh::introspect::NodePayload;
 use hyperactor_mesh::introspect::NodeProperties;
+use hyperactor_mesh::introspect::NodeRef;
 
 use crate::filter::is_failed_node;
 use crate::filter::is_stopped_node;
@@ -192,9 +193,8 @@ impl NodeType {
 /// recursively, respecting `expanded_keys` and depth limits.
 #[derive(Debug, Clone)]
 pub(crate) struct TreeNode {
-    /// Opaque reference string for this node (identity in the admin
-    /// API).
-    pub(crate) reference: String,
+    /// Typed node reference (identity in the admin API).
+    pub(crate) reference: NodeRef,
     /// Human-friendly label shown in the tree (derived from
     /// [`NodePayload`]).
     pub(crate) label: String,
@@ -225,7 +225,7 @@ impl TreeNode {
     /// Placeholders are created from parent children lists without
     /// fetching payload. They have `fetched: false`, `has_children:
     /// true`, and empty `children` vector.
-    pub(crate) fn placeholder(reference: String) -> Self {
+    pub(crate) fn placeholder(reference: NodeRef) -> Self {
         Self {
             label: derive_label_from_ref(&reference),
             reference,
@@ -244,7 +244,7 @@ impl TreeNode {
     ///
     /// Like `placeholder` but with `stopped: true` so the node
     /// renders gray and can be filtered without a child fetch.
-    pub(crate) fn placeholder_stopped(reference: String) -> Self {
+    pub(crate) fn placeholder_stopped(reference: NodeRef) -> Self {
         Self {
             label: derive_label_from_ref(&reference),
             reference,
@@ -263,7 +263,7 @@ impl TreeNode {
     ///
     /// Used when building child lists from cached or freshly fetched
     /// payloads. The node starts collapsed with no children.
-    pub(crate) fn from_payload(reference: String, payload: &NodePayload) -> Self {
+    pub(crate) fn from_payload(reference: NodeRef, payload: &NodePayload) -> Self {
         Self {
             label: derive_label(payload),
             node_type: NodeType::from_properties(&payload.properties),
@@ -333,21 +333,37 @@ impl<'a> VisibleRows<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use hyperactor_mesh::introspect::FailureInfo;
     use hyperactor_mesh::introspect::NodePayload;
     use hyperactor_mesh::introspect::NodeProperties;
+    use hyperactor_mesh::introspect::NodeRef;
 
     use super::*;
 
+    fn mock_actor_ref(name: &str) -> NodeRef {
+        use std::str::FromStr;
+        // Create a simple ActorId for testing.
+        let id_str = format!("unix:@test,world,{}[0]", name);
+        NodeRef::Actor(hyperactor::reference::ActorId::from_str(&id_str).unwrap())
+    }
+
+    fn mock_proc_ref(name: &str) -> NodeRef {
+        use std::str::FromStr;
+        let id_str = format!("unix:@test,{}", name);
+        NodeRef::Proc(hyperactor::reference::ProcId::from_str(&id_str).unwrap())
+    }
+
     // Helper to create test payloads
-    fn mock_payload(identity: &str) -> NodePayload {
+    fn mock_payload(identity: NodeRef) -> NodePayload {
         NodePayload {
-            identity: identity.to_string(),
+            identity,
             properties: NodeProperties::Actor {
                 actor_status: "Running".to_string(),
                 actor_type: "test".to_string(),
                 messages_processed: 0,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
+                created_at: Some(SystemTime::UNIX_EPOCH),
                 last_message_handler: None,
                 total_processing_time_us: 0,
                 flight_recorder: None,
@@ -356,7 +372,7 @@ mod tests {
             },
             children: vec![],
             parent: None,
-            as_of: "2026-01-01T00:00:00.000Z".to_string(),
+            as_of: SystemTime::now(),
         }
     }
 
@@ -554,8 +570,9 @@ mod tests {
 
     #[test]
     fn placeholder_stopped_differs_only_in_stopped_field() {
-        let normal = TreeNode::placeholder("actor1".to_string());
-        let stopped = TreeNode::placeholder_stopped("actor1".to_string());
+        let r = mock_actor_ref("actor1");
+        let normal = TreeNode::placeholder(r.clone());
+        let stopped = TreeNode::placeholder_stopped(r);
         assert_eq!(normal.reference, stopped.reference);
         assert_eq!(normal.label, stopped.label);
         assert!(matches!(normal.node_type, NodeType::Actor));
@@ -572,13 +589,14 @@ mod tests {
 
     #[test]
     fn from_payload_sets_stopped_for_stopped_actor() {
+        let r = mock_actor_ref("actor1");
         let payload = NodePayload {
-            identity: "actor1".to_string(),
+            identity: r.clone(),
             properties: NodeProperties::Actor {
                 actor_status: "stopped:done".to_string(),
                 actor_type: "test".to_string(),
                 messages_processed: 5,
-                created_at: "".to_string(),
+                created_at: Some(SystemTime::UNIX_EPOCH),
                 last_message_handler: None,
                 total_processing_time_us: 0,
                 flight_recorder: None,
@@ -587,28 +605,30 @@ mod tests {
             },
             children: vec![],
             parent: None,
-            as_of: "".to_string(),
+            as_of: SystemTime::now(),
         };
-        let node = TreeNode::from_payload("actor1".to_string(), &payload);
+        let node = TreeNode::from_payload(r, &payload);
         assert!(node.stopped);
     }
 
     #[test]
     fn from_payload_not_stopped_for_running_actor() {
-        let payload = mock_payload("actor1");
-        let node = TreeNode::from_payload("actor1".to_string(), &payload);
+        let r = mock_actor_ref("actor1");
+        let payload = mock_payload(r.clone());
+        let node = TreeNode::from_payload(r, &payload);
         assert!(!node.stopped);
     }
 
     #[test]
     fn from_payload_sets_is_system_for_system_actor() {
+        let r = mock_actor_ref("host_agent");
         let payload = NodePayload {
-            identity: "host_agent[0]".to_string(),
+            identity: r.clone(),
             properties: NodeProperties::Actor {
                 actor_status: "idle".to_string(),
                 actor_type: "hyperactor_mesh::proc_agent::ProcAgent".to_string(),
                 messages_processed: 10,
-                created_at: "".to_string(),
+                created_at: Some(SystemTime::UNIX_EPOCH),
                 last_message_handler: None,
                 total_processing_time_us: 0,
                 flight_recorder: None,
@@ -617,87 +637,96 @@ mod tests {
             },
             children: vec![],
             parent: None,
-            as_of: "".to_string(),
+            as_of: SystemTime::now(),
         };
-        let node = TreeNode::from_payload("host_agent[0]".to_string(), &payload);
+        let node = TreeNode::from_payload(r, &payload);
         assert!(node.is_system);
         assert!(!node.stopped);
     }
 
     #[test]
     fn from_payload_not_system_for_user_actor() {
-        let payload = mock_payload("worker[0]");
-        let node = TreeNode::from_payload("worker[0]".to_string(), &payload);
+        let r = mock_actor_ref("worker");
+        let payload = mock_payload(r.clone());
+        let node = TreeNode::from_payload(r, &payload);
         assert!(!node.is_system);
     }
 
     #[test]
     fn from_payload_proc_is_never_stopped() {
+        let r = mock_proc_ref("proc1");
         let payload = NodePayload {
-            identity: "proc1".to_string(),
+            identity: r.clone(),
             properties: NodeProperties::Proc {
                 proc_name: "proc1".to_string(),
                 num_actors: 0,
                 system_children: vec![],
-                stopped_children: vec!["x".to_string()],
+                stopped_children: vec![mock_actor_ref("x")],
                 stopped_retention_cap: 10,
                 is_poisoned: false,
                 failed_actor_count: 0,
             },
             children: vec![],
             parent: None,
-            as_of: "".to_string(),
+            as_of: SystemTime::now(),
         };
-        let node = TreeNode::from_payload("proc1".to_string(), &payload);
+        let node = TreeNode::from_payload(r, &payload);
         assert!(!node.stopped);
     }
 
     #[test]
     fn from_payload_sets_failed_for_actor_with_failure_info() {
+        let r = mock_actor_ref("actor1");
+        let worker_id = {
+            use std::str::FromStr;
+            hyperactor::reference::ActorId::from_str("unix:@test,world,worker[0]").unwrap()
+        };
         let payload = NodePayload {
-            identity: "actor1".to_string(),
+            identity: r.clone(),
             properties: NodeProperties::Actor {
                 actor_status: "failed:panic".to_string(),
                 actor_type: "test".to_string(),
                 messages_processed: 0,
-                created_at: "".to_string(),
+                created_at: Some(SystemTime::UNIX_EPOCH),
                 last_message_handler: None,
                 total_processing_time_us: 0,
                 flight_recorder: None,
                 is_system: false,
                 failure_info: Some(FailureInfo {
                     error_message: "GPU memory corruption".to_string(),
-                    root_cause_actor: "worker[0]".to_string(),
+                    root_cause_actor: worker_id,
                     root_cause_name: Some("worker".to_string()),
-                    occurred_at: "2025-01-01T00:00:00Z".to_string(),
+                    occurred_at: SystemTime::UNIX_EPOCH,
                     is_propagated: false,
                 }),
             },
             children: vec![],
             parent: None,
-            as_of: "".to_string(),
+            as_of: SystemTime::now(),
         };
-        let node = TreeNode::from_payload("actor1".to_string(), &payload);
+        let node = TreeNode::from_payload(r, &payload);
         assert!(node.failed);
         assert!(node.stopped);
     }
 
     #[test]
     fn from_payload_not_failed_without_failure_info() {
-        let payload = mock_payload("actor1");
-        let node = TreeNode::from_payload("actor1".to_string(), &payload);
+        let r = mock_actor_ref("actor1");
+        let payload = mock_payload(r.clone());
+        let node = TreeNode::from_payload(r, &payload);
         assert!(!node.failed);
     }
 
     #[test]
     fn from_payload_or_logic_both_sources_agree() {
+        let r = mock_actor_ref("actor1");
         let payload = NodePayload {
-            identity: "actor1".to_string(),
+            identity: r.clone(),
             properties: NodeProperties::Actor {
                 actor_status: "stopped:done".to_string(),
                 actor_type: "test".to_string(),
                 messages_processed: 0,
-                created_at: "".to_string(),
+                created_at: Some(SystemTime::UNIX_EPOCH),
                 last_message_handler: None,
                 total_processing_time_us: 0,
                 flight_recorder: None,
@@ -706,9 +735,9 @@ mod tests {
             },
             children: vec![],
             parent: None,
-            as_of: "".to_string(),
+            as_of: SystemTime::now(),
         };
-        let mut node = TreeNode::from_payload("actor1".to_string(), &payload);
+        let mut node = TreeNode::from_payload(r, &payload);
         let child_is_stopped = true;
         node.stopped = node.stopped || child_is_stopped;
         assert!(node.stopped);
@@ -716,8 +745,9 @@ mod tests {
 
     #[test]
     fn from_payload_or_logic_only_proc_list() {
-        let payload = mock_payload("actor1");
-        let mut node = TreeNode::from_payload("actor1".to_string(), &payload);
+        let r = mock_actor_ref("actor1");
+        let payload = mock_payload(r.clone());
+        let mut node = TreeNode::from_payload(r, &payload);
         assert!(!node.stopped);
         let child_is_stopped = true;
         node.stopped = node.stopped || child_is_stopped;
@@ -726,13 +756,14 @@ mod tests {
 
     #[test]
     fn from_payload_or_logic_only_cached_payload() {
+        let r = mock_actor_ref("actor1");
         let payload = NodePayload {
-            identity: "actor1".to_string(),
+            identity: r.clone(),
             properties: NodeProperties::Actor {
                 actor_status: "failed:panic".to_string(),
                 actor_type: "test".to_string(),
                 messages_processed: 0,
-                created_at: "".to_string(),
+                created_at: Some(SystemTime::UNIX_EPOCH),
                 last_message_handler: None,
                 total_processing_time_us: 0,
                 flight_recorder: None,
@@ -741,9 +772,9 @@ mod tests {
             },
             children: vec![],
             parent: None,
-            as_of: "".to_string(),
+            as_of: SystemTime::now(),
         };
-        let mut node = TreeNode::from_payload("actor1".to_string(), &payload);
+        let mut node = TreeNode::from_payload(r, &payload);
         assert!(node.stopped);
         let child_is_stopped = false;
         node.stopped = node.stopped || child_is_stopped;

@@ -6,13 +6,13 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::str::FromStr;
+use std::time::SystemTime;
 
 use hyperactor::introspect::RecordedEvent;
-use hyperactor::reference as hyperactor_reference;
 use hyperactor_mesh::introspect::FailureInfo;
 use hyperactor_mesh::introspect::NodePayload;
 use hyperactor_mesh::introspect::NodeProperties;
+use hyperactor_mesh::introspect::NodeRef;
 use ratatui::layout::Constraint;
 use ratatui::layout::Direction;
 use ratatui::layout::Layout;
@@ -35,8 +35,10 @@ use crate::diagnostics::DiagResult;
 use crate::diagnostics::DiagSummary;
 use crate::format::format_event_summary;
 use crate::format::format_local_time;
-use crate::format::format_relative_time;
-use crate::format::format_uptime;
+use crate::format::format_system_time_iso;
+use crate::format::format_system_time_local;
+use crate::format::format_system_time_relative;
+use crate::format::format_system_time_uptime;
 use crate::theme::ColorScheme;
 use crate::theme::Labels;
 
@@ -190,7 +192,7 @@ fn render_root_detail(
     area: Rect,
     payload: &NodePayload,
     num_hosts: usize,
-    started_at: &str,
+    started_at: &SystemTime,
     started_by: &str,
     scheme: &ColorScheme,
     l: &Labels,
@@ -200,20 +202,25 @@ fn render_root_detail(
         .borders(Borders::ALL)
         .border_style(scheme.border);
 
-    let uptime_str = format_uptime(started_at);
+    let uptime_str = format_system_time_uptime(started_at);
 
     let mut lines = vec![
         detail_line(l.hosts, num_hosts.to_string(), scheme),
         detail_line(l.started_by, started_by, scheme),
         detail_line(l.uptime_detail, &uptime_str, scheme),
-        detail_line(l.started_at, format_local_time(started_at), scheme),
-        detail_line(l.data_as_of, format_relative_time(&payload.as_of), scheme),
+        detail_line(l.started_at, format_system_time_local(started_at), scheme),
+        detail_line(
+            l.data_as_of,
+            format_system_time_relative(&payload.as_of),
+            scheme,
+        ),
         Line::default(),
     ];
     for child in &payload.children {
+        let child_str = child.to_string();
         lines.push(Line::from(vec![
             Span::styled("  ", Style::default()),
-            Span::styled(child, scheme.node_host),
+            Span::styled(child_str, scheme.node_host),
         ]));
     }
 
@@ -242,13 +249,19 @@ fn render_host_detail(
     let mut lines = vec![
         detail_line(l.address, addr, scheme),
         detail_line(l.procs, num_procs.to_string(), scheme),
-        detail_line(l.data_as_of, format_relative_time(&payload.as_of), scheme),
+        detail_line(
+            l.data_as_of,
+            format_system_time_relative(&payload.as_of),
+            scheme,
+        ),
         Line::default(),
     ];
     for child in &payload.children {
-        let short = hyperactor_reference::ProcId::from_str(child)
-            .map(|pid| pid.name().to_string())
-            .unwrap_or_else(|_| child.clone());
+        let child_str = child.to_string();
+        let short = match child {
+            NodeRef::Proc(proc_id) => proc_id.name().to_string(),
+            _ => child_str.clone(),
+        };
         lines.push(Line::from(vec![
             Span::styled("  ", Style::default()),
             Span::styled(short, scheme.node_proc),
@@ -283,7 +296,11 @@ fn render_proc_detail(
     let mut lines = vec![
         detail_line(l.name, proc_name, scheme),
         detail_line(l.actors, num_actors.to_string(), scheme),
-        detail_line(l.data_as_of, format_relative_time(&payload.as_of), scheme),
+        detail_line(
+            l.data_as_of,
+            format_system_time_relative(&payload.as_of),
+            scheme,
+        ),
     ];
 
     if is_poisoned {
@@ -308,7 +325,7 @@ fn render_proc_detail(
         }
         lines.push(Line::from(vec![
             Span::styled("  ", Style::default()),
-            Span::raw(actor),
+            Span::raw(actor.to_string()),
         ]));
     }
 
@@ -331,7 +348,7 @@ fn render_actor_detail(
     actor_status: &str,
     actor_type: &str,
     messages_processed: u64,
-    created_at: &str,
+    created_at: &Option<SystemTime>,
     last_message_handler: Option<&str>,
     total_processing_time_us: u64,
     flight_recorder_json: Option<&str>,
@@ -359,12 +376,21 @@ fn render_actor_detail(
         scheme.detail_status_warn
     };
 
+    let created_str = created_at
+        .as_ref()
+        .map(|t| format_system_time_iso(t))
+        .unwrap_or_else(|| "-".to_string());
+
     let mut lines = vec![
         Line::from(vec![
             Span::styled(l.status, scheme.detail_label),
             Span::styled(actor_status, status_style),
         ]),
-        detail_line(l.data_as_of, format_relative_time(&payload.as_of), scheme),
+        detail_line(
+            l.data_as_of,
+            format_system_time_relative(&payload.as_of),
+            scheme,
+        ),
         detail_line(l.actor_type, actor_type, scheme),
         detail_line(l.messages, messages_processed.to_string(), scheme),
         detail_line(
@@ -373,7 +399,7 @@ fn render_actor_detail(
                 .to_string(),
             scheme,
         ),
-        detail_line(l.created, created_at, scheme),
+        detail_line(l.created, &created_str, scheme),
         detail_line(l.last_handler, last_message_handler.unwrap_or("-"), scheme),
         detail_line(l.children, payload.children.len().to_string(), scheme),
     ];
@@ -386,13 +412,17 @@ fn render_actor_detail(
         ]));
         let root_cause_display = match &fi.root_cause_name {
             Some(name) => format!("{} ({})", name, fi.root_cause_actor),
-            None => fi.root_cause_actor.clone(),
+            None => fi.root_cause_actor.to_string(),
         };
         lines.push(Line::from(vec![
             Span::styled(l.root_cause, scheme.detail_label),
             Span::raw(root_cause_display),
         ]));
-        lines.push(detail_line(l.failed_at, &fi.occurred_at, scheme));
+        lines.push(detail_line(
+            l.failed_at,
+            format_system_time_iso(&fi.occurred_at),
+            scheme,
+        ));
         lines.push(Line::from(vec![
             Span::styled(l.propagated, scheme.detail_label),
             Span::raw(if fi.is_propagated { l.yes } else { l.no }),

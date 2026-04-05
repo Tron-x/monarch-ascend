@@ -24,6 +24,7 @@ mod blocking;
 mod chunked_fuse;
 mod fast_pack;
 mod panic;
+mod readonly_fuse;
 mod tls_receiver;
 mod tls_sender;
 mod trace;
@@ -252,6 +253,11 @@ pub fn mod_init(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "monarch_extension.chunked_fuse",
     )?)?;
 
+    crate::readonly_fuse::register_python_bindings(&get_or_add_new_module(
+        module,
+        "monarch_extension.readonly_fuse",
+    )?)?;
+
     monarch_hyperactor::logging::register_python_bindings(&get_or_add_new_module(
         module,
         "monarch_hyperactor.logging",
@@ -291,10 +297,6 @@ pub fn mod_init(module: &Bound<'_, PyModule>) -> PyResult<()> {
         monarch_hyperactor::meta::alloc::register_python_bindings(&get_or_add_new_module(
             module,
             "monarch_hyperactor.meta.alloc",
-        )?)?;
-        monarch_hyperactor::meta::alloc_mock::register_python_bindings(&get_or_add_new_module(
-            module,
-            "monarch_hyperactor.meta.alloc_mock",
         )?)?;
     }
     // Add feature detection function

@@ -14,6 +14,8 @@ use std::pin::Pin;
 use algebra::JoinSemilattice;
 use hyperactor_mesh::introspect::NodePayload;
 use hyperactor_mesh::introspect::NodeProperties;
+use hyperactor_mesh::introspect::NodeRef;
+use hyperactor_mesh::introspect::dto::NodePayloadDto;
 
 use crate::filter::is_failed_node;
 use crate::filter::is_stopped_node;
@@ -115,8 +117,8 @@ impl<T: Clone> JoinSemilattice for FetchState<T> {
 pub(crate) async fn fetch_with_join(
     client: &reqwest::Client,
     base_url: &str,
-    reference: &str,
-    cache: &mut HashMap<String, FetchState<NodePayload>>,
+    reference: &NodeRef,
+    cache: &mut HashMap<NodeRef, FetchState<NodePayload>>,
     refresh_gen: u64,
     seq_counter: &mut u64,
     force: bool,
@@ -157,7 +159,7 @@ pub(crate) async fn fetch_with_join(
 
         // Join into cache.
         cache
-            .entry(reference.to_string())
+            .entry(reference.clone())
             .and_modify(|s| *s = s.join(&new_state))
             .or_insert(new_state);
     }
@@ -169,21 +171,26 @@ pub(crate) async fn fetch_with_join(
 ///
 /// Free-function form of `App::fetch_node` so callers that hold
 /// partial borrows of `App` can avoid borrowing all of `&self`.
+/// The `NodeRef` is converted to its string form for the URL path.
 pub(crate) async fn fetch_node_raw(
     client: &reqwest::Client,
     base_url: &str,
-    reference: &str,
+    reference: &NodeRef,
 ) -> Result<NodePayload, String> {
-    let url = format!("{}/v1/{}", base_url, urlencoding::encode(reference));
+    let ref_str = reference.to_string();
+    let url = format!("{}/v1/{}", base_url, urlencoding::encode(&ref_str));
     let resp = client
         .get(&url)
         .send()
         .await
         .map_err(|e| format!("Request failed: {}", e))?;
     if resp.status().is_success() {
-        resp.json::<NodePayload>()
+        resp.json::<NodePayloadDto>()
             .await
             .map_err(|e| format!("Parse error: {}", e))
+            .and_then(|dto| {
+                NodePayload::try_from(dto).map_err(|e| format!("Conversion error: {}", e))
+            })
     } else {
         Err(format!("HTTP {}", resp.status()))
     }
@@ -191,8 +198,8 @@ pub(crate) async fn fetch_node_raw(
 
 /// Extract cached payload from FetchState cache (free function).
 pub(crate) fn get_cached_payload<'a>(
-    cache: &'a HashMap<String, FetchState<NodePayload>>,
-    reference: &str,
+    cache: &'a HashMap<NodeRef, FetchState<NodePayload>>,
+    reference: &NodeRef,
 ) -> Option<&'a NodePayload> {
     cache.get(reference).and_then(|state| match state {
         FetchState::Ready { value, .. } => Some(value),
@@ -216,12 +223,12 @@ pub(crate) fn build_tree_node<'a>(
     base_url: &'a str,
     show_system: bool,
     show_stopped: bool,
-    cache: &'a mut HashMap<String, FetchState<NodePayload>>,
-    path: &'a mut Vec<String>,
-    reference: &'a str,
+    cache: &'a mut HashMap<NodeRef, FetchState<NodePayload>>,
+    path: &'a mut Vec<NodeRef>,
+    reference: &'a NodeRef,
     depth: usize,
-    expanded_keys: &'a HashSet<(String, usize)>,
-    failed_keys: &'a HashSet<(String, usize)>,
+    expanded_keys: &'a HashSet<(NodeRef, usize)>,
+    failed_keys: &'a HashSet<(NodeRef, usize)>,
     refresh_gen: u64,
     seq_counter: &'a mut u64,
 ) -> Pin<Box<dyn Future<Output = Option<TreeNode>> + Send + 'a>> {
@@ -233,10 +240,10 @@ pub(crate) fn build_tree_node<'a>(
 
         // Cycle guard: only reject if reference is in the current path
         // (true cycle), not if it appears elsewhere in the tree.
-        if path.contains(&reference.to_string()) {
+        if path.contains(reference) {
             return None;
         }
-        path.push(reference.to_string());
+        path.push(reference.clone());
 
         // Fetch using unified fetch+join path (force=false for cache-aware).
         let state = fetch_with_join(
@@ -276,7 +283,7 @@ pub(crate) fn build_tree_node<'a>(
         let label = derive_label(&payload);
         let node_type = NodeType::from_properties(&payload.properties);
         let has_children = !payload.children.is_empty();
-        let is_expanded = expanded_keys.contains(&(reference.to_string(), depth));
+        let is_expanded = expanded_keys.contains(&(reference.clone(), depth));
 
         // Build children if expanded.
         let mut children = Vec::new();
@@ -288,7 +295,7 @@ pub(crate) fn build_tree_node<'a>(
 
             // Extract system_children from the parent so we can filter
             // lazily without fetching each child individually.
-            let system_children: HashSet<&str> = match &payload.properties {
+            let system_children: HashSet<&NodeRef> = match &payload.properties {
                 NodeProperties::Root {
                     system_children, ..
                 }
@@ -297,22 +304,19 @@ pub(crate) fn build_tree_node<'a>(
                 }
                 | NodeProperties::Proc {
                     system_children, ..
-                } => system_children.iter().map(|s| s.as_str()).collect(),
+                } => system_children.iter().collect(),
                 _ => HashSet::new(),
             };
 
             // Extract stopped_children from proc payloads for lazy
             // filtering/graying without per-child fetches.
-            let (stopped_children, parent_is_poisoned): (HashSet<&str>, bool) =
+            let (stopped_children, parent_is_poisoned): (HashSet<&NodeRef>, bool) =
                 match &payload.properties {
                     NodeProperties::Proc {
                         stopped_children,
                         is_poisoned,
                         ..
-                    } => (
-                        stopped_children.iter().map(|s| s.as_str()).collect(),
-                        *is_poisoned,
-                    ),
+                    } => (stopped_children.iter().collect(), *is_poisoned),
                     _ => (HashSet::new(), false),
                 };
 
@@ -320,12 +324,12 @@ pub(crate) fn build_tree_node<'a>(
 
             for child_ref in &sorted {
                 // Filter order: system first, then stopped.
-                if !show_system && system_children.contains(child_ref.as_str()) {
+                if !show_system && system_children.contains(child_ref) {
                     continue;
                 }
 
-                let child_is_stopped = stopped_children.contains(child_ref.as_str());
-                let child_is_system = system_children.contains(child_ref.as_str());
+                let child_is_stopped = stopped_children.contains(child_ref);
+                let child_is_system = system_children.contains(child_ref);
 
                 // TUI-4: failed nodes always visible.
                 // If the parent proc is poisoned, its stopped children may be
@@ -345,8 +349,7 @@ pub(crate) fn build_tree_node<'a>(
                 if is_proc_or_actor {
                     // Lazy: create placeholder for unexpanded children,
                     // but recursively build expanded ones.
-                    let child_is_expanded =
-                        expanded_keys.contains(&(child_ref.to_string(), depth + 1));
+                    let child_is_expanded = expanded_keys.contains(&(child_ref.clone(), depth + 1));
 
                     if child_is_expanded {
                         if let Some(child_node) = build_tree_node(
@@ -451,10 +454,10 @@ pub(crate) fn build_tree_node<'a>(
             children.iter().any(|c| c.failed)
         } else {
             // Carried: children not built this cycle — inherit prior.
-            failed_keys.contains(&(reference.to_string(), depth))
+            failed_keys.contains(&(reference.clone(), depth))
         };
         let node = TreeNode {
-            reference: reference.to_string(),
+            reference: reference.clone(),
             label,
             node_type,
             expanded: is_expanded,
@@ -491,9 +494,12 @@ pub(crate) fn natural_ref_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 /// Clone and sort a payload's children by natural reference order.
-pub(crate) fn sorted_children(payload: &NodePayload) -> Vec<String> {
+///
+/// Sorts by the display form of each `NodeRef` using natural ordering
+/// so that `worker[2]` comes before `worker[10]`.
+pub(crate) fn sorted_children(payload: &NodePayload) -> Vec<NodeRef> {
     let mut children = payload.children.clone();
-    children.sort_by(|a, b| natural_ref_cmp(a, b));
+    children.sort_by(|a, b| natural_ref_cmp(&a.to_string(), &b.to_string()));
     children
 }
 
@@ -512,20 +518,28 @@ pub(crate) fn extract_trailing_index(s: &str) -> Option<(&str, u64)> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use algebra::JoinSemilattice;
     use hyperactor_mesh::introspect::NodePayload;
     use hyperactor_mesh::introspect::NodeProperties;
 
     use super::*;
 
-    fn mock_payload(identity: &str) -> NodePayload {
+    fn mock_actor_ref(name: &str) -> NodeRef {
+        use std::str::FromStr;
+        let id_str = format!("unix:@test,world,{}[0]", name);
+        NodeRef::Actor(hyperactor::reference::ActorId::from_str(&id_str).unwrap())
+    }
+
+    fn mock_payload(identity: NodeRef) -> NodePayload {
         NodePayload {
-            identity: identity.to_string(),
+            identity,
             properties: NodeProperties::Actor {
                 actor_status: "Running".to_string(),
                 actor_type: "test".to_string(),
                 messages_processed: 0,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
+                created_at: Some(SystemTime::UNIX_EPOCH),
                 last_message_handler: None,
                 total_processing_time_us: 0,
                 flight_recorder: None,
@@ -534,7 +548,7 @@ mod tests {
             },
             children: vec![],
             parent: None,
-            as_of: "2026-01-01T00:00:00.000Z".to_string(),
+            as_of: SystemTime::now(),
         }
     }
 
@@ -581,7 +595,7 @@ mod tests {
 
     #[test]
     fn join_is_commutative() {
-        let payload = mock_payload("test");
+        let payload = mock_payload(mock_actor_ref("test"));
         let a = FetchState::Ready {
             stamp: Stamp {
                 ts_micros: 1000,
@@ -619,7 +633,7 @@ mod tests {
 
     #[test]
     fn join_is_associative() {
-        let payload = mock_payload("test");
+        let payload = mock_payload(mock_actor_ref("test"));
         let a = FetchState::Ready {
             stamp: Stamp {
                 ts_micros: 1000,
@@ -670,7 +684,7 @@ mod tests {
 
     #[test]
     fn join_is_idempotent() {
-        let payload = mock_payload("test");
+        let payload = mock_payload(mock_actor_ref("test"));
         let a = FetchState::Ready {
             stamp: Stamp {
                 ts_micros: 1000,
@@ -704,7 +718,7 @@ mod tests {
 
     #[test]
     fn join_unknown_is_identity() {
-        let payload = mock_payload("test");
+        let payload = mock_payload(mock_actor_ref("test"));
         let a = FetchState::Ready {
             stamp: Stamp {
                 ts_micros: 1000,
@@ -740,7 +754,7 @@ mod tests {
 
     #[test]
     fn join_prefers_newer_stamp() {
-        let payload = mock_payload("test");
+        let payload = mock_payload(mock_actor_ref("test"));
         let older = FetchState::Ready {
             stamp: Stamp {
                 ts_micros: 1000,
@@ -769,7 +783,7 @@ mod tests {
 
     #[test]
     fn join_uses_seq_for_tie_break() {
-        let payload = mock_payload("test");
+        let payload = mock_payload(mock_actor_ref("test"));
         let first = FetchState::Ready {
             stamp: Stamp {
                 ts_micros: 1000,
@@ -798,7 +812,7 @@ mod tests {
 
     #[test]
     fn join_deterministic_tie_break_ready_over_error() {
-        let payload = mock_payload("test");
+        let payload = mock_payload(mock_actor_ref("test"));
         let ready = FetchState::Ready {
             stamp: Stamp {
                 ts_micros: 1000,
@@ -894,7 +908,7 @@ mod tests {
                 seq: 1,
             },
             generation: 5,
-            value: mock_payload("fresh"),
+            value: mock_payload(mock_actor_ref("fresh")),
         };
 
         let result = error.join(&fresh_ready);
@@ -906,7 +920,7 @@ mod tests {
 
     #[test]
     fn join_refresh_staleness_triggers_refetch() {
-        let payload = mock_payload("test");
+        let payload = mock_payload(mock_actor_ref("test"));
         let stale = FetchState::Ready {
             stamp: Stamp {
                 ts_micros: 1000,
@@ -936,7 +950,7 @@ mod tests {
 
     #[test]
     fn cache_join_commutativity_ready_vs_error() {
-        let payload = mock_payload("test");
+        let payload = mock_payload(mock_actor_ref("test"));
         let ready = FetchState::Ready {
             stamp: Stamp {
                 ts_micros: 1000,
@@ -962,7 +976,7 @@ mod tests {
 
     #[test]
     fn join_cache_preserves_ready_when_generation_matches() {
-        let payload = mock_payload("current");
+        let payload = mock_payload(mock_actor_ref("current"));
         let current = FetchState::Ready {
             stamp: Stamp {
                 ts_micros: 1000,
@@ -1046,8 +1060,8 @@ mod tests {
 
     #[test]
     fn cache_join_ready_vs_ready_equal_stamps() {
-        let payload1 = mock_payload("first");
-        let payload2 = mock_payload("second");
+        let payload1 = mock_payload(mock_actor_ref("first"));
+        let payload2 = mock_payload(mock_actor_ref("second"));
 
         let ready1 = FetchState::Ready {
             stamp: Stamp {
@@ -1077,8 +1091,8 @@ mod tests {
 
     #[test]
     fn stale_cache_recovery() {
-        let old_payload = mock_payload("stale_data");
-        let new_payload = mock_payload("fresh_data");
+        let old_payload = mock_payload(mock_actor_ref("stale_data"));
+        let new_payload = mock_payload(mock_actor_ref("fresh_data"));
 
         let stale = FetchState::Ready {
             stamp: Stamp {
@@ -1102,7 +1116,7 @@ mod tests {
             FetchState::Ready {
                 value, generation, ..
             } => {
-                assert_eq!(value.identity, "fresh_data");
+                assert_eq!(value.identity, mock_actor_ref("fresh_data"));
                 assert_eq!(generation, 10);
             }
             _ => panic!("Expected Ready state"),
@@ -1118,13 +1132,13 @@ mod tests {
                 seq: 1,
             },
             generation: 10,
-            value: mock_payload("repaired"),
+            value: mock_payload(mock_actor_ref("repaired")),
         };
 
         let result = bad.join(&good);
         match result {
             FetchState::Ready { value, .. } => {
-                assert_eq!(value.identity, "repaired");
+                assert_eq!(value.identity, mock_actor_ref("repaired"));
             }
             _ => panic!("Expected recovery to Ready"),
         }
@@ -1132,7 +1146,7 @@ mod tests {
         let result2 = good.join(&bad);
         match result2 {
             FetchState::Ready { value, .. } => {
-                assert_eq!(value.identity, "repaired");
+                assert_eq!(value.identity, mock_actor_ref("repaired"));
             }
             _ => panic!("Expected recovery to Ready"),
         }
@@ -1146,7 +1160,7 @@ mod tests {
                 seq: 1,
             },
             generation: 5,
-            value: mock_payload("early"),
+            value: mock_payload(mock_actor_ref("early")),
         };
         let late = FetchState::Ready {
             stamp: Stamp {
@@ -1154,7 +1168,7 @@ mod tests {
                 seq: 1,
             },
             generation: 10,
-            value: mock_payload("late"),
+            value: mock_payload(mock_actor_ref("late")),
         };
 
         let result = early.join(&late);
@@ -1162,7 +1176,7 @@ mod tests {
             FetchState::Ready {
                 value, generation, ..
             } => {
-                assert_eq!(value.identity, "late");
+                assert_eq!(value.identity, mock_actor_ref("late"));
                 assert_eq!(generation, 10);
             }
             _ => panic!("Expected Ready with late data"),
@@ -1173,7 +1187,7 @@ mod tests {
             FetchState::Ready {
                 value, generation, ..
             } => {
-                assert_eq!(value.identity, "late");
+                assert_eq!(value.identity, mock_actor_ref("late"));
                 assert_eq!(generation, 10);
             }
             _ => panic!("Expected Ready with late data"),
@@ -1191,7 +1205,7 @@ mod tests {
                     seq: i,
                 },
                 generation: i,
-                value: mock_payload(&format!("refresh_{}", i)),
+                value: mock_payload(mock_actor_ref(&format!("refresh_{}", i))),
             };
 
             if let FetchState::Ready { stamp, .. } = &state {

@@ -467,11 +467,9 @@ impl Proc {
         let handle = ActorHandle::new(instance.inner.cell.clone(), instance.inner.ports.clone());
         instance.change_status(ActorStatus::Client);
 
-        let introspect_cell = instance.inner.cell.clone();
-        let introspect_mailbox = instance.inner.mailbox.clone();
         tokio::spawn(crate::introspect::serve_introspect(
-            introspect_cell,
-            introspect_mailbox,
+            instance.inner.cell.clone(),
+            instance.inner.mailbox.clone(),
             receivers.introspect,
         ));
 
@@ -1554,11 +1552,9 @@ impl<A: Actor> Instance<A> {
         // Spawn the introspect task — a separate tokio task that
         // reads InstanceCell directly and replies via the actor's
         // Mailbox. The actor loop never sees IntrospectMessage.
-        let introspect_cell = self.inner.cell.clone();
-        let introspect_mailbox = self.inner.mailbox.clone();
         tokio::spawn(crate::introspect::serve_introspect(
-            introspect_cell,
-            introspect_mailbox,
+            self.inner.cell.clone(),
+            self.inner.mailbox.clone(),
             receivers.introspect,
         ));
 
@@ -1932,8 +1928,14 @@ impl<A: Actor> Instance<A> {
                 HandlerInfo::from_static(std::any::type_name::<M>(), None)
             }
         };
+
+        let endpoint = type_info.and_then(|info| {
+            // SAFETY: The caller promises to pass the correct type info.
+            unsafe { info.endpoint_name(&message as *const M as *const ()) }
+        });
+
         // Use a helper function for a better instrument log.
-        self.handle_message_with_handler_info(actor, handler_info, headers, message)
+        self.handle_message_with_handler_info(actor, handler_info, headers, message, endpoint)
             .await
     }
 
@@ -1945,6 +1947,7 @@ impl<A: Actor> Instance<A> {
         handler_info: HandlerInfo,
         headers: Flattrs,
         message: M,
+        endpoint: Option<String>,
     ) -> Result<(), anyhow::Error>
     where
         A: Handler<M>,
@@ -1971,8 +1974,7 @@ impl<A: Actor> Instance<A> {
                 id: message_id,
                 from_actor_id,
                 to_actor_id,
-                // TODO: populate endpoint
-                endpoint: None,
+                endpoint,
                 port_id,
             });
 
@@ -3903,7 +3905,7 @@ mod tests {
         assert_eq!(event.actor_id, actor_id);
         assert!(event.actor_status.is_failed());
         // Originated here, not propagated.
-        assert_eq!(event.actually_failing_actor().actor_id, actor_id);
+        assert_eq!(event.actually_failing_actor().unwrap().actor_id, actor_id);
     }
 
     // Exercises FI-2 (see introspect.rs module-scope comment).
@@ -4024,7 +4026,7 @@ mod tests {
         );
         let event = event.unwrap();
         // Root cause is the child, not the parent.
-        assert_eq!(event.actually_failing_actor().actor_id, child_id);
+        assert_eq!(event.actually_failing_actor().unwrap().actor_id, child_id);
     }
 
     // Exercises S11 (see introspect.rs module doc).
@@ -4093,7 +4095,7 @@ mod tests {
         let root_cause = attrs
             .get(crate::introspect::FAILURE_ROOT_CAUSE_ACTOR)
             .expect("must have root_cause_actor");
-        assert_eq!(root_cause, &actor_id.to_string());
+        assert_eq!(root_cause, &actor_id);
         assert_eq!(
             attrs.get(crate::introspect::FAILURE_IS_PROPAGATED),
             Some(&false)
@@ -4133,7 +4135,7 @@ mod tests {
         let root_cause = attrs
             .get(crate::introspect::FAILURE_ROOT_CAUSE_ACTOR)
             .expect("propagated failure must have root_cause_actor");
-        assert_eq!(root_cause, &child_id.to_string());
+        assert_eq!(root_cause, &child_id);
         assert_eq!(
             attrs.get(crate::introspect::FAILURE_IS_PROPAGATED),
             Some(&true)

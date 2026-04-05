@@ -268,10 +268,6 @@ class Instance(abc.ABC):
         """Mark this actor as system/infrastructure."""
         ...
 
-    def _stop_instance(self, reason: Optional[str] = None) -> None:
-        """Deprecated: use stop() instead."""
-        return self.stop(reason)
-
 
 @dataclass
 class CreatorInstance:
@@ -475,7 +471,7 @@ def shutdown_context() -> "Future[None]":
             pass
         # Stop the client actor after the host mesh shutdown completes.
         if c is not None:
-            c.actor_instance._stop_instance()
+            c.actor_instance.stop()
             _context.set(None)
 
     return Future(coro=_shutdown_sequence())
@@ -1702,9 +1698,34 @@ class RootClientActor(Actor):
     name: str = "client"
 
     def __supervise__(self, failure: MeshFailure) -> bool:
+        import os
+        import socket
+        import sys
+        from datetime import datetime
+
+        from monarch._src.actor.supervision import UnhandledFaultHookException
         from monarch.actor import unhandled_fault_hook  # pyre-ignore
 
-        unhandled_fault_hook(failure)  # pyre-ignore
+        try:
+            unhandled_fault_hook(failure)  # pyre-ignore
+        except BaseException as e:  # noqa: B036 - catch SystemExit from sys.exit; re-raised wrapped
+            pid = os.getpid()
+            hostname = socket.gethostname()
+            report = failure.report()
+            message = (
+                f"Unhandled monarch error on the root actor, "
+                f"hostname={hostname}, PID={pid} at time {datetime.now()}:\n"
+                f"{report}\n"
+            )
+            sys.stderr.write(message)
+            sys.stderr.flush()
+
+            from monarch._rust_bindings.monarch_hyperactor.telemetry import (  # pyre-ignore
+                instant_event,
+            )
+
+            instant_event(message)
+            raise UnhandledFaultHookException(repr(e)) from e
         return True
 
     @staticmethod

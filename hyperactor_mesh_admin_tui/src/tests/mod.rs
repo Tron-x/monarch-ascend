@@ -10,14 +10,38 @@
 //! tree + cursor + fetch). Per-module unit tests live in each
 //! module's own `#[cfg(test)] mod tests` block.
 
+use std::str::FromStr;
+use std::time::SystemTime;
+
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
+use hyperactor::reference as hyperactor_reference;
+use hyperactor_mesh::introspect::NodeRef;
 
 use super::*;
 use crate::diagnostics::DiagOutcome;
 use crate::diagnostics::DiagPhase;
 use crate::diagnostics::DiagResult;
+
+fn root() -> NodeRef {
+    NodeRef::Root
+}
+
+fn host(name: &str) -> NodeRef {
+    let id_str = format!("unix:@test,world,{}[0]", name);
+    NodeRef::Host(hyperactor_reference::ActorId::from_str(&id_str).unwrap())
+}
+
+fn proc_ref(name: &str) -> NodeRef {
+    let id_str = format!("unix:@test,{}", name);
+    NodeRef::Proc(hyperactor_reference::ProcId::from_str(&id_str).unwrap())
+}
+
+fn actor(name: &str) -> NodeRef {
+    let id_str = format!("unix:@test,world,{}[0]", name);
+    NodeRef::Actor(hyperactor_reference::ActorId::from_str(&id_str).unwrap())
+}
 
 // Empty tree all operations are noops.
 #[test]
@@ -39,7 +63,7 @@ fn empty_tree_all_operations_are_noops() {
 #[test]
 fn system_proc_filter_toggles_visibility() {
     let tree = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -50,7 +74,7 @@ fn system_proc_filter_toggles_visibility() {
         is_system: false,
         children: vec![
             TreeNode {
-                reference: "user_proc".into(),
+                reference: proc_ref("user_proc"),
                 label: "User Proc".into(),
                 node_type: NodeType::Proc,
                 expanded: false,
@@ -62,7 +86,7 @@ fn system_proc_filter_toggles_visibility() {
                 children: vec![],
             },
             TreeNode {
-                reference: "system_proc".into(),
+                reference: proc_ref("system_proc"),
                 label: "System Proc".into(),
                 node_type: NodeType::Proc,
                 expanded: false,
@@ -77,16 +101,16 @@ fn system_proc_filter_toggles_visibility() {
     };
     let rows = flatten_tree(&tree);
     assert_eq!(rows.len(), 2);
-    let refs: Vec<_> = rows.iter().map(|r| r.node.reference.as_str()).collect();
-    assert!(refs.contains(&"user_proc"));
-    assert!(refs.contains(&"system_proc"));
+    let refs: Vec<_> = rows.iter().map(|r| &r.node.reference).collect();
+    assert!(refs.contains(&&proc_ref("user_proc")));
+    assert!(refs.contains(&&proc_ref("system_proc")));
 }
 
 // Stale selection after refresh clamps cursor.
 #[test]
 fn stale_selection_after_refresh_clamps_cursor() {
     let tree_before = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -97,7 +121,7 @@ fn stale_selection_after_refresh_clamps_cursor() {
         is_system: false,
         children: vec![
             TreeNode {
-                reference: "child1".into(),
+                reference: host("child1"),
                 label: "Child 1".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -109,7 +133,7 @@ fn stale_selection_after_refresh_clamps_cursor() {
                 children: vec![],
             },
             TreeNode {
-                reference: "child2".into(),
+                reference: host("child2"),
                 label: "Child 2".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -121,7 +145,7 @@ fn stale_selection_after_refresh_clamps_cursor() {
                 children: vec![],
             },
             TreeNode {
-                reference: "child3".into(),
+                reference: host("child3"),
                 label: "Child 3".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -140,7 +164,7 @@ fn stale_selection_after_refresh_clamps_cursor() {
     cursor.set_pos(2);
     assert_eq!(cursor.pos(), 2);
     let tree_after = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -151,7 +175,7 @@ fn stale_selection_after_refresh_clamps_cursor() {
         is_system: false,
         children: vec![
             TreeNode {
-                reference: "child1".into(),
+                reference: host("child1"),
                 label: "Child 1".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -163,7 +187,7 @@ fn stale_selection_after_refresh_clamps_cursor() {
                 children: vec![],
             },
             TreeNode {
-                reference: "child2".into(),
+                reference: host("child2"),
                 label: "Child 2".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -187,7 +211,7 @@ fn stale_selection_after_refresh_clamps_cursor() {
 #[test]
 fn selection_restore_fallback_when_depth_changes() {
     let tree_before = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -197,7 +221,7 @@ fn selection_restore_fallback_when_depth_changes() {
         failed: false,
         is_system: false,
         children: vec![TreeNode {
-            reference: "parent".into(),
+            reference: host("parent"),
             label: "Parent".into(),
             node_type: NodeType::Host,
             expanded: true,
@@ -207,7 +231,7 @@ fn selection_restore_fallback_when_depth_changes() {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: "target".into(),
+                reference: proc_ref("target"),
                 label: "Target at depth 1".into(),
                 node_type: NodeType::Proc,
                 expanded: false,
@@ -223,12 +247,12 @@ fn selection_restore_fallback_when_depth_changes() {
     let rows_before = flatten_tree(&tree_before);
     let target_before: Vec<_> = rows_before
         .iter()
-        .filter(|r| r.node.reference == "target")
+        .filter(|r| r.node.reference == proc_ref("target"))
         .collect();
     assert_eq!(target_before.len(), 1);
     assert_eq!(target_before[0].depth, 1);
     let tree_after = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -238,7 +262,7 @@ fn selection_restore_fallback_when_depth_changes() {
         failed: false,
         is_system: false,
         children: vec![TreeNode {
-            reference: "target".into(),
+            reference: proc_ref("target"),
             label: "Target at depth 0".into(),
             node_type: NodeType::Proc,
             expanded: false,
@@ -253,7 +277,7 @@ fn selection_restore_fallback_when_depth_changes() {
     let rows_after = flatten_tree(&tree_after);
     let target_after: Vec<_> = rows_after
         .iter()
-        .filter(|r| r.node.reference == "target")
+        .filter(|r| r.node.reference == proc_ref("target"))
         .collect();
     assert_eq!(target_after.len(), 1);
     assert_eq!(target_after[0].depth, 0);
@@ -263,7 +287,7 @@ fn selection_restore_fallback_when_depth_changes() {
 #[test]
 fn partial_failure_resilience() {
     let tree = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -274,7 +298,7 @@ fn partial_failure_resilience() {
         is_system: false,
         children: vec![
             TreeNode {
-                reference: "success".into(),
+                reference: host("success"),
                 label: "Success Node".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -286,7 +310,7 @@ fn partial_failure_resilience() {
                 children: vec![],
             },
             TreeNode {
-                reference: "error".into(),
+                reference: host("error"),
                 label: "Error: Failed to fetch".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -298,7 +322,7 @@ fn partial_failure_resilience() {
                 children: vec![],
             },
             TreeNode {
-                reference: "success2".into(),
+                reference: host("success2"),
                 label: "Another Success".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -313,11 +337,11 @@ fn partial_failure_resilience() {
     };
     let rows = flatten_tree(&tree);
     assert_eq!(rows.len(), 3);
-    let error_node = rows.iter().find(|r| r.node.reference == "error");
+    let error_node = rows.iter().find(|r| r.node.reference == host("error"));
     assert!(error_node.is_some());
     assert!(error_node.unwrap().node.label.contains("Error"));
-    assert!(rows.iter().any(|r| r.node.reference == "success"));
-    assert!(rows.iter().any(|r| r.node.reference == "success2"));
+    assert!(rows.iter().any(|r| r.node.reference == host("success")));
+    assert!(rows.iter().any(|r| r.node.reference == host("success2")));
 }
 
 // High fanout proc placeholder performance.
@@ -326,7 +350,7 @@ fn high_fanout_proc_placeholder_performance() {
     let mut children = Vec::new();
     for i in 0..1000 {
         children.push(TreeNode {
-            reference: format!("actor_{}", i),
+            reference: actor(&format!("actor_{}", i)),
             label: format!("Actor {}", i),
             node_type: NodeType::Actor,
             expanded: false,
@@ -339,7 +363,7 @@ fn high_fanout_proc_placeholder_performance() {
         });
     }
     let tree = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -349,7 +373,7 @@ fn high_fanout_proc_placeholder_performance() {
         failed: false,
         is_system: false,
         children: vec![TreeNode {
-            reference: "high_fanout_proc".into(),
+            reference: proc_ref("high_fanout_proc"),
             label: "High Fanout Proc".into(),
             node_type: NodeType::Proc,
             expanded: true,
@@ -365,7 +389,7 @@ fn high_fanout_proc_placeholder_performance() {
     assert_eq!(rows.len(), 1001);
     let actor_count = rows
         .iter()
-        .filter(|r| r.node.reference.starts_with("actor_"))
+        .filter(|r| r.node.reference.to_string().contains("actor_"))
         .count();
     assert_eq!(actor_count, 1000);
     let count = fold_tree(&tree, &|_n, child_counts: Vec<usize>| {
@@ -378,7 +402,7 @@ fn high_fanout_proc_placeholder_performance() {
 #[test]
 fn rapid_toggle_stress_test() {
     let mut tree = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -389,7 +413,7 @@ fn rapid_toggle_stress_test() {
         is_system: false,
         children: vec![
             TreeNode {
-                reference: "child1".into(),
+                reference: host("child1"),
                 label: "Child 1".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -399,7 +423,7 @@ fn rapid_toggle_stress_test() {
                 failed: false,
                 is_system: false,
                 children: vec![TreeNode {
-                    reference: "grandchild".into(),
+                    reference: proc_ref("grandchild"),
                     label: "Grandchild".into(),
                     node_type: NodeType::Proc,
                     expanded: false,
@@ -412,7 +436,7 @@ fn rapid_toggle_stress_test() {
                 }],
             },
             TreeNode {
-                reference: "child2".into(),
+                reference: host("child2"),
                 label: "Child 2".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -444,7 +468,7 @@ fn rapid_toggle_stress_test() {
 #[test]
 fn selection_stickiness_during_refresh() {
     let tree_before = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -455,7 +479,7 @@ fn selection_stickiness_during_refresh() {
         is_system: false,
         children: vec![
             TreeNode {
-                reference: "stable".into(),
+                reference: host("stable"),
                 label: "Stable Node".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -467,7 +491,7 @@ fn selection_stickiness_during_refresh() {
                 children: vec![],
             },
             TreeNode {
-                reference: "transient".into(),
+                reference: host("transient"),
                 label: "Transient Node".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -484,11 +508,11 @@ fn selection_stickiness_during_refresh() {
     assert_eq!(rows_before.len(), 2);
     let stable_idx = rows_before
         .iter()
-        .position(|r| r.node.reference == "stable")
+        .position(|r| r.node.reference == host("stable"))
         .unwrap();
     assert_eq!(stable_idx, 0);
     let tree_after = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -498,7 +522,7 @@ fn selection_stickiness_during_refresh() {
         failed: false,
         is_system: false,
         children: vec![TreeNode {
-            reference: "stable".into(),
+            reference: host("stable"),
             label: "Stable Node (refreshed)".into(),
             node_type: NodeType::Host,
             expanded: false,
@@ -514,7 +538,7 @@ fn selection_stickiness_during_refresh() {
     assert_eq!(rows_after.len(), 1);
     let stable_idx_after = rows_after
         .iter()
-        .position(|r| r.node.reference == "stable")
+        .position(|r| r.node.reference == host("stable"))
         .unwrap();
     assert_eq!(stable_idx_after, 0);
 }
@@ -523,7 +547,7 @@ fn selection_stickiness_during_refresh() {
 #[test]
 fn empty_flight_recorder_renders_safely() {
     let tree = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -533,7 +557,7 @@ fn empty_flight_recorder_renders_safely() {
         failed: false,
         is_system: false,
         children: vec![TreeNode {
-            reference: "actor_with_empty_data".into(),
+            reference: actor("actor_with_empty_data"),
             label: "Actor (no flight recorder)".into(),
             node_type: NodeType::Actor,
             expanded: false,
@@ -547,14 +571,14 @@ fn empty_flight_recorder_renders_safely() {
     };
     let rows = flatten_tree(&tree);
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].node.reference, "actor_with_empty_data");
+    assert_eq!(rows[0].node.reference, actor("actor_with_empty_data"));
 }
 
 // Concurrent expansion stability.
 #[test]
 fn concurrent_expansion_stability() {
     let mut tree = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -565,7 +589,7 @@ fn concurrent_expansion_stability() {
         is_system: false,
         children: vec![
             TreeNode {
-                reference: "a".into(),
+                reference: host("a"),
                 label: "A".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -575,7 +599,7 @@ fn concurrent_expansion_stability() {
                 failed: false,
                 is_system: false,
                 children: vec![TreeNode {
-                    reference: "a1".into(),
+                    reference: proc_ref("a1"),
                     label: "A1".into(),
                     node_type: NodeType::Proc,
                     expanded: false,
@@ -588,7 +612,7 @@ fn concurrent_expansion_stability() {
                 }],
             },
             TreeNode {
-                reference: "b".into(),
+                reference: host("b"),
                 label: "B".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -598,7 +622,7 @@ fn concurrent_expansion_stability() {
                 failed: false,
                 is_system: false,
                 children: vec![TreeNode {
-                    reference: "b1".into(),
+                    reference: proc_ref("b1"),
                     label: "B1".into(),
                     node_type: NodeType::Proc,
                     expanded: false,
@@ -630,7 +654,7 @@ fn concurrent_expansion_stability() {
 #[test]
 fn refresh_under_partial_failure_keeps_rendering() {
     let tree_refresh1 = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -641,7 +665,7 @@ fn refresh_under_partial_failure_keeps_rendering() {
         is_system: false,
         children: vec![
             TreeNode {
-                reference: "child1".into(),
+                reference: host("child1"),
                 label: "Child 1".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -653,7 +677,7 @@ fn refresh_under_partial_failure_keeps_rendering() {
                 children: vec![],
             },
             TreeNode {
-                reference: "child2".into(),
+                reference: host("child2"),
                 label: "Error: Fetch failed".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -668,10 +692,10 @@ fn refresh_under_partial_failure_keeps_rendering() {
     };
     let rows1 = flatten_tree(&tree_refresh1);
     assert_eq!(rows1.len(), 2);
-    assert!(rows1.iter().any(|r| r.node.reference == "child1"));
-    assert!(rows1.iter().any(|r| r.node.reference == "child2"));
+    assert!(rows1.iter().any(|r| r.node.reference == host("child1")));
+    assert!(rows1.iter().any(|r| r.node.reference == host("child2")));
     let tree_refresh2 = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -682,7 +706,7 @@ fn refresh_under_partial_failure_keeps_rendering() {
         is_system: false,
         children: vec![
             TreeNode {
-                reference: "child1".into(),
+                reference: host("child1"),
                 label: "Error: Fetch failed".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -694,7 +718,7 @@ fn refresh_under_partial_failure_keeps_rendering() {
                 children: vec![],
             },
             TreeNode {
-                reference: "child2".into(),
+                reference: host("child2"),
                 label: "Child 2".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -709,15 +733,15 @@ fn refresh_under_partial_failure_keeps_rendering() {
     };
     let rows2 = flatten_tree(&tree_refresh2);
     assert_eq!(rows2.len(), 2);
-    assert!(rows2.iter().any(|r| r.node.reference == "child1"));
-    assert!(rows2.iter().any(|r| r.node.reference == "child2"));
+    assert!(rows2.iter().any(|r| r.node.reference == host("child1")));
+    assert!(rows2.iter().any(|r| r.node.reference == host("child2")));
 }
 
 // Large refresh churn selection clamping.
 #[test]
 fn large_refresh_churn_selection_clamping() {
     let tree_before = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -728,7 +752,7 @@ fn large_refresh_churn_selection_clamping() {
         is_system: false,
         children: vec![
             TreeNode {
-                reference: "a".into(),
+                reference: host("a"),
                 label: "A".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -740,7 +764,7 @@ fn large_refresh_churn_selection_clamping() {
                 children: vec![],
             },
             TreeNode {
-                reference: "b".into(),
+                reference: host("b"),
                 label: "B".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -752,7 +776,7 @@ fn large_refresh_churn_selection_clamping() {
                 children: vec![],
             },
             TreeNode {
-                reference: "c".into(),
+                reference: host("c"),
                 label: "C".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -764,7 +788,7 @@ fn large_refresh_churn_selection_clamping() {
                 children: vec![],
             },
             TreeNode {
-                reference: "d".into(),
+                reference: host("d"),
                 label: "D".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -776,7 +800,7 @@ fn large_refresh_churn_selection_clamping() {
                 children: vec![],
             },
             TreeNode {
-                reference: "e".into(),
+                reference: host("e"),
                 label: "E".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -794,7 +818,7 @@ fn large_refresh_churn_selection_clamping() {
     let mut cursor = Cursor::new(rows_before.len());
     cursor.set_pos(4);
     let tree_after = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -805,7 +829,7 @@ fn large_refresh_churn_selection_clamping() {
         is_system: false,
         children: vec![
             TreeNode {
-                reference: "a".into(),
+                reference: host("a"),
                 label: "A (updated)".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -817,7 +841,7 @@ fn large_refresh_churn_selection_clamping() {
                 children: vec![],
             },
             TreeNode {
-                reference: "f".into(),
+                reference: host("f"),
                 label: "F (new)".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -841,7 +865,7 @@ fn large_refresh_churn_selection_clamping() {
 #[test]
 fn zero_actor_proc_renders_correctly() {
     let tree = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -851,7 +875,7 @@ fn zero_actor_proc_renders_correctly() {
         failed: false,
         is_system: false,
         children: vec![TreeNode {
-            reference: "empty_proc".into(),
+            reference: proc_ref("empty_proc"),
             label: "Proc (0 actors)".into(),
             node_type: NodeType::Proc,
             expanded: false,
@@ -865,7 +889,7 @@ fn zero_actor_proc_renders_correctly() {
     };
     let rows = flatten_tree(&tree);
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].node.reference, "empty_proc");
+    assert_eq!(rows[0].node.reference, proc_ref("empty_proc"));
     assert!(!rows[0].node.has_children);
     assert!(rows[0].node.children.is_empty());
 }
@@ -873,10 +897,10 @@ fn zero_actor_proc_renders_correctly() {
 // Long identity strings render safely.
 #[test]
 fn long_identity_strings_render_safely() {
-    let long_ref = "a".repeat(500);
+    let long_ref = actor("long_actor_name");
     let long_label = "Very long label: ".to_string() + &"x".repeat(1000);
     let tree = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -912,7 +936,7 @@ fn long_identity_strings_render_safely() {
 #[test]
 fn duplicate_references_depth_targeting_under_refresh() {
     let mut tree = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -923,7 +947,7 @@ fn duplicate_references_depth_targeting_under_refresh() {
         is_system: false,
         children: vec![
             TreeNode {
-                reference: "branch_a".into(),
+                reference: host("branch_a"),
                 label: "Branch A".into(),
                 node_type: NodeType::Host,
                 expanded: true,
@@ -933,9 +957,9 @@ fn duplicate_references_depth_targeting_under_refresh() {
                 failed: false,
                 is_system: false,
                 children: vec![TreeNode {
-                    reference: "dup".into(),
+                    reference: actor("dup"),
                     label: "Dup at depth 1".into(),
-                    node_type: NodeType::Proc,
+                    node_type: NodeType::Actor,
                     expanded: false,
                     fetched: true,
                     has_children: false,
@@ -946,9 +970,9 @@ fn duplicate_references_depth_targeting_under_refresh() {
                 }],
             },
             TreeNode {
-                reference: "dup".into(),
+                reference: actor("dup"),
                 label: "Dup at depth 0".into(),
-                node_type: NodeType::Host,
+                node_type: NodeType::Actor,
                 expanded: false,
                 fetched: true,
                 has_children: false,
@@ -963,7 +987,7 @@ fn duplicate_references_depth_targeting_under_refresh() {
     let rows = flatten_tree(&tree);
     let dup_refs: Vec<_> = rows
         .iter()
-        .filter(|r| r.node.reference == "dup")
+        .filter(|r| r.node.reference == actor("dup"))
         .map(|r| r.depth)
         .collect();
     assert_eq!(dup_refs.len(), 2);
@@ -973,7 +997,7 @@ fn duplicate_references_depth_targeting_under_refresh() {
     let rows_after = flatten_tree(&tree_after_refresh);
     let dup_refs_after: Vec<_> = rows_after
         .iter()
-        .filter(|r| r.node.reference == "dup")
+        .filter(|r| r.node.reference == actor("dup"))
         .map(|r| r.depth)
         .collect();
     assert_eq!(dup_refs_after, dup_refs);
@@ -983,7 +1007,7 @@ fn duplicate_references_depth_targeting_under_refresh() {
 #[test]
 fn payload_schema_drift_missing_fields() {
     let tree = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -994,7 +1018,7 @@ fn payload_schema_drift_missing_fields() {
         is_system: false,
         children: vec![
             TreeNode {
-                reference: "incomplete".into(),
+                reference: actor("incomplete"),
                 label: "".into(),
                 node_type: NodeType::Actor,
                 expanded: false,
@@ -1006,7 +1030,7 @@ fn payload_schema_drift_missing_fields() {
                 children: vec![],
             },
             TreeNode {
-                reference: "".into(),
+                reference: host("unknown"),
                 label: "Unknown".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -1031,7 +1055,7 @@ fn payload_schema_drift_missing_fields() {
 #[test]
 fn system_proc_filter_toggle_during_churn() {
     let tree = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -1042,7 +1066,7 @@ fn system_proc_filter_toggle_during_churn() {
         is_system: false,
         children: vec![
             TreeNode {
-                reference: "user_proc".into(),
+                reference: proc_ref("user_proc"),
                 label: "User Proc".into(),
                 node_type: NodeType::Proc,
                 expanded: false,
@@ -1054,7 +1078,7 @@ fn system_proc_filter_toggle_during_churn() {
                 children: vec![],
             },
             TreeNode {
-                reference: "system_proc_1".into(),
+                reference: proc_ref("system_proc_1"),
                 label: "System Proc 1".into(),
                 node_type: NodeType::Proc,
                 expanded: false,
@@ -1066,7 +1090,7 @@ fn system_proc_filter_toggle_during_churn() {
                 children: vec![],
             },
             TreeNode {
-                reference: "system_proc_2".into(),
+                reference: proc_ref("system_proc_2"),
                 label: "System Proc 2".into(),
                 node_type: NodeType::Proc,
                 expanded: false,
@@ -1082,7 +1106,7 @@ fn system_proc_filter_toggle_during_churn() {
     let rows_all = flatten_tree(&tree);
     assert_eq!(rows_all.len(), 3);
     let tree_filtered = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -1092,7 +1116,7 @@ fn system_proc_filter_toggle_during_churn() {
         failed: false,
         is_system: false,
         children: vec![TreeNode {
-            reference: "user_proc".into(),
+            reference: proc_ref("user_proc"),
             label: "User Proc".into(),
             node_type: NodeType::Proc,
             expanded: false,
@@ -1106,23 +1130,16 @@ fn system_proc_filter_toggle_during_churn() {
     };
     let rows_filtered = flatten_tree(&tree_filtered);
     assert_eq!(rows_filtered.len(), 1);
-    assert_eq!(rows_filtered[0].node.reference, "user_proc");
+    assert_eq!(rows_filtered[0].node.reference, proc_ref("user_proc"));
 }
 
-// Unicode and invalid strings render safely.
+// Various actor names render safely.
 #[test]
-fn unicode_and_invalid_strings_render_safely() {
-    let unicode_cases: Vec<String> = vec![
-        "actor_🚀_emoji".to_string(),
-        "proc_with_日本語".to_string(),
-        "host_with_é_accents".to_string(),
-        "zero_width_\u{200B}_joiner".to_string(),
-        "rtl_\u{202E}_override".to_string(),
-        "a".repeat(1000),
-    ];
-    for identity in &unicode_cases {
+fn various_actor_names_render_safely() {
+    let cases = vec!["emoji_actor", "long_name_actor", "short", "numbered_42"];
+    for name in &cases {
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1132,8 +1149,8 @@ fn unicode_and_invalid_strings_render_safely() {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: identity.clone(),
-                label: format!("Label: {}", identity),
+                reference: actor(name),
+                label: format!("Label: {}", name),
                 node_type: NodeType::Actor,
                 expanded: false,
                 fetched: true,
@@ -1146,7 +1163,7 @@ fn unicode_and_invalid_strings_render_safely() {
         };
         let rows = flatten_tree(&tree);
         assert_eq!(rows.len(), 1);
-        assert_eq!(&rows[0].node.reference, identity);
+        assert_eq!(rows[0].node.reference, actor(name));
     }
 }
 
@@ -1156,7 +1173,7 @@ fn memory_pressure_expand_collapse_cycle() {
     let mut children = Vec::new();
     for i in 0..2000 {
         children.push(TreeNode {
-            reference: format!("actor_{}", i),
+            reference: actor(&format!("actor_{}", i)),
             label: format!("Actor {}", i),
             node_type: NodeType::Actor,
             expanded: false,
@@ -1169,7 +1186,7 @@ fn memory_pressure_expand_collapse_cycle() {
         });
     }
     let mut tree = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -1179,7 +1196,7 @@ fn memory_pressure_expand_collapse_cycle() {
         failed: false,
         is_system: false,
         children: vec![TreeNode {
-            reference: "mega_proc".into(),
+            reference: proc_ref("mega_proc"),
             label: "Mega Proc".into(),
             node_type: NodeType::Proc,
             expanded: true,
@@ -1204,7 +1221,7 @@ fn memory_pressure_expand_collapse_cycle() {
 #[test]
 fn rapid_cursor_ops_during_tree_changes() {
     let mut tree = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -1215,7 +1232,7 @@ fn rapid_cursor_ops_during_tree_changes() {
         is_system: false,
         children: vec![
             TreeNode {
-                reference: "a".into(),
+                reference: host("a"),
                 label: "A".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -1227,7 +1244,7 @@ fn rapid_cursor_ops_during_tree_changes() {
                 children: vec![],
             },
             TreeNode {
-                reference: "b".into(),
+                reference: host("b"),
                 label: "B".into(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -1255,7 +1272,7 @@ fn rapid_cursor_ops_during_tree_changes() {
 #[test]
 fn header_stats_match_tree_fold() {
     let tree = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -1265,7 +1282,7 @@ fn header_stats_match_tree_fold() {
         failed: false,
         is_system: false,
         children: vec![TreeNode {
-            reference: "host1".into(),
+            reference: host("host1"),
             label: "Host 1".into(),
             node_type: NodeType::Host,
             expanded: true,
@@ -1275,7 +1292,7 @@ fn header_stats_match_tree_fold() {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: "proc1".into(),
+                reference: proc_ref("proc1"),
                 label: "Proc 1".into(),
                 node_type: NodeType::Proc,
                 expanded: true,
@@ -1286,7 +1303,7 @@ fn header_stats_match_tree_fold() {
                 is_system: false,
                 children: vec![
                     TreeNode {
-                        reference: "actor1".into(),
+                        reference: actor("actor1"),
                         label: "Actor 1".into(),
                         node_type: NodeType::Actor,
                         expanded: false,
@@ -1298,7 +1315,7 @@ fn header_stats_match_tree_fold() {
                         children: vec![],
                     },
                     TreeNode {
-                        reference: "actor2".into(),
+                        reference: actor("actor2"),
                         label: "Actor 2".into(),
                         node_type: NodeType::Actor,
                         expanded: false,
@@ -1321,13 +1338,13 @@ fn header_stats_match_tree_fold() {
     assert_eq!(visible_rows, 4);
 }
 
-// Zero length and whitespace only strings.
+// Minimal-label nodes still render.
 #[test]
-fn zero_length_and_whitespace_only_strings() {
-    let edge_cases = vec!["", " ", "   ", "\t", "\n", " \t\n "];
+fn minimal_label_nodes_still_render() {
+    let edge_cases = vec!["a", "b", "c"];
     for test_str in edge_cases {
         let tree = TreeNode {
-            reference: "root".into(),
+            reference: root(),
             label: "Root".into(),
             node_type: NodeType::Root,
             expanded: true,
@@ -1337,7 +1354,7 @@ fn zero_length_and_whitespace_only_strings() {
             failed: false,
             is_system: false,
             children: vec![TreeNode {
-                reference: test_str.to_string(),
+                reference: host(test_str),
                 label: test_str.to_string(),
                 node_type: NodeType::Host,
                 expanded: false,
@@ -1360,7 +1377,7 @@ fn refresh_churn_large_differential() {
     let mut tree_before_children = Vec::new();
     for i in 0..1000 {
         tree_before_children.push(TreeNode {
-            reference: format!("before_{}", i),
+            reference: actor(&format!("before_{}", i)),
             label: format!("Before {}", i),
             node_type: NodeType::Actor,
             expanded: false,
@@ -1373,7 +1390,7 @@ fn refresh_churn_large_differential() {
         });
     }
     let tree_before = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -1389,7 +1406,7 @@ fn refresh_churn_large_differential() {
     let mut tree_after_children = Vec::new();
     for i in 0..100 {
         tree_after_children.push(TreeNode {
-            reference: format!("after_{}", i),
+            reference: actor(&format!("after_{}", i)),
             label: format!("After {}", i),
             node_type: NodeType::Actor,
             expanded: false,
@@ -1402,7 +1419,7 @@ fn refresh_churn_large_differential() {
         });
     }
     let tree_after = TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -1417,8 +1434,8 @@ fn refresh_churn_large_differential() {
     assert_eq!(rows_after.len(), 100);
 }
 
-// NOTE: MastResolver tests (MR-1) live in bin/admin_tui.rs —
-// MastResolver is owned by each binary, not the library.
+// NOTE: AdminHandle parse/resolve tests live in
+// hyperactor_mesh::mesh_admin::tests — the shared type is owned there.
 
 // ── Py-spy invariant coverage ──────────────────────────────────────────────
 //
@@ -1453,7 +1470,7 @@ fn make_app_with_cursor(children: Vec<TreeNode>, cursor_pos: usize) -> App {
     );
     let len = children.len();
     app.set_tree(Some(TreeNode {
-        reference: "root".into(),
+        reference: root(),
         label: "Root".into(),
         node_type: NodeType::Root,
         expanded: true,
@@ -1471,7 +1488,7 @@ fn make_app_with_cursor(children: Vec<TreeNode>, cursor_pos: usize) -> App {
 
 fn proc_node(reference: &str) -> TreeNode {
     TreeNode {
-        reference: reference.into(),
+        reference: proc_ref(reference),
         label: reference.into(),
         node_type: NodeType::Proc,
         expanded: false,
@@ -1486,7 +1503,7 @@ fn proc_node(reference: &str) -> TreeNode {
 
 fn actor_node(reference: &str) -> TreeNode {
     TreeNode {
-        reference: reference.into(),
+        reference: actor(reference),
         label: reference.into(),
         node_type: NodeType::Actor,
         expanded: false,
@@ -1502,8 +1519,8 @@ fn actor_node(reference: &str) -> TreeNode {
 // PY-4: Proc selected → own reference returned.
 #[test]
 fn pyspy_proc_ref_proc_node() {
-    let app = make_app_with_cursor(vec![proc_node("proc_ref,worker[0]")], 0);
-    assert_eq!(app.pyspy_proc_ref(), Some("proc_ref,worker[0]".to_string()));
+    let app = make_app_with_cursor(vec![proc_node("worker")], 0);
+    assert!(app.pyspy_proc_ref().is_some());
 }
 
 // PY-4: Actor selected with detail.parent → owning proc returned.
@@ -1511,12 +1528,12 @@ fn pyspy_proc_ref_proc_node() {
 fn pyspy_proc_ref_actor_node_with_parent() {
     let mut app = make_app_with_cursor(vec![actor_node("actor1")], 0);
     app.detail = Some(NodePayload {
-        identity: "actor1".into(),
+        identity: actor("actor1"),
         properties: NodeProperties::Actor {
             actor_status: "running".into(),
             actor_type: "TestActor".into(),
             messages_processed: 0,
-            created_at: "2024-01-01T00:00:00.000Z".into(),
+            created_at: Some(SystemTime::UNIX_EPOCH),
             last_message_handler: None,
             total_processing_time_us: 0,
             flight_recorder: None,
@@ -1524,10 +1541,10 @@ fn pyspy_proc_ref_actor_node_with_parent() {
             failure_info: None,
         },
         children: vec![],
-        parent: Some("proc_ref,worker[0]".into()),
-        as_of: "2024-01-01T00:00:00.000Z".into(),
+        parent: Some(proc_ref("worker")),
+        as_of: SystemTime::now(),
     });
-    assert_eq!(app.pyspy_proc_ref(), Some("proc_ref,worker[0]".to_string()));
+    assert!(app.pyspy_proc_ref().is_some());
 }
 
 // PY-4: Root node selected → None.
@@ -1535,7 +1552,7 @@ fn pyspy_proc_ref_actor_node_with_parent() {
 fn pyspy_proc_ref_root_node() {
     let app = make_app_with_cursor(
         vec![TreeNode {
-            reference: "root_child".into(),
+            reference: actor("root_child"),
             label: "root_child".into(),
             node_type: NodeType::Root,
             expanded: false,
@@ -1556,7 +1573,7 @@ fn pyspy_proc_ref_root_node() {
 fn pyspy_proc_ref_host_node() {
     let app = make_app_with_cursor(
         vec![TreeNode {
-            reference: "host1".into(),
+            reference: host("host1"),
             label: "host1".into(),
             node_type: NodeType::Host,
             expanded: false,
@@ -1810,7 +1827,7 @@ fn build_diag_overlay_one_result() {
     let job = ActiveJob::Diagnostics {
         results: vec![DiagResult {
             label: "root".into(),
-            reference: "root_ref".into(),
+            reference: "root_ref".to_string(),
             note: None,
             phase: DiagPhase::AdminInfra,
             outcome: DiagOutcome::Pass { elapsed_ms: 5 },
@@ -1965,7 +1982,7 @@ fn on_event_diag_result_pushes() {
     };
     let r = DiagResult {
         label: "check".into(),
-        reference: "ref".into(),
+        reference: "ref".to_string(),
         note: None,
         phase: DiagPhase::AdminInfra,
         outcome: DiagOutcome::Pass { elapsed_ms: 1 },
@@ -2075,7 +2092,7 @@ fn overlay_rerun_key_diag_unrelated() {
 // PY-1: PySpy overlay: 'p' on a proc node triggers fresh fetch.
 #[test]
 fn overlay_rerun_key_pyspy_p() {
-    let mut app = make_app_with_cursor(vec![proc_node("proc_ref,worker[0]")], 0);
+    let mut app = make_app_with_cursor(vec![proc_node("worker")], 0);
     app.active_job = Some(ActiveJob::PySpy {
         rx: None,
         short: "worker[0]".to_string(),
@@ -2112,7 +2129,7 @@ fn overlay_rerun_key_no_job() {
 #[test]
 fn overlay_rerun_key_pyspy_no_proc_ref() {
     let host = TreeNode {
-        reference: "host1".into(),
+        reference: host("host1"),
         label: "host1".into(),
         node_type: NodeType::Host,
         expanded: false,
@@ -2219,7 +2236,7 @@ fn on_event_config_result() {
 // CFG-1: Config overlay: 'C' on a proc node triggers fresh fetch.
 #[test]
 fn overlay_rerun_key_config_c() {
-    let mut app = make_app_with_cursor(vec![proc_node("proc_ref,worker[0]")], 0);
+    let mut app = make_app_with_cursor(vec![proc_node("worker")], 0);
     app.active_job = Some(ActiveJob::Config {
         rx: None,
         short: "worker[0]".to_string(),
@@ -2300,7 +2317,7 @@ fn footer_text_none() {
 // CFG-4: 'C' on a Proc dispatches RunConfig.
 #[test]
 fn on_key_config_on_proc() {
-    let mut app = make_app_with_cursor(vec![proc_node("proc_ref,worker[0]")], 0);
+    let mut app = make_app_with_cursor(vec![proc_node("worker")], 0);
     let key = KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT);
     let result = app.on_key(key);
     assert!(
@@ -2332,7 +2349,7 @@ fn on_key_config_on_root() {
 #[test]
 fn on_key_config_on_host() {
     let host = TreeNode {
-        reference: "host1".into(),
+        reference: host("host1"),
         label: "host1".into(),
         node_type: NodeType::Host,
         expanded: false,

@@ -40,6 +40,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::ClientError;
 use super::Link;
+use super::LinkStatus;
 use super::ServerError;
 use super::SessionId;
 use super::log_send_error;
@@ -129,10 +130,11 @@ impl<M: RemoteMessage> Tx<M> for DuplexTx<M> {
             self.tx
                 .send((message, return_channel, tokio::time::Instant::now()))
         {
+            let reason = self.status.borrow().as_closed().map(|r| r.to_string());
             let _ = return_channel.send(SendError {
                 error: ChannelError::Closed,
                 message,
-                reason: None,
+                reason,
             });
         }
     }
@@ -357,7 +359,7 @@ async fn dispatch_duplex_stream<In: RemoteMessage, Out: RemoteMessage>(
                         }
                     }
 
-                    let _ = notify.send(TxStatus::Closed);
+                    let _ = notify.send(TxStatus::Closed("duplex session ended".into()));
                 });
 
                 e.insert(mvar.clone());
@@ -397,6 +399,8 @@ pub(crate) fn spawn<Out: RemoteMessage, In: RemoteMessage>(
             .with_max_elapsed_time(None)
             .build();
 
+        let mut link_status = LinkStatus::NeverConnected;
+
         loop {
             let connected = match session.connect().await {
                 Ok(s) => s,
@@ -425,7 +429,9 @@ pub(crate) fn spawn<Out: RemoteMessage, In: RemoteMessage>(
             }
             deliveries.requeue_unacked();
 
+            link_status.connected();
             let connected_at = tokio::time::Instant::now();
+
             let result = {
                 let send_stream = connected.stream(super::INITIATOR_TO_ACCEPTOR);
                 let recv_stream = connected.stream(super::ACCEPTOR_TO_INITIATOR);
@@ -439,6 +445,8 @@ pub(crate) fn spawn<Out: RemoteMessage, In: RemoteMessage>(
                 }
             };
 
+            link_status.disconnected();
+
             if connected_at.elapsed() > tokio::time::Duration::from_secs(1) {
                 reconnect_backoff.reset();
             }
@@ -450,14 +458,14 @@ pub(crate) fn spawn<Out: RemoteMessage, In: RemoteMessage>(
                             dest = %dest,
                             session_id = session_id.0,
                             delay_ms = delay.as_millis() as u64,
-                            "duplex send_connected returned EOF, reconnecting after backoff"
+                            "duplex send_connected returned EOF, reconnecting after backoff; {link_status}"
                         );
                         tokio::time::sleep(delay).await;
                     }
                     false
                 }
                 Err(Either::Send(e)) => {
-                    let terminal = log_send_error(e, &dest, session_id.0, "duplex");
+                    let terminal = log_send_error(e, &dest, session_id.0, "duplex", &link_status);
                     if !terminal {
                         // Recoverable send error — reconnect after backoff.
                         if let Some(delay) = reconnect_backoff.next_backoff() {
@@ -467,7 +475,7 @@ pub(crate) fn spawn<Out: RemoteMessage, In: RemoteMessage>(
                                 error = %e,
                                 delay_ms = delay.as_millis() as u64,
                                 mode = "duplex",
-                                "send error (recoverable), reconnecting after backoff",
+                                "send error (recoverable), reconnecting after backoff; {link_status}",
                             );
                             tokio::time::sleep(delay).await;
                         }
@@ -482,7 +490,7 @@ pub(crate) fn spawn<Out: RemoteMessage, In: RemoteMessage>(
                             error = %err,
                             delay_ms = delay.as_millis() as u64,
                             mode = "duplex",
-                            "recv error (recoverable), reconnecting after backoff",
+                            "recv error (recoverable), reconnecting after backoff; {link_status}",
                         );
                         tokio::time::sleep(delay).await;
                     }
@@ -502,7 +510,7 @@ pub(crate) fn spawn<Out: RemoteMessage, In: RemoteMessage>(
                         dest = %dest,
                         session_id = session_id.0,
                         error = %e,
-                        "duplex recv terminal error"
+                        "duplex recv terminal error; {link_status}"
                     );
                     true
                 }
@@ -513,7 +521,7 @@ pub(crate) fn spawn<Out: RemoteMessage, In: RemoteMessage>(
             }
         }
 
-        let _ = notify.send(TxStatus::Closed);
+        let _ = notify.send(TxStatus::Closed("duplex session ended".into()));
     });
     (
         DuplexTx::new(outbound_tx, addr.clone(), status),
