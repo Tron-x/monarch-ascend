@@ -4,36 +4,67 @@ HiXL single-sided communication bandwidth test.
 
 Tests READ and WRITE throughput between two NPU cards using various buffer sizes.
 """
+import argparse
 import ctypes
 import multiprocessing as mp
 import os
-import sys
+import re
 import time
+import socket
 
 ALIGN_2MB = 2 * 1024 * 1024
+MB = 1024 * 1024
+GB = 1024 * 1024 * 1024
 COORD_FILE = "/tmp/hixl_bw_coord"
 WARMUP_ITERS = 5
 MEASURE_ITERS = 50
 
-SIZES = [
-    (1, "1 MB", 1 * 1024 * 1024),
-    (2, "2 MB", 2 * 1024 * 1024),
-    (4, "4 MB", 4 * 1024 * 1024),
-    (8, "8 MB", 8 * 1024 * 1024),
-    (16, "16 MB", 16 * 1024 * 1024),
-    (32, "32 MB", 32 * 1024 * 1024),
-    (64, "64 MB", 64 * 1024 * 1024),
-    (128, "128 MB", 128 * 1024 * 1024),
-    (256, "256 MB", 256 * 1024 * 1024),
-    (512, "512 MB", 512 * 1024 * 1024),
-]
 
+def parse_size(size_text):
+    value = size_text.strip().replace(" ", "").upper()
+    match = re.fullmatch(r"(\d+)(MB|GB)", value)
+    if not match:
+        raise argparse.ArgumentTypeError(
+            "max_size must use MB or GB, for example 256MB or 2GB"
+        )
+
+    amount = int(match.group(1))
+    unit = match.group(2)
+    size_bytes = amount * (MB if unit == "MB" else GB)
+    if size_bytes <= MB:
+        raise argparse.ArgumentTypeError("max_size must be greater than 1MB")
+    return size_bytes
+
+
+def format_size(size_bytes):
+    if size_bytes % GB == 0:
+        return f"{size_bytes // GB} GB"
+    if size_bytes % MB == 0:
+        return f"{size_bytes // MB} MB"
+    return f"{size_bytes} bytes"
+
+
+def iter_sizes(max_size):
+    size = MB
+    while size <= max_size:
+        yield size
+        size *= 2
+
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        local_ip = s.getsockname()[0]
+    finally:
+        s.close()
+    return local_ip
 
 def find_lib():
     paths = [
         os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                     "tests/hixl/build/libtest_hixl.so"),
-        "/root/monarch/tests/hixl/build/libtest_hixl.so",
+                     "build/libtest_hixl.so"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                     "libtest_hixl.so"),
     ]
     env = os.environ.get("MONARCH_HIXL_LIB")
     if env and os.path.isfile(env):
@@ -88,7 +119,8 @@ def server(dev_id, barrier, result_queue, max_size):
     torch.npu.set_device(0)
 
     lib = setup_lib()
-    ip = os.environ.get("MONARCH_HIXL_IP", "192.168.0.117")
+    # 用socket获取本机IP地址，避免环境变量未设置时使用默认IP导致连接失败
+    ip = get_local_ip()
     eid = f"{ip}:{40000 + dev_id}"
     ctx = lib.hixl_init_engine(0, eid.encode())
     assert ctx, "server init failed"
@@ -158,9 +190,8 @@ def client(dev_id, server_dev_id, barrier, result_queue, max_size):
 
     results = []
 
-    for _, label, size in SIZES:
-        if size > max_size:
-            break
+    for size in iter_sizes(max_size):
+        label = format_size(size)
 
         for op_name, transfer_fn in [("READ", lib.hixl_transfer_read),
                                       ("WRITE", lib.hixl_transfer_write)]:
@@ -194,15 +225,49 @@ def client(dev_id, server_dev_id, barrier, result_queue, max_size):
 
 
 def main():
-    dev_a = int(sys.argv[1]) if len(sys.argv) > 1 else 5
-    dev_b = int(sys.argv[2]) if len(sys.argv) > 2 else 6
+    parser = argparse.ArgumentParser(
+        prog="python bench_hixl_bandwidth.py",
+        description="HiXL bandwidth benchmark for a sender and a receiver NPU.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  python bench_hixl_bandwidth.py -s 5 -r 6 -e 256MB\n\n"
+            "The -e value must be greater than 1MB and support MB or GB units,\n"
+            "for example 128MB, 512MB, or 2GB."
+        ),
+    )
+    parser.add_argument(
+        "-s",
+        "--sender",
+        type=int,
+        required=True,
+        help="sender NPU id",
+    )
+    parser.add_argument(
+        "-r",
+        "--receiver",
+        type=int,
+        required=True,
+        help="receiver NPU id",
+    )
+    parser.add_argument(
+        "-e",
+        "--max-size",
+        dest="max_size",
+        type=parse_size,
+        required=True,
+        help="maximum transfer size, such as 128MB or 2GB",
+    )
+    args = parser.parse_args()
 
-    max_size = SIZES[-1][2]
+    dev_a = args.sender
+    dev_b = args.receiver
+    max_size = args.max_size
 
     print("=" * 70)
     print(f"HiXL Bandwidth Test: NPU {dev_a} ↔ NPU {dev_b}")
     print(f"  Transport: HCCS (default)")
-    print(f"  Buffer sizes: 1 MB → {SIZES[-1][1]}")
+    print(f"  Buffer sizes: 1 MB → {format_size(max_size)}")
     print(f"  Warmup: {WARMUP_ITERS} iters, Measure: {MEASURE_ITERS} iters")
     print("=" * 70)
 
