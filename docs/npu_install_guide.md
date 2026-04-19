@@ -343,6 +343,8 @@ buf = alloc_aligned_tensor((size,), dtype=torch.float32, device="npu:0")
 | `ASCEND_RT_VISIBLE_DEVICES` | 进程可见的物理 NPU（运行时） | 所有卡 |
 | `MONARCH_HIXL_TRANSPORT` | HiXL 传输模式 | `hccs` |
 | `MONARCH_NPU_DEVICE` | HiXL 使用的逻辑设备号 | `0` |
+| `HCCL_INTRA_ROCE_ENABLE` | 跨机必须设为 `1`；由于 CANN 在库加载时缓存该值，**必须在 Python 启动前 export**，只靠 `MONARCH_HIXL_TRANSPORT=roce`（Rust 在运行时再 set_var）太晚 | 未设置 |
+| `HCCL_CONNECT_TIMEOUT` | 秒；CANN 9.0 要求 `[120, 7200]`，小于 120 会被 `HcclCommInitClusterInfoMemConfig` 拒绝（`EI0001`） | 未设置 |
 | `PYO3_PYTHON` | Rust 编译链接的 Python（编译时） | 自动检测 |
 
 ---
@@ -389,6 +391,40 @@ python tests/hixl/bench_hixl_bandwidth.py 5 6
 
 ---
 
+## HiXL 跨机 (RoCE) 实测
+
+测试环境：两台独立 910B 节点，每卡一个 200 Gb/s RoCE port，Monarch actor 分布在两机，通过 `RDMABuffer.read_into` 做单边 READ。
+
+测试脚本：`tests/hixl/e2e/test_multinode_rdma.py`
+
+Worker 启动前必须 export：
+
+```bash
+export MONARCH_HIXL_TRANSPORT=roce
+export HCCL_INTRA_ROCE_ENABLE=1
+export HCCL_CONNECT_TIMEOUT=120
+```
+
+| 操作 | 数据量 | 带宽 (GB/s) | 延迟 (ms) |
+|------|--------|------------|-----------|
+| READ | 16 MB | 14.2 | 1.18 |
+| READ | 256 MB | 23.4 | 11.47 |
+
+理论上 200 Gb/s ≈ 25 GB/s，256 MB 实测 **23.4 GB/s ≈ 94%** 线速利用率。
+
+### 跨机已知限制：同 engine pair 只能有一个已注册 region
+
+CANN 9.0 / HiXL：若一对 engine 之间同时存在多个已注册内存区域，第二次之后的 `TransferSync` 会返回 `503900`。注册本身成功，失败发生在 transfer 阶段。
+
+Monarch 侧已内置软解决方案（`monarch_rdma/src/backend/hixl/manager_actor.rs`）：`register_mem_if_needed` 在真实 HiXL 注册之外额外维护 `aliased_addrs` 表，新 `addr..addr+size` 若整段落在已注册区间内，就记作 alias 并跳过第二次 `hixl_register_mem`。上层只要保证所有并发 buffer 的物理地址都落在同一段大区间内（典型做法是预注册一个大 staging pool），就能无限复用子切片而不触发 `503900`。`deregister_mem` 采用引用计数，所有 alias 都释放且 owner 自身也无引用时才真正下发 `hixl_deregister_mem`。
+
+推荐模式：
+- **staging pool**（推荐，torchstore 已默认启用）：进程级预注册一个大 `RDMABuffer`，后续所有小 buffer 都从该 pool 切子切片，Rust 层自动识别为 alias。
+- **单大 buffer + 切片访问**：一次 `alloc_aligned_tensor` 出最大容量，`RDMABuffer` 覆盖整个 tensor，各子区域用 offset 切片。
+- **串行注册**：上一个 `RDMABuffer` drop 之后再创建下一个。禁止 overlap（overlap 会在 `RegisterMem` 阶段就报 `103900`）。
+
+---
+
 ## 踩坑速查表
 
 | # | 现象 | 原因 | 解决 |
@@ -406,3 +442,6 @@ python tests/hixl/bench_hixl_bandwidth.py 5 6
 | 11 | `pip install -e .` 时 `rustc -V` 卡住 | rust-toolchain 触发 rustup 下载新工具链，网络慢 | 设置 `RUSTUP_TOOLCHAIN=nightly-2025-12-05` 绕过，或等待下载完成 |
 | 12 | `pip install` 丢失 CANN/torch 路径 | pip 默认 build isolation 创建临时环境 | 始终加 `--no-build-isolation` |
 | 13 | merge 上游后 `could not find ibverbs/tcp in backend` | `rdma_components.rs` 的 `use` 语句缺少 `#[cfg(not(feature = "hixl"))]` | 在 `IbvManagerActor`/`TcpManagerActor` 的 `use` 行前加 `#[cfg(not(feature = "hixl"))]` |
+| 14 | 跨机 Monarch HiXL 启动挂在 `HcclCommInitClusterInfoMemConfig (EI0001)` | `HCCL_CONNECT_TIMEOUT` 没设或 < 120 | 在 worker 启动脚本里 `export HCCL_CONNECT_TIMEOUT=120`（Python 启动前） |
+| 15 | 跨机 `hixl_transfer_read` 卡住或超时 | `HCCL_INTRA_ROCE_ENABLE` 在 Python 启动后才被 set_var，CANN 已经缓存了旧值 | 在 worker 启动脚本里 `export HCCL_INTRA_ROCE_ENABLE=1`（不能只靠 `MONARCH_HIXL_TRANSPORT=roce`） |
+| 16 | 跨机多 buffer 场景 `TransferSync ret=503900` | 同一 engine pair 同时注册了多个 region，CANN 9.0 HiXL 限制 | Monarch Rust 侧 `register_mem_if_needed` 已做 range-containment aliasing；上层用 staging pool（torchstore 默认）或单大 buffer + 切片；必要时串行创建/drop `RDMABuffer` |

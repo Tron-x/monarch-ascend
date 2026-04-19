@@ -57,8 +57,24 @@ pub struct HixlEngineState {
     pub engine: hixl_sys::HixlEngine,
     pub engine_id: String,
     pub connected_peers: Mutex<HashSet<String>>,
-    /// addr → reference count.  Memory is deregistered when count drops to 0.
-    pub registered_addrs: Mutex<HashMap<usize, usize>>,
+    /// Real HiXL registrations: `addr → (size, refcount)`.  The first
+    /// `register_mem_if_needed` call for a given address performs the
+    /// actual `hixl_register_mem` and adds an entry here.  The entry is
+    /// removed (and `hixl_deregister_mem` called) once refcount drops
+    /// back to 0.
+    pub registered_addrs: Mutex<HashMap<usize, (usize, usize)>>,
+    /// Sub-range aliases: `aliased_addr → (owner_addr, refcount)`.
+    ///
+    /// When a new `register_mem_if_needed(addr, size)` call falls fully
+    /// inside an already-registered range `[owner, owner+owner_size)`,
+    /// we skip the HiXL call entirely (HiXL in CANN 9.x rejects more
+    /// than one registered region per engine pair with ret=503900) and
+    /// record the request here instead.  The owner's refcount is also
+    /// bumped so the underlying HiXL registration can't be released
+    /// while aliases are still alive.  This lets an upper layer
+    /// (torchstore, forge) pre-register one large staging buffer and
+    /// then freely reuse sub-slices of it for arbitrary transfers.
+    pub aliased_addrs: Mutex<HashMap<usize, (usize, usize)>>,
     /// `true` when running over RoCE instead of HCCS.
     pub force_roce: bool,
 }
@@ -175,11 +191,69 @@ const HCCS_ALIGNMENT: usize = 2 * 1024 * 1024; // 2 MB
 pub fn register_mem_if_needed(addr: usize, size: usize) -> Result<()> {
     with_state(|state| {
         let mut addrs = state.registered_addrs.lock().unwrap();
-        if let Some(refcnt) = addrs.get_mut(&addr) {
+        let mut aliases = state.aliased_addrs.lock().unwrap();
+
+        // Case 1: exact match on an existing real registration -> bump.
+        if let Some((_sz, refcnt)) = addrs.get_mut(&addr) {
             *refcnt += 1;
             return Ok(());
         }
 
+        // Case 2: exact match on a known alias -> bump both alias and
+        // the real owner's refcount (so the real HiXL registration
+        // can't be torn down while any alias is in flight).
+        if let Some((owner, arefcnt)) = aliases.get_mut(&addr) {
+            *arefcnt += 1;
+            let owner_key = *owner;
+            if let Some((_sz, orefcnt)) = addrs.get_mut(&owner_key) {
+                *orefcnt += 1;
+            }
+            return Ok(());
+        }
+
+        // Case 3: new addr but fully contained in an existing real
+        // registration's range -> record as alias, skip HiXL call.
+        //
+        // HiXL (CANN 9.x) allows at most one registered memory region
+        // per engine pair; issuing a second `register_mem` on the same
+        // pair makes every subsequent `TransferSync` return 503900 on
+        // that pair.  The protocol still works across *all* addresses
+        // that physically live inside an already-registered region —
+        // so once an upper layer has reserved a large backing buffer,
+        // we can freely reuse sub-slices of it without ever asking
+        // HiXL to register a second region.  This branch implements
+        // that "range containment" check.
+        //
+        // We only match containment: the new [addr, addr+size) must be
+        // fully inside some existing [owner, owner+owner_size).
+        let containing_owner = addrs
+            .iter()
+            .find_map(|(&owner_addr, &(owner_size, _))| {
+                if addr >= owner_addr
+                    && size <= owner_size
+                    && addr + size <= owner_addr + owner_size
+                {
+                    Some((owner_addr, owner_size))
+                } else {
+                    None
+                }
+            });
+        if let Some((owner_addr, _owner_size)) = containing_owner {
+            aliases.insert(addr, (owner_addr, 1));
+            if let Some((_sz, orefcnt)) = addrs.get_mut(&owner_addr) {
+                *orefcnt += 1;
+            }
+            tracing::debug!(
+                "[hixl] aliasing addr={:#x} size={} to owner={:#x} (skipping hixl_register_mem)",
+                addr,
+                size,
+                owner_addr,
+            );
+            return Ok(());
+        }
+
+        // Case 4: fresh registration.  Fall through to the original
+        // path: warn on alignment, call HiXL, record as real.
         if !state.force_roce && (addr % HCCS_ALIGNMENT != 0) {
             tracing::warn!(
                 "[hixl] memory addr={:#x} is NOT 2 MB aligned (offset={:#x}). \
@@ -194,7 +268,7 @@ pub fn register_mem_if_needed(addr: usize, size: usize) -> Result<()> {
             .engine
             .register_mem(addr, size)
             .map_err(|ret| anyhow::anyhow!("hixl_register_mem(addr={:#x}, size={}) failed: ret={}", addr, size, ret))?;
-        addrs.insert(addr, 1);
+        addrs.insert(addr, (size, 1));
         Ok(())
     })
 }
@@ -204,8 +278,49 @@ pub fn register_mem_if_needed(addr: usize, size: usize) -> Result<()> {
 pub fn deregister_mem(addr: usize) -> Result<()> {
     with_state(|state| {
         let mut addrs = state.registered_addrs.lock().unwrap();
+        let mut aliases = state.aliased_addrs.lock().unwrap();
+
+        // Case 1: alias entry.  Decrement its refcount and also the
+        // real owner's refcount.  When either hits 0, propagate the
+        // teardown: the alias is removed from the map, and the owner
+        // is released (via hixl_deregister_mem) only if *all* of its
+        // aliases and its direct refs have been released.
+        if let Some((owner, arefcnt)) = aliases.get_mut(&addr) {
+            *arefcnt -= 1;
+            let owner_key = *owner;
+            let alias_now_zero = *arefcnt == 0;
+            if alias_now_zero {
+                aliases.remove(&addr);
+            }
+            let mut owner_now_zero = false;
+            if let Some((_sz, orefcnt)) = addrs.get_mut(&owner_key) {
+                if *orefcnt > 1 {
+                    *orefcnt -= 1;
+                } else {
+                    addrs.remove(&owner_key);
+                    owner_now_zero = true;
+                }
+            }
+            drop(aliases);
+            drop(addrs);
+            if owner_now_zero {
+                match state.engine.deregister_mem(owner_key) {
+                    Ok(()) => tracing::debug!(
+                        "[hixl] deregistered owner={:#x} via alias={:#x}",
+                        owner_key, addr,
+                    ),
+                    Err(ret) => tracing::warn!(
+                        "[hixl] deregister_mem owner={:#x} (via alias={:#x}) ret={} (treating as success)",
+                        owner_key, addr, ret,
+                    ),
+                }
+            }
+            return Ok(());
+        }
+
+        // Case 2: direct (real) entry.  Standard refcount path.
         match addrs.get_mut(&addr) {
-            Some(refcnt) if *refcnt > 1 => {
+            Some((_sz, refcnt)) if *refcnt > 1 => {
                 *refcnt -= 1;
                 return Ok(());
             }
@@ -217,13 +332,14 @@ pub fn deregister_mem(addr: usize) -> Result<()> {
                 return Ok(());
             }
         }
+        drop(aliases);
         drop(addrs);
         match state.engine.deregister_mem(addr) {
             Ok(()) => {
                 tracing::debug!("[hixl] deregistered mem addr={:#x}", addr);
             }
             Err(ret) => {
-                // ret=103900 means the HIXL driver reports the address is no
+                // ret=103900 means the HiXL driver reports the address is no
                 // longer registered (e.g. already deregistered by another path,
                 // or re-used after an earlier deregister+register cycle).  We
                 // have already removed the addr from registered_addrs above, so
@@ -434,6 +550,7 @@ fn do_init_engine(dev: i32, eid: String, force_roce: bool) -> Result<()> {
                         engine_id: eid_clone.clone(),
                         connected_peers: Mutex::new(HashSet::new()),
                         registered_addrs: Mutex::new(HashMap::new()),
+                        aliased_addrs: Mutex::new(HashMap::new()),
                         force_roce,
                     };
                     *HIXL_STATE.lock().unwrap() = Some(new_state);
