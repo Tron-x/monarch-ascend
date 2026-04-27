@@ -12,6 +12,7 @@ import contextvars
 import functools
 import inspect
 import logging
+import os
 import threading
 import warnings
 from abc import abstractmethod, abstractproperty
@@ -548,6 +549,27 @@ def enable_transport(transport: "ChannelTransport | str") -> None:
                 f"Attempted to enable transport type `{transport_config}`."
             )
         _transport = transport_config
+    # Export the transport selection to the environment so child processes
+    # (e.g. the mount_worker spawned by Mounts.ensure_open) can re-apply it
+    # before issuing any monarch API calls. Without this, fresh subprocesses
+    # fall back to the default Unix transport and any cross-host operation
+    # they perform (e.g. spawning FUSEActor procs on remote hosts) silently
+    # fails because Unix abstract sockets are not routable across hosts.
+    if isinstance(transport, str):
+        os.environ["MONARCH_DEFAULT_TRANSPORT"] = transport
+    else:
+        # ChannelTransport enum: store its string short-name when known,
+        # otherwise its repr (mount_worker only consumes the well-known names).
+        _enum_to_short = {
+            ChannelTransport.TcpWithHostname: "tcp",
+            ChannelTransport.Unix: "ipc",
+            ChannelTransport.MetaTlsWithIpV6: "metatls",
+            ChannelTransport.MetaTlsWithHostname: "metatls-hostname",
+            ChannelTransport.Tls: "tls",
+        }
+        short = _enum_to_short.get(transport)
+        if short is not None:
+            os.environ["MONARCH_DEFAULT_TRANSPORT"] = short
     # pyre-ignore[6]: BindSpec is accepted by configure. We just do not expose
     # it in the method's signature since BindSpec is not a public type.
     configure(default_transport=transport_config)
