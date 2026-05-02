@@ -5,7 +5,7 @@
 #   2. C++ extensions (monarch.common._C, gradient_generator) link against libtorch
 #   3. Build-time torch detection determines whether to enable tensor_engine feature
 # The torch index is controlled by [tool.uv.sources] below (e.g., pytorch-cu128)
-requires = ["setuptools>=64", "setuptools-rust", "wheel", "numpy", "torch"]
+requires = ["setuptools>=77", "setuptools-rust", "wheel", "numpy", "torch"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -18,6 +18,20 @@ license = "BSD-3-Clause"
 license-files = ["LICENSE"]
 authors = [
     {name = "Meta", email = "oncall+monarch@xmail.facebook.com"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Distributed Computing",
 ]
 
 dependencies = [
@@ -119,6 +133,12 @@ dev = [
     "torch>=2.9.1",
     "setuptools-rust",
 ]
+
+[project.urls]
+Homepage = "https://meta-pytorch.org/monarch/"
+Documentation = "https://meta-pytorch.org/monarch/"
+Repository = "https://github.com/meta-pytorch/monarch"
+Issues = "https://github.com/meta-pytorch/monarch/issues"
 
 [project.scripts]
 monarch = "monarch.tools.cli:main"

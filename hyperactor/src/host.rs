@@ -117,8 +117,8 @@ pub enum HostError {
     ProcExists(String),
 
     /// Failures occuring while spawning a subprocess.
-    #[error("proc '{0}' failed to spawn process: {1}")]
-    ProcessSpawnFailure(reference::ProcId, #[source] std::io::Error),
+    #[error("proc '{0}' (command: {1}) failed to spawn process: {2}")]
+    ProcessSpawnFailure(reference::ProcId, String, #[source] std::io::Error),
 
     /// Failures occuring while configuring a subprocess.
     #[error("proc '{0}' failed to configure process: {1}")]
@@ -155,19 +155,21 @@ impl<M: ProcManager> Host<M> {
     /// On success, the host will multiplex messages for procs on the host
     /// on the address of the host.
     pub async fn new(manager: M, addr: ChannelAddr) -> Result<Self, HostError> {
-        Self::new_with_default(manager, addr, None).await
+        Self::new_with_default(manager, addr, None, None).await
     }
 
     /// Like [`new`], serves a host using the provided ProcManager, on the provided `addr`.
     /// Unknown destinations are forwarded to the default sender.
+    /// When `listener` is `Some`, it is used as the frontend listening socket
+    /// instead of binding a new one.
     #[crate::instrument(fields(addr=addr.to_string()))]
     pub async fn new_with_default(
         manager: M,
         addr: ChannelAddr,
         default_sender: Option<BoxedMailboxSender>,
+        listener: Option<std::net::TcpListener>,
     ) -> Result<Self, HostError> {
-        let (frontend_addr, frontend_rx) = channel::serve(addr)?;
-
+        let (frontend_addr, frontend_rx) = channel::serve_with_listener(addr, listener)?;
         // We set up a cascade of routers: first, the outer router supports
         // sending to the the system proc, while the dial router manages dialed
         // connections.
@@ -1311,9 +1313,9 @@ where
         // Kill the child when its handle is dropped.
         cmd.kill_on_drop(true);
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| HostError::ProcessSpawnFailure(proc_id.clone(), e))?;
+        let child = cmd.spawn().map_err(|e| {
+            HostError::ProcessSpawnFailure(proc_id.clone(), self.program.display().to_string(), e)
+        })?;
 
         // Retain the handle so it lives for the life of the
         // manager/host.

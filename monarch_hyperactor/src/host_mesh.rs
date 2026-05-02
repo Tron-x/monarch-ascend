@@ -25,6 +25,7 @@ use hyperactor_mesh::host_mesh::HostMeshRef;
 use hyperactor_mesh::host_mesh::host_agent::GetLocalProcClient;
 use hyperactor_mesh::host_mesh::host_agent::HostAgent;
 use hyperactor_mesh::host_mesh::host_agent::ShutdownHost;
+use hyperactor_mesh::mesh_admin::MeshAdminMessageClient;
 use hyperactor_mesh::proc_agent::GetProcClient;
 use hyperactor_mesh::proc_mesh::ProcRef;
 use hyperactor_mesh::shared_cell::SharedCell;
@@ -37,11 +38,9 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use pyo3::types::PyType;
 
 use crate::actor::PythonActor;
 use crate::actor::to_py_error;
-use crate::alloc::PyAlloc;
 use crate::context::PyInstance;
 use crate::proc_mesh::PyProcMesh;
 use crate::pytokio::PyPythonTask;
@@ -138,33 +137,6 @@ impl PyHostMesh {
 
 #[pymethods]
 impl PyHostMesh {
-    #[classmethod]
-    fn allocate_nonblocking(
-        _cls: &Bound<'_, PyType>,
-        instance: &PyInstance,
-        alloc: &mut PyAlloc,
-        name: String,
-        bootstrap_params: Option<PyBootstrapCommand>,
-    ) -> PyResult<PyPythonTask> {
-        let bootstrap_params =
-            bootstrap_params.map_or_else(|| alloc.bootstrap_command.clone(), |b| Some(b.to_rust()));
-        let alloc = match alloc.take() {
-            Some(alloc) => alloc,
-            None => {
-                return Err(PyException::new_err(
-                    "Alloc object already used".to_string(),
-                ));
-            }
-        };
-        let instance = instance.clone();
-        PyPythonTask::new(async move {
-            let mesh = HostMesh::allocate(instance.deref(), alloc, &name, bootstrap_params)
-                .await
-                .map_err(|err| PyException::new_err(err.to_string()))?;
-            Ok(Self::new_owned(mesh))
-        })
-    }
-
     #[pyo3(signature = (instance, name, per_host, proc_bind = None))]
     fn spawn_nonblocking(
         &self,
@@ -188,9 +160,19 @@ impl PyHostMesh {
     }
 
     fn with_bootstrap(&self, bootstrap_command: &PyBootstrapCommand) -> PyResult<Self> {
-        Ok(Self::new_ref(
-            self.mesh_ref()?.with_bootstrap(bootstrap_command.to_rust()),
-        ))
+        match self {
+            PyHostMesh::Owned(inner) => {
+                let cmd = bootstrap_command.to_rust();
+                inner
+                    .0
+                    .try_with_mut(|mesh| mesh.set_bootstrap(cmd))
+                    .map_err(|e| PyException::new_err(e.to_string()))?;
+                Ok(Self::Owned(inner.clone()))
+            }
+            PyHostMesh::Ref(_) => Ok(Self::new_ref(
+                self.mesh_ref()?.with_bootstrap(bootstrap_command.to_rust()),
+            )),
+        }
     }
 
     fn sliced(&self, region: &PyRegion) -> PyResult<Self> {
@@ -205,7 +187,7 @@ impl PyHostMesh {
     }
 
     fn __reduce__<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
-        let bytes = bincode::serialize(&self.mesh_ref()?)
+        let bytes = bincode::serde::encode_to_vec(&self.mesh_ref()?, bincode::config::legacy())
             .map_err(|e| PyErr::new::<PyValueError, _>(e.to_string()))?;
         let py_bytes = (PyBytes::new(py, &bytes),).into_bound_py_any(py).unwrap();
         let from_bytes =
@@ -297,6 +279,13 @@ static ROOT_CLIENT_INSTANCE_FOR_HOST: OnceLock<Instance<PythonActor>> = OnceLock
 /// Static storage for the host mesh agent created by bootstrap_host().
 static HOST_MESH_AGENT_FOR_HOST: OnceLock<ActorHandle<HostAgent>> = OnceLock::new();
 
+/// Static storage for the host shutdown handle created by bootstrap_host().
+/// Used during shutdown_context to join the mailbox server and flush
+/// receive-side acks.
+static HOST_SHUTDOWN_HANDLE: OnceLock<
+    tokio::sync::Mutex<Option<hyperactor_mesh::bootstrap::HostShutdownHandle>>,
+> = OnceLock::new();
+
 /// Bootstrap the client host and root client actor.
 ///
 /// This creates a proper Host with BootstrapProcManager, spawns the root client
@@ -318,17 +307,19 @@ fn bootstrap_host(bootstrap_cmd: Option<PyBootstrapCommand>) -> PyResult<PyPytho
     };
 
     PyPythonTask::new(async move {
-        let (host_mesh_agent, _shutdown) = host(
+        let (host_mesh_agent, shutdown_handle) = host(
             default_bind_spec().binding_addr(),
             Some(bootstrap_cmd),
             None,
             false,
+            None,
         )
         .await
         .map_err(|e| PyException::new_err(e.to_string()))?;
 
-        // Store the agent for later shutdown
-        HOST_MESH_AGENT_FOR_HOST.set(host_mesh_agent.clone()).ok(); // Ignore error if already set
+        // Store the agent and shutdown handle for later shutdown
+        HOST_MESH_AGENT_FOR_HOST.set(host_mesh_agent.clone()).ok();
+        HOST_SHUTDOWN_HANDLE.get_or_init(|| tokio::sync::Mutex::new(Some(shutdown_handle)));
 
         let host_mesh_name = hyperactor_mesh::Name::new_reserved("local").unwrap();
         let host_mesh = HostMeshRef::from_host_agent(host_mesh_name, host_mesh_agent.bind())
@@ -453,8 +444,10 @@ fn bootstrap_host(bootstrap_cmd: Option<PyBootstrapCommand>) -> PyResult<PyPytho
 
 #[pyfunction]
 fn py_host_mesh_from_bytes(bytes: &Bound<'_, PyBytes>) -> PyResult<PyHostMesh> {
-    let r: PyResult<HostMeshRef> = bincode::deserialize(bytes.as_bytes())
-        .map_err(|e| PyErr::new::<PyValueError, _>(e.to_string()));
+    let r: PyResult<HostMeshRef> =
+        bincode::serde::decode_from_slice(bytes.as_bytes(), bincode::config::legacy())
+            .map(|(v, _)| v)
+            .map_err(|e| PyErr::new::<PyValueError, _>(e.to_string()));
     r.map(PyHostMesh::new_ref)
 }
 
@@ -496,15 +489,39 @@ fn shutdown_local_host_mesh() -> PyResult<PyPythonTask> {
             )
             .map_err(|e| PyException::new_err(e.to_string()))?;
 
+        // Join the host's mailbox server to flush receive-side acks
+        // before the process exits.
+        if let Some(lock) = HOST_SHUTDOWN_HANDLE.get() {
+            if let Some(handle) = lock.lock().await.take() {
+                handle.join().await;
+            }
+        }
+
         Ok(())
     })
 }
 
-/// Spawn a MeshAdminAgent aggregating topology across one or more meshes.
-///
-/// The admin runs on the caller's local proc and serves the
-/// mesh-admin HTTP API. Returns the admin HTTP URL. When
-/// `admin_addr` is `None`, the bind address is read from
+/// Opaque capability token for `ActorRef<MeshAdminAgent>` across the
+/// Python boundary. No methods, no getters — Python never inspects
+/// this. It exists solely to transport the typed ref from
+/// `_spawn_admin` to `_start_periodic_snapshots`.
+#[pyclass(
+    name = "PyMeshAdminRef",
+    module = "monarch._rust_bindings.monarch_hyperactor.host_mesh"
+)]
+#[derive(Clone)]
+pub struct PyMeshAdminRef(
+    hyperactor::reference::ActorRef<hyperactor_mesh::mesh_admin::MeshAdminAgent>,
+);
+
+impl PyMeshAdminRef {
+    pub fn actor_ref(
+        &self,
+    ) -> hyperactor::reference::ActorRef<hyperactor_mesh::mesh_admin::MeshAdminAgent> {
+        self.0.clone()
+    }
+}
+
 /// `MESH_ADMIN_ADDR` config.
 ///
 /// Python-facing wrapper around
@@ -534,10 +551,17 @@ fn _spawn_admin(
 
     let instance = instance.clone();
     PyPythonTask::new(async move {
-        let addr = host_mesh::spawn_admin(&mesh_refs, instance.deref(), admin_addr, telemetry_url)
+        let admin_ref =
+            host_mesh::spawn_admin(&mesh_refs, instance.deref(), admin_addr, telemetry_url)
+                .await
+                .map_err(|e| PyException::new_err(e.to_string()))?;
+        let admin_url = admin_ref
+            .get_admin_addr(instance.deref())
             .await
-            .map_err(|e| PyException::new_err(e.to_string()))?;
-        Ok(addr)
+            .map_err(|e| PyException::new_err(e.to_string()))?
+            .addr
+            .ok_or_else(|| PyException::new_err("mesh admin agent did not report an address"))?;
+        Ok((admin_url, PyMeshAdminRef(admin_ref)))
     })
 }
 
@@ -572,5 +596,6 @@ pub fn register_python_bindings(hyperactor_mod: &Bound<'_, PyModule>) -> PyResul
 
     hyperactor_mod.add_class::<PyHostMesh>()?;
     hyperactor_mod.add_class::<PyBootstrapCommand>()?;
+    hyperactor_mod.add_class::<PyMeshAdminRef>()?;
     Ok(())
 }

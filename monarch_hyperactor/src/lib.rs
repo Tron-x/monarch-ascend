@@ -12,7 +12,6 @@
 
 pub mod actor;
 pub mod actor_mesh;
-pub mod alloc;
 pub mod bootstrap;
 pub mod buffers;
 pub mod channel;
@@ -25,7 +24,6 @@ pub mod local_state_broker;
 pub mod logging;
 pub mod mailbox;
 pub mod metrics;
-pub mod namespace;
 pub mod ndslice;
 pub mod pickle;
 pub mod proc;
@@ -44,9 +42,6 @@ pub mod telemetry;
 pub mod testing;
 mod testresource;
 pub mod value_mesh;
-
-#[cfg(fbcode_build)]
-pub mod meta;
 
 // Register types from dependent crates that don't have wirevalue as a dependency
 wirevalue::register_type!(monarch_types::PickledPyObject);

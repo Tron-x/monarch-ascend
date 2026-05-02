@@ -37,10 +37,16 @@ Then verify with::
 
 import argparse
 import asyncio
+import logging
 import time
 
+from monarch._src.actor.telemetry import TracingForwarder
 from monarch.actor import Actor, endpoint
-from monarch.job import ProcessJob
+from monarch.job import ProcessJob, TelemetryConfig
+
+logger = logging.getLogger("pyspy_workload")
+logger.addHandler(TracingForwarder())
+logger.setLevel(logging.INFO)
 
 
 # -- Work helpers with named frames for py-spy visibility ----------
@@ -130,7 +136,11 @@ def parse_args() -> argparse.Namespace:
 async def async_main() -> None:
     args = parse_args()
 
-    job = ProcessJob({"hosts": 1}).enable_admin()
+    job = (
+        ProcessJob({"hosts": 1})
+        .enable_telemetry(TelemetryConfig(snapshot_interval_secs=30.0))
+        .enable_admin()
+    )
     state = job.state(cached_path=None)
     host = state.hosts
 

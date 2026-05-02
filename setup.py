@@ -357,7 +357,7 @@ class build_ext(_build_ext):
 
 # Extension Creation
 def create_cpp_extension(
-    name: str, sources: List[str], extra_macros: List[str] = None
+    name: str, sources: List[str], define_macros: Optional[List] = None
 ) -> Extension:
     """
     Create a C++ extension with torch dependencies.
@@ -365,18 +365,21 @@ def create_cpp_extension(
     Args:
         name: Extension module name (e.g., "monarch.common._C")
         sources: List of source file paths
-        extra_macros: Optional list of preprocessor macro names to define
+        define_macros: Optional list of (NAME, VALUE) tuples passed verbatim
+            to ``Extension(define_macros=...)``.  Use ``[("MACRO", "1")]`` to
+            define ``MACRO=1`` at compile time; pass ``None`` (default) for no
+            macros.  NPU/Ascend builds typically pass ``None`` and rely on the
+            upstream ``#ifdef MONARCH_BUILD_CUDA`` pattern's ``else`` branch
+            for no-op CUDA stubs.
 
     Returns:
         Extension object configured for torch
     """
-    compile_args = ["-std=c++17", "-g", "-O3"]
-    for macro in extra_macros or []:
-        compile_args.append(f"-D{macro}")
     return Extension(
         name,
         sources,
-        extra_compile_args=compile_args,
+        extra_compile_args=["-std=c++17", "-g", "-O3"],
+        define_macros=define_macros or [],
         libraries=["dl", "c10", "torch", "torch_cpu", "torch_python"],
         library_dirs=[torch_config["lib_path"]],
         include_dirs=[
@@ -394,24 +397,32 @@ def create_cpp_extension(
 ext_modules = []
 if build_tensor_engine:
     cpp_sources = ["python/monarch/common/init.cpp"]
+    cpp_defines = []
     if build_cuda:
         # mock_cuda.cpp is not compatible with ROCm (relies on CUDA-specific assembly)
         cpp_sources.append("python/monarch/common/mock_cuda.cpp")
+        cpp_defines.append(("MONARCH_BUILD_CUDA", "1"))
 
     ext_modules = [
-        create_cpp_extension("monarch.common._C", cpp_sources),
+        create_cpp_extension(
+            "monarch.common._C", cpp_sources, define_macros=cpp_defines
+        ),
         create_cpp_extension(
             "monarch.gradient._gradient_generator",
             ["python/monarch/gradient/_gradient_generator.cpp"],
         ),
     ]
 elif build_ascend and torch_config:
-    # Ascend build: include init.cpp but skip mock_cuda
+    # Ascend build: include init.cpp but skip mock_cuda.
+    # Upstream changed the convention from "default-include CUDA mock, opt-out
+    # via MONARCH_NO_CUDA_MOCK" to "default-no-CUDA, opt-in via
+    # MONARCH_BUILD_CUDA" (see python/monarch/common/init.cpp).  Ascend builds
+    # naturally fall into the upstream else branch (no-op CUDA stubs) by
+    # simply not defining MONARCH_BUILD_CUDA.
     ext_modules = [
         create_cpp_extension(
             "monarch.common._C",
             ["python/monarch/common/init.cpp"],
-            extra_macros=["MONARCH_NO_CUDA_MOCK"],
         ),
         create_cpp_extension(
             "monarch.gradient._gradient_generator",

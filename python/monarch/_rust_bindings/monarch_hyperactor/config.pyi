@@ -56,7 +56,6 @@ def configure(
     split_max_buffer_age: str = ...,
     stop_actor_timeout: str = ...,
     cleanup_timeout: str = ...,
-    remote_allocator_heartbeat_interval: str = ...,
     default_encoding: Encoding = ...,
     channel_net_rx_buffer_full_check_interval: str = ...,
     message_latency_sampling_rate: float = ...,
@@ -83,6 +82,7 @@ def configure(
     mesh_attach_config_timeout: str = ...,
     mesh_orphan_timeout: str = ...,
     rdma_allow_tcp_fallback: bool = ...,
+    rdma_disable_ibverbs: bool = ...,
     rdma_max_chunk_size_mb: int = ...,
     **kwargs: object,
 ) -> None:
@@ -128,8 +128,6 @@ def configure(
             (humantime)
         stop_actor_timeout: Timeout for stopping actors (humantime)
         cleanup_timeout: Timeout for cleanup operations (humantime)
-        remote_allocator_heartbeat_interval: Heartbeat interval for
-            remote allocator (humantime)
         default_encoding: Default message encoding (Encoding.Bincode,
             Encoding.Json, or Encoding.Multipart)
         channel_net_rx_buffer_full_check_interval: Network receive buffer
@@ -180,6 +178,8 @@ def configure(
             fall back to chunked hyperactor messaging over the default
             channel transport. When False, operations fail if no ibverbs
             backend is available.
+        rdma_disable_ibverbs: Force-disable ibverbs even when available,
+            causing all RDMA operations to use the TCP fallback backend.
         rdma_max_chunk_size_mb: Maximum chunk size in MiB for
             TCP-based RDMA transfers (default: 64)
         **kwargs: Reserved for future configuration keys

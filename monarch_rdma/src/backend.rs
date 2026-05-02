@@ -11,6 +11,8 @@
 //! On GPU: ibverbs backend (rdmaxcel) for InfiniBand/RoCE.
 //! On NPU: HIXL backend for Ascend RDMA/RoCE/HCCS.
 
+#[cfg(all(test, not(feature = "hixl")))]
+pub(crate) mod cuda_test_utils;
 #[cfg(not(feature = "hixl"))]
 pub mod ibverbs;
 #[cfg(not(feature = "hixl"))]

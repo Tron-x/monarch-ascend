@@ -8,9 +8,25 @@
 
 #include <Python.h>
 #include <torch/version.h> // @manual=//caffe2:version_cpp
-#ifndef MONARCH_NO_CUDA_MOCK
+
+#ifdef MONARCH_BUILD_CUDA
 // @lint-ignore CLANGTIDY facebook-hte-RelativeInclude
 #include "mock_cuda.h"
+#else
+// No-op stubs when building without CUDA (e.g. ROCm, NPU/Ascend).
+// Selected here because upstream switched MONARCH_BUILD_CUDA from "default-on /
+// opt-out via MONARCH_NO_CUDA_MOCK" to "default-off / opt-in via
+// MONARCH_BUILD_CUDA"; Ascend builds (see setup.py ``elif build_ascend``)
+// no longer need to pass any macro -- they fall through into this branch.
+static PyObject* patch_cuda(PyObject*, PyObject*) {
+  Py_RETURN_NONE;
+}
+static PyObject* mock_cuda(PyObject*, PyObject*) {
+  Py_RETURN_NONE;
+}
+static PyObject* unmock_cuda(PyObject*, PyObject*) {
+  Py_RETURN_NONE;
+}
 #endif
 
 // @lint-ignore-every CLANGTIDY facebook-hte-NullableReturn

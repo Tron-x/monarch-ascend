@@ -7,7 +7,6 @@
 # pyre-unsafe
 
 import contextlib
-import io
 import logging
 import os
 import pickle
@@ -16,12 +15,14 @@ import signal
 import subprocess
 import sys
 import tempfile
+import traceback
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Literal, NamedTuple, Optional, Sequence
 
+from monarch._rust_bindings.monarch_hyperactor.host_mesh import PyMeshAdminRef
 from monarch._src.actor.bootstrap import attach_to_workers
 from monarch._src.actor.host_mesh import _spawn_admin
 from monarch._src.job.mount_config import Mounts
@@ -33,12 +34,51 @@ from monarch.actor import (
     current_rank,
     enable_transport,
     endpoint,
+    Future,
     HostMesh,
     Port,
     this_host,
 )
 from monarch.distributed_telemetry.actor import start_telemetry
 from monarch.distributed_telemetry.engine import QueryEngine
+
+
+@contextlib.contextmanager
+def _redirect_stdio(stdout=None, stderr=None):
+    """Redirect stdout/stderr at the OS fd level.
+
+    Unlike contextlib.redirect_stdout/stderr, subprocesses also inherit the
+    redirect because file descriptors 1 and 2 are replaced via os.dup2.
+
+    *stdout* and *stderr* must be file objects backed by a real OS file
+    descriptor (e.g. from open() or tempfile.TemporaryFile). StringIO is not
+    supported.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    redirects = []
+    if stdout is not None:
+        redirects.append((1, stdout, "stdout"))
+    if stderr is not None:
+        redirects.append((2, stderr, "stderr"))
+
+    saved_fds = {}
+    saved_py = {}
+    for fd, new_file, attr in redirects:
+        saved_fds[fd] = os.dup(fd)
+        os.dup2(new_file.fileno(), fd)
+        saved_py[attr] = getattr(sys, attr)
+        setattr(sys, attr, new_file)
+    try:
+        yield
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        for fd, _, attr in redirects:
+            setattr(sys, attr, saved_py[attr])
+            os.dup2(saved_fds[fd], fd)
+            os.close(saved_fds[fd])
 
 
 class BashActor(Actor):
@@ -152,27 +192,41 @@ class BashActor(Actor):
                 source = f.read()
             code = compile(source, py_file, "exec")
 
+            capture = output_dir is None
             if output_dir is not None:
                 os.makedirs(output_dir, exist_ok=True)
-                out_f: Any = open(os.path.join(output_dir, "stdout.txt"), "w")
-                err_f: Any = open(os.path.join(output_dir, "stderr.txt"), "w")
+                out_ctx = open(os.path.join(output_dir, "stdout.txt"), "w")
+                err_ctx = open(os.path.join(output_dir, "stderr.txt"), "w")
             else:
-                out_f = io.StringIO()
-                err_f = io.StringIO()
+                out_ctx = tempfile.TemporaryFile(mode="w+")
+                err_ctx = tempfile.TemporaryFile(mode="w+")
 
-            with (
-                out_f,
-                err_f,
-                patch.object(sys, "argv", argv),
-                contextlib.redirect_stdout(out_f),
-                contextlib.redirect_stderr(err_f),
-            ):
-                exec(code, {"__name__": "__main__", "__file__": py_file})
-                return {
-                    "returncode": 0,
-                    "stdout": out_f.getvalue() if output_dir is None else "",
-                    "stderr": err_f.getvalue() if output_dir is None else "",
-                }
+            returncode = 1
+            stdout_val = ""
+            stderr_val = ""
+            with out_ctx as out_f, err_ctx as err_f:
+                with (
+                    patch.object(sys, "argv", argv),
+                    _redirect_stdio(stdout=out_f, stderr=err_f),
+                ):
+                    try:
+                        returncode = 0
+                        exec(code, {"__name__": "__main__", "__file__": py_file})
+                    except Exception:
+                        returncode = 1
+                        traceback.print_exc()
+
+                if capture:
+                    out_f.seek(0)
+                    err_f.seek(0)
+                    stdout_val = out_f.read()
+                    stderr_val = err_f.read()
+
+            return {
+                "returncode": returncode,
+                "stdout": stdout_val,
+                "stderr": stderr_val,
+            }
 
     @endpoint
     def run_streaming(
@@ -253,12 +307,18 @@ class TelemetryConfig:
             0 disables retention.
         include_dashboard: Whether to start the monarch dashboard web server.
         dashboard_port: Preferred port for the dashboard.
+        snapshot_interval_secs: Interval in seconds between periodic mesh
+            introspection snapshots. Snapshots capture the mesh topology
+            into the telemetry query surface. 0 disables periodic capture
+            (default). Snapshot table schemas are always pre-registered
+            regardless of this setting.
     """
 
     batch_size: int = 1000
     retention_secs: int = 600
     include_dashboard: bool = False
     dashboard_port: int = 8265
+    snapshot_interval_secs: float = 0  # 0 = disabled
 
 
 @dataclass
@@ -373,6 +433,8 @@ class JobTrait(ABC):
         self._query_engine: Optional[QueryEngine] = None
         self._telemetry_url: Optional[str] = None
         self._admin_url: Optional[str] = None
+        self._scanner = None  # DatabaseScanner, set by _start_telemetry_if_configured
+        self._snapshot_started: bool = False
         self._apply_id: Optional[str] = None
         self._mounts: Mounts = Mounts()
         # Per-mesh python executable overrides.  None key means "all meshes".
@@ -385,23 +447,64 @@ class JobTrait(ABC):
             return
 
         cfg = self._telemetry
-        self._query_engine, self._telemetry_url = start_telemetry(
+        self._query_engine, self._telemetry_url, self._scanner = start_telemetry(
             batch_size=cfg.batch_size,
             retention_secs=cfg.retention_secs,
             include_dashboard=cfg.include_dashboard,
             dashboard_port=cfg.dashboard_port,
         )
 
-    def _start_admin_if_configured(self, host_meshes: List[HostMesh]) -> None:
-        """Start the mesh admin agent if configured and not already running."""
-        if self._mesh_admin is None or self._admin_url is not None:
-            return
+    def _start_admin_if_configured(
+        self, host_meshes: List[HostMesh]
+    ) -> Optional[PyMeshAdminRef]:
+        """Start the mesh admin agent if configured and not already running.
 
-        self._admin_url = _spawn_admin(
+        Returns the opaque admin ref for immediate use by snapshot
+        startup, or None if admin is not configured or already running.
+        """
+        if self._mesh_admin is None or self._admin_url is not None:
+            return None
+
+        admin_url, admin_ref = _spawn_admin(
             host_meshes,
             admin_addr=self._mesh_admin.admin_addr,
             telemetry_url=self._telemetry_url,
         ).get()
+        self._admin_url = admin_url
+        return admin_ref
+
+    def _start_periodic_snapshots_if_configured(
+        self, admin_ref: Optional[PyMeshAdminRef]
+    ) -> None:
+        """Start periodic snapshots if configured and not already running.
+
+        Spawns a SnapshotCaptureActor on the local proc. The actor is
+        stopped by framework lifecycle on proc teardown — no manual
+        stop needed. The admin_ref is consumed here and not persisted.
+        """
+        if self._snapshot_started:
+            return
+        if self._telemetry is None or self._scanner is None:
+            return
+        if admin_ref is None:
+            return
+        telemetry = self._telemetry
+        assert telemetry is not None  # guarded above
+        if telemetry.snapshot_interval_secs <= 0:
+            return
+
+        from monarch._rust_bindings.monarch_extension.snapshot_integration import (
+            _start_periodic_snapshots,
+        )
+        from monarch.actor import context
+
+        _start_periodic_snapshots(
+            scanner=self._scanner,
+            admin_ref=admin_ref,
+            instance=context().actor_instance._as_rust(),
+            interval_secs=telemetry.snapshot_interval_secs,
+        )
+        self._snapshot_started = True
 
     def _wrap_state(self, job_state: JobState) -> JobState:
         """Attach telemetry and admin fields to a JobState."""
@@ -513,7 +616,8 @@ class JobTrait(ABC):
             logger.info("Job is running, returning current state")
             job_state = running_job._state()
             self._start_telemetry_if_configured()
-            self._start_admin_if_configured(list(job_state._hosts.values()))
+            admin_ref = self._start_admin_if_configured(list(job_state._hosts.values()))
+            self._start_periodic_snapshots_if_configured(admin_ref)
             return self._wrap_state(job_state)
 
         cached = self._load_cached(cached_path)
@@ -522,14 +626,16 @@ class JobTrait(ABC):
             logger.info("Connecting to cached job")
             job_state = cached._state()
             self._start_telemetry_if_configured()
-            self._start_admin_if_configured(list(job_state._hosts.values()))
+            admin_ref = self._start_admin_if_configured(list(job_state._hosts.values()))
+            self._start_periodic_snapshots_if_configured(admin_ref)
             return self._wrap_state(job_state)
         logger.info("Applying current job")
         self.apply()
         logger.info("Job has started, connecting to current state")
         job_state = self._state()
         self._start_telemetry_if_configured()
-        self._start_admin_if_configured(list(job_state._hosts.values()))
+        admin_ref = self._start_admin_if_configured(list(job_state._hosts.values()))
+        self._start_periodic_snapshots_if_configured(admin_ref)
         result = self._wrap_state(job_state)
         if cached_path is not None:
             # Create the directory for cached_path if it doesn't exist
@@ -604,6 +710,8 @@ class JobTrait(ABC):
         state["_query_engine"] = None
         state["_telemetry_url"] = None
         state["_admin_url"] = None
+        state["_scanner"] = None
+        state["_snapshot_started"] = False
         return state
 
     def dump(self, filename: str) -> None:
@@ -869,7 +977,7 @@ def exec_command(
     rank: Optional[int] = None,
     point: Optional[Dict[str, int]] = None,
     per_host: Optional[Dict[str, int]] = None,
-) -> int:
+) -> "Future[int]":
     """Run a command on *host_mesh* via BashActor.
 
     Args:
@@ -890,56 +998,61 @@ def exec_command(
             to :meth:`~monarch.actor.HostMesh.spawn_procs`.
 
     Returns:
-        Maximum return code across all ranks (0 = success).
+        A Future resolving to the maximum return code across all ranks (0 = success).
     """
-    procs = (
-        host_mesh.spawn_procs(per_host=per_host)
-        if per_host
-        else host_mesh.spawn_procs()
-    )
-    if point is not None:
-        procs = procs.slice(**point)
-    elif rank is not None:
-        procs = procs.flatten("rank").slice(rank=rank)
 
-    bash_actors = procs.spawn("BashActor", BashActor)
+    async def _impl() -> int:
+        if point is not None:
+            host_mesh_s = host_mesh.slice(**point)
+        elif rank is not None:
+            host_mesh_s = host_mesh.flatten("rank").slice(rank=rank)
+        else:
+            host_mesh_s = host_mesh
 
-    client_cwd = os.getcwd()
+        procs = host_mesh_s.spawn_procs(per_host=per_host)
+        try:
+            bash_actors = procs.spawn("BashActor", BashActor)
 
-    if cmd[0].endswith(".py") or cmd[0] == "-m":
-        results = bash_actors.run_python.call(
-            cmd,
-            env=env,
-            workdir=workdir,
-            client_cwd=client_cwd,
-            output_dir=output_dir,
-        ).get()
-    else:
-        lines: List[str] = ["#!/bin/bash"]
-        if env:
-            for k, v in env.items():
-                lines.append(f"export {k}={shlex.quote(v)}")
-        if workdir:
-            lines.append(f"cd {shlex.quote(workdir)}")
-        elif client_cwd:
-            lines.append(
-                f"[ -d {shlex.quote(client_cwd)} ] && cd {shlex.quote(client_cwd)}"
-            )
-        lines.append(shlex.join(cmd))
-        script = "\n".join(lines) + "\n"
-        results = bash_actors.run.call(script, output_dir=output_dir).get()
-    max_rc = 0
-    for _rank_key, result in results:
-        rc = result.get("returncode", 1)
-        max_rc = max(max_rc, rc)
-        if output_dir is None:
-            stdout = result.get("stdout", "")
-            stderr = result.get("stderr", "")
-            if stdout:
-                print(stdout, end="")
-            if stderr:
-                print(stderr, end="", file=sys.stderr)
-    return max_rc
+            client_cwd = os.getcwd()
+
+            if cmd[0].endswith(".py") or cmd[0] == "-m":
+                results = await bash_actors.run_python.call(
+                    cmd,
+                    env=env,
+                    workdir=workdir,
+                    client_cwd=client_cwd,
+                    output_dir=output_dir,
+                )
+            else:
+                lines: List[str] = ["#!/bin/bash"]
+                if env:
+                    for k, v in env.items():
+                        lines.append(f"export {k}={shlex.quote(v)}")
+                if workdir:
+                    lines.append(f"cd {shlex.quote(workdir)}")
+                elif client_cwd:
+                    lines.append(
+                        f"[ -d {shlex.quote(client_cwd)} ] && cd {shlex.quote(client_cwd)}"
+                    )
+                lines.append(shlex.join(cmd))
+                script = "\n".join(lines) + "\n"
+                results = await bash_actors.run.call(script, output_dir=output_dir)
+            max_rc = 0
+            for _rank_key, result in results:
+                rc = result.get("returncode", 1)
+                max_rc = max(max_rc, rc)
+                if output_dir is None:
+                    stdout = result.get("stdout", "")
+                    stderr = result.get("stderr", "")
+                    if stdout:
+                        print(stdout, end="")
+                    if stderr:
+                        print(stderr, end="", file=sys.stderr)
+            return max_rc
+        finally:
+            await procs.stop()
+
+    return Future(coro=_impl())
 
 
 class LocalJob(JobTrait):
@@ -1151,20 +1264,40 @@ class LoginJob(JobTrait):
 
 
 class SSHJob(LoginJob):
+    """Connect to hosts via SSH and start monarch workers.
+
+    Args:
+        python_exe: Python executable on remote hosts.
+        ssh_args: Extra arguments passed to ssh.
+        monarch_port: Port the worker listens on.
+        transport: Transport type for worker communication. Supported
+            values are "tcp", "metatls" and "metatls-hostname"
+            (see enable_transport).
+    """
+
     def __init__(
         self,
         python_exe: str = "python",
         ssh_args: Sequence[str] = (),
         monarch_port: int = 22222,
+        transport: str = "tcp",
     ):
-        enable_transport("tcp")
+        if transport not in ("tcp", "metatls", "metatls-hostname"):
+            raise ValueError(
+                f"SSHJob only supports tcp, metatls, and metatls-hostname transport types, got {transport!r}"
+            )
+        enable_transport(transport)
         self._python_exe = python_exe
         self._ssh_args = ssh_args
         self._port = monarch_port
+        self._transport = transport
+        self._scheme = (
+            "metatls" if transport in ("metatls", "metatls-hostname") else "tcp"
+        )
         super().__init__()
 
     def _start_host(self, host: str) -> ProcessState:
-        addr = f"tcp://{host}:{self._port}"
+        addr = f"{self._scheme}://{host}:{self._port}"
         startup = f'from monarch.actor import run_worker_loop_forever; run_worker_loop_forever(address={repr(addr)}, ca="trust_all_connections")'
 
         command = f"{shlex.quote(self._python_exe)} -c {shlex.quote(startup)}"
@@ -1180,5 +1313,6 @@ class SSHJob(LoginJob):
             and spec._python_exe == self._python_exe
             and self._port == spec._port
             and self._ssh_args == spec._ssh_args
+            and self._transport == spec._transport
             and super().can_run(spec)
         )

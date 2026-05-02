@@ -81,6 +81,7 @@ pub mod reference;
 pub mod remote;
 mod signal_handler;
 mod stdio_redirect;
+pub mod subject;
 pub mod supervision;
 pub mod sync;
 /// Test utilities.
@@ -88,7 +89,7 @@ pub mod testing;
 pub mod time;
 
 #[cfg(fbcode_build)]
-mod meta;
+pub mod meta;
 
 /// Re-exports of external crates used by hyperactor_macros codegen.
 /// This module is not part of the public API and should not be used directly.

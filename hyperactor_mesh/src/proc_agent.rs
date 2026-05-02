@@ -15,35 +15,20 @@
 #![allow(unused_assignments)]
 
 use std::collections::HashMap;
-use std::mem::take;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::RwLock;
-use std::sync::RwLockReadGuard;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use enum_as_inner::EnumAsInner;
 use hyperactor::Actor;
 use hyperactor::ActorHandle;
 use hyperactor::Bind;
 use hyperactor::Context;
 use hyperactor::Data;
-use hyperactor::HandleClient;
 use hyperactor::Handler;
 use hyperactor::Instance;
 use hyperactor::PortHandle;
-use hyperactor::RefClient;
 use hyperactor::Unbind;
 use hyperactor::actor::handle_undeliverable_message;
 use hyperactor::actor::remote::Remote;
-use hyperactor::channel;
-use hyperactor::channel::ChannelAddr;
-use hyperactor::mailbox::BoxedMailboxSender;
-use hyperactor::mailbox::DialMailboxRouter;
-use hyperactor::mailbox::IntoBoxedMailboxSender;
-use hyperactor::mailbox::MailboxClient;
-use hyperactor::mailbox::MailboxSender;
 use hyperactor::mailbox::MessageEnvelope;
 use hyperactor::mailbox::Undeliverable;
 use hyperactor::proc::Proc;
@@ -61,6 +46,8 @@ use crate::Name;
 use crate::config_dump::ConfigDump;
 use crate::config_dump::ConfigDumpResult;
 use crate::pyspy::PySpyDump;
+use crate::pyspy::PySpyProfile;
+use crate::pyspy::PySpyProfileWorker;
 use crate::pyspy::PySpyWorker;
 use crate::resource;
 
@@ -80,16 +67,6 @@ declare_attrs! {
     /// of treating it as an error.
     attr STREAM_STATE_SUBSCRIBER: bool;
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Named)]
-pub enum GspawnResult {
-    Success {
-        rank: usize,
-        actor_id: hyperactor_reference::ActorId,
-    },
-    Error(String),
-}
-wirevalue::register_type!(GspawnResult);
 
 /// Deferred republish of introspect properties.
 ///
@@ -131,90 +108,6 @@ fn collect_live_children(
         }
     }
     (children, system_children)
-}
-
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    Handler,
-    HandleClient,
-    RefClient,
-    Named
-)]
-pub(crate) enum MeshAgentMessage {
-    /// Configure the proc in the mesh.
-    Configure {
-        /// The rank of this proc in the mesh.
-        rank: usize,
-        /// The forwarder to send messages to unknown destinations.
-        forwarder: ChannelAddr,
-        /// The supervisor port to which the agent should report supervision events.
-        supervisor: Option<hyperactor_reference::PortRef<ActorSupervisionEvent>>,
-        /// An address book to use for direct dialing.
-        address_book: HashMap<hyperactor_reference::ProcId, ChannelAddr>,
-        /// The agent should write its rank to this port when it successfully
-        /// configured.
-        configured: hyperactor_reference::PortRef<usize>,
-        /// If true, and supervisor is None, record supervision events to be reported
-        record_supervision_events: bool,
-    },
-
-    Status {
-        /// The status of the proc.
-        /// To be replaced with fine-grained lifecycle status,
-        /// and to use aggregation.
-        status: hyperactor_reference::PortRef<(usize, bool)>,
-    },
-
-    /// Spawn an actor on the proc to the provided name.
-    Gspawn {
-        /// registered actor type
-        actor_type: String,
-        /// spawned actor name
-        actor_name: String,
-        /// serialized parameters
-        params_data: Data,
-        /// reply port; the proc should send its rank to indicated a spawned actor
-        status_port: hyperactor_reference::PortRef<GspawnResult>,
-    },
-}
-
-/// Internal configuration state of the mesh agent.
-#[derive(Debug, EnumAsInner, Default)]
-enum State {
-    UnconfiguredV0 {
-        sender: ReconfigurableMailboxSender,
-    },
-
-    ConfiguredV0 {
-        sender: ReconfigurableMailboxSender,
-        rank: usize,
-        supervisor: Option<hyperactor_reference::PortRef<ActorSupervisionEvent>>,
-    },
-
-    V1,
-
-    #[default]
-    Invalid,
-}
-
-impl State {
-    fn rank(&self) -> Option<usize> {
-        match self {
-            State::ConfiguredV0 { rank, .. } => Some(*rank),
-            _ => None,
-        }
-    }
-
-    fn supervisor(&self) -> Option<hyperactor_reference::PortRef<ActorSupervisionEvent>> {
-        match self {
-            State::ConfiguredV0 { supervisor, .. } => supervisor.clone(),
-            _ => None,
-        }
-    }
 }
 
 /// Actor state used for v1 API.
@@ -368,7 +261,6 @@ struct SelfCheck {}
 /// See GC-1 in `global_context` module doc.
 #[hyperactor::export(
     handlers=[
-        MeshAgentMessage,
         ActorSupervisionEvent,
         resource::CreateOrUpdate<ActorSpec> { cast = true },
         resource::Stop { cast = true },
@@ -380,13 +272,13 @@ struct SelfCheck {}
         resource::WaitRankStatus { cast = true },
         RepublishIntrospect { cast = true },
         PySpyDump,
+        PySpyProfile,
         ConfigDump,
     ]
 )]
 pub struct ProcAgent {
     proc: Proc,
     remote: Remote,
-    state: State,
     /// Actors created and tracked through the resource behavior.
     actor_states: HashMap<Name, ActorInstanceState>,
     /// If true, and supervisor is None, record supervision events to be reported
@@ -408,30 +300,6 @@ pub struct ProcAgent {
 }
 
 impl ProcAgent {
-    #[hyperactor::observe_result("MeshAgent")]
-    pub(crate) async fn bootstrap(
-        proc_id: hyperactor_reference::ProcId,
-    ) -> Result<(Proc, ActorHandle<Self>), anyhow::Error> {
-        let sender = ReconfigurableMailboxSender::new();
-        let proc = Proc::configured(proc_id.clone(), BoxedMailboxSender::new(sender.clone()));
-
-        let agent = ProcAgent {
-            proc: proc.clone(),
-            remote: Remote::collect(),
-            state: State::UnconfiguredV0 { sender },
-            actor_states: HashMap::new(),
-            record_supervision_events: false,
-            introspect_dirty: false,
-            shutdown_tx: None,
-            stopping_all: false,
-            // v0 procs don't have an owner they can check for, so they should
-            // never try to kill the children.
-            mesh_orphan_timeout: None,
-        };
-        let handle = proc.spawn::<Self>("mesh", agent)?;
-        Ok((proc, handle))
-    }
-
     pub(crate) fn boot_v1(
         proc: Proc,
         shutdown_tx: Option<tokio::sync::oneshot::Sender<i32>>,
@@ -448,7 +316,6 @@ impl ProcAgent {
         let agent = ProcAgent {
             proc: proc.clone(),
             remote: Remote::collect(),
-            state: State::V1,
             actor_states: HashMap::new(),
             record_supervision_events: true,
             introspect_dirty: false,
@@ -554,7 +421,7 @@ impl ProcAgent {
         attrs.set(crate::introspect::NODE_TYPE, "proc".to_string());
         attrs.set(
             crate::introspect::PROC_NAME,
-            self.proc.proc_id().to_string(),
+            self.proc.proc_id().name().to_string(),
         );
         attrs.set(crate::introspect::NUM_ACTORS, num_live);
         attrs.set(hyperactor::introspect::CHILDREN, children);
@@ -566,6 +433,37 @@ impl ProcAgent {
         );
         attrs.set(crate::introspect::IS_POISONED, failed_actor_count > 0);
         attrs.set(crate::introspect::FAILED_ACTOR_COUNT, failed_actor_count);
+
+        // PD-* proc debug stats intentionally join two signal classes:
+        // hosting-process memory for the OS process that owns this
+        // proc, and proc-local queue pressure aggregated over live
+        // actors only.
+        let memory = crate::introspect::ProcessMemoryStats::read_from_procfs();
+        memory.to_attrs(&mut attrs);
+
+        // Proc-wide total from runtime accounting path (O(1)).
+        let queue_total = self.proc.queue_depth_total();
+        attrs.set(crate::introspect::ACTOR_WORK_QUEUE_DEPTH_TOTAL, queue_total);
+
+        // Per-actor max still needs the per-actor scan (PD-4: live actors only).
+        let mut queue_max: u64 = 0;
+        for actor_id in self.proc.all_instance_keys() {
+            if let Some(cell) = self.proc.get_instance(&actor_id) {
+                queue_max = queue_max.max(cell.queue_depth());
+            }
+        }
+        attrs.set(crate::introspect::ACTOR_WORK_QUEUE_DEPTH_MAX, queue_max);
+
+        // Retained queue-pressure evidence (PD-6, PD-7).
+        attrs.set(
+            crate::introspect::ACTOR_WORK_QUEUE_DEPTH_HIGH_WATER_MARK,
+            self.proc.queue_depth_high_water_mark(),
+        );
+        attrs.set(
+            crate::introspect::LAST_NONZERO_QUEUE_DEPTH_AGE_MS,
+            self.proc.last_nonzero_queue_depth_age_ms(),
+        );
+
         cx.instance().publish_attrs(attrs);
     }
 }
@@ -646,7 +544,7 @@ impl Actor for ProcAgent {
                     let num_live = children.len();
                     let mut attrs = hyperactor_config::Attrs::new();
                     attrs.set(crate::introspect::NODE_TYPE, "proc".to_string());
-                    attrs.set(crate::introspect::PROC_NAME, proc_id.to_string());
+                    attrs.set(crate::introspect::PROC_NAME, proc_id.name().to_string());
                     attrs.set(crate::introspect::NUM_ACTORS, num_live);
                     attrs.set(crate::introspect::SYSTEM_CHILDREN, system_children);
                     attrs.set(crate::introspect::STOPPED_CHILDREN, stopped_children);
@@ -656,6 +554,31 @@ impl Actor for ProcAgent {
                     );
                     attrs.set(crate::introspect::IS_POISONED, is_poisoned);
                     attrs.set(crate::introspect::FAILED_ACTOR_COUNT, failed_actor_count);
+
+                    // PD-*: include proc debug stats in QueryChild
+                    // to prevent resolution drift from the publish path.
+                    let memory = crate::introspect::ProcessMemoryStats::read_from_procfs();
+                    memory.to_attrs(&mut attrs);
+                    attrs.set(
+                        crate::introspect::ACTOR_WORK_QUEUE_DEPTH_TOTAL,
+                        proc.queue_depth_total(),
+                    );
+                    let mut queue_max: u64 = 0;
+                    for aid in proc.all_instance_keys() {
+                        if let Some(cell) = proc.get_instance(&aid) {
+                            queue_max = queue_max.max(cell.queue_depth());
+                        }
+                    }
+                    attrs.set(crate::introspect::ACTOR_WORK_QUEUE_DEPTH_MAX, queue_max);
+                    attrs.set(
+                        crate::introspect::ACTOR_WORK_QUEUE_DEPTH_HIGH_WATER_MARK,
+                        proc.queue_depth_high_water_mark(),
+                    );
+                    attrs.set(
+                        crate::introspect::LAST_NONZERO_QUEUE_DEPTH_AGE_MS,
+                        proc.last_nonzero_queue_depth_age_ms(),
+                    );
+
                     let attrs_json =
                         serde_json::to_string(&attrs).unwrap_or_else(|_| "{}".to_string());
 
@@ -724,119 +647,6 @@ impl Actor for ProcAgent {
 }
 
 #[async_trait]
-#[hyperactor::handle(MeshAgentMessage)]
-impl MeshAgentMessageHandler for ProcAgent {
-    async fn configure(
-        &mut self,
-        cx: &Context<Self>,
-        rank: usize,
-        forwarder: ChannelAddr,
-        supervisor: Option<hyperactor_reference::PortRef<ActorSupervisionEvent>>,
-        address_book: HashMap<hyperactor_reference::ProcId, ChannelAddr>,
-        configured: hyperactor_reference::PortRef<usize>,
-        record_supervision_events: bool,
-    ) -> Result<(), anyhow::Error> {
-        anyhow::ensure!(
-            self.state.is_unconfigured_v0(),
-            "mesh agent cannot be (re-)configured"
-        );
-        self.record_supervision_events = record_supervision_events;
-
-        let client = MailboxClient::new(channel::dial(forwarder)?);
-        let router =
-            DialMailboxRouter::new_with_default_direct_addressed_remote_only(client.into_boxed());
-
-        for (proc_id, addr) in address_book {
-            router.bind(proc_id.into(), addr);
-        }
-
-        let sender = take(&mut self.state).into_unconfigured_v0().unwrap();
-        assert!(sender.configure(router.into_boxed()));
-
-        // This is a bit suboptimal: ideally we'd set the supervisor first, to correctly report
-        // any errors that occur during configuration. However, these should anyway be correctly
-        // caught on process exit.
-        self.state = State::ConfiguredV0 {
-            sender,
-            rank,
-            supervisor,
-        };
-        configured.send(cx, rank)?;
-
-        Ok(())
-    }
-
-    async fn gspawn(
-        &mut self,
-        cx: &Context<Self>,
-        actor_type: String,
-        actor_name: String,
-        params_data: Data,
-        status_port: hyperactor_reference::PortRef<GspawnResult>,
-    ) -> Result<(), anyhow::Error> {
-        anyhow::ensure!(
-            self.state.is_configured_v0(),
-            "mesh agent is not v0 configured"
-        );
-        let actor_id = match self
-            .remote
-            .gspawn(
-                &self.proc,
-                &actor_type,
-                &actor_name,
-                params_data,
-                cx.headers().clone(),
-            )
-            .await
-        {
-            Ok(id) => id,
-            Err(err) => {
-                status_port.send(cx, GspawnResult::Error(format!("gspawn failed: {}", err)))?;
-                return Err(anyhow::anyhow!("gspawn failed"));
-            }
-        };
-        status_port.send(
-            cx,
-            GspawnResult::Success {
-                rank: self.state.rank().unwrap(),
-                actor_id,
-            },
-        )?;
-        self.publish_introspect_properties(cx);
-        Ok(())
-    }
-
-    async fn status(
-        &mut self,
-        cx: &Context<Self>,
-        status_port: hyperactor_reference::PortRef<(usize, bool)>,
-    ) -> Result<(), anyhow::Error> {
-        match &self.state {
-            State::ConfiguredV0 { rank, .. } => {
-                // v0 path: configured with a concrete rank
-                status_port.send(cx, (*rank, true))?;
-                Ok(())
-            }
-            State::UnconfiguredV0 { .. } => {
-                // v0 path but not configured yet
-                Err(anyhow::anyhow!(
-                    "status unavailable: v0 agent not configured (waiting for Configure)"
-                ))
-            }
-            State::V1 => {
-                // v1/owned path does not support status (no rank semantics)
-                Err(anyhow::anyhow!(
-                    "status unsupported in v1/owned path (no rank)"
-                ))
-            }
-            State::Invalid => Err(anyhow::anyhow!(
-                "status unavailable: agent in invalid state"
-            )),
-        }
-    }
-}
-
-#[async_trait]
 impl Handler<ActorSupervisionEvent> for ProcAgent {
     async fn handle(
         &mut self,
@@ -887,9 +697,7 @@ impl Handler<ActorSupervisionEvent> for ProcAgent {
                 self.shutdown().await;
             }
         }
-        if let Some(supervisor) = self.state.supervisor() {
-            supervisor.send(cx, event)?;
-        } else if !self.record_supervision_events && event.is_error() {
+        if !self.record_supervision_events && event.is_error() {
             // If there is no supervisor, and nothing is recording these, crash
             // the whole process on error events.
             tracing::error!(
@@ -899,8 +707,6 @@ impl Handler<ActorSupervisionEvent> for ProcAgent {
                 "could not propagate supervision event, crashing",
             );
 
-            // We should have a custom "crash" function here, so that this works
-            // in testing of the LocalAllocator, etc.
             std::process::exit(1);
         }
         Ok(())
@@ -926,6 +732,17 @@ impl Handler<PySpyDump> for ProcAgent {
         message: PySpyDump,
     ) -> Result<(), anyhow::Error> {
         PySpyWorker::spawn_and_forward(cx, message.opts, message.result)
+    }
+}
+
+#[async_trait]
+impl Handler<PySpyProfile> for ProcAgent {
+    async fn handle(
+        &mut self,
+        cx: &Context<Self>,
+        message: PySpyProfile,
+    ) -> Result<(), anyhow::Error> {
+        PySpyProfileWorker::spawn_and_forward(cx, message.request, message.result)
     }
 }
 
@@ -1360,278 +1177,11 @@ impl Handler<SelfCheck> for ProcAgent {
     }
 }
 
-/// A mailbox sender that initially queues messages, and then relays them to
-/// an underlying sender once configured.
-#[derive(Clone)]
-pub(crate) struct ReconfigurableMailboxSender {
-    state: Arc<RwLock<ReconfigurableMailboxSenderState>>,
-}
-
-impl std::fmt::Debug for ReconfigurableMailboxSender {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Not super helpful, but we definitely don't wan to acquire any locks
-        // in a Debug formatter.
-        f.debug_struct("ReconfigurableMailboxSender").finish()
-    }
-}
-
-/// A capability wrapper granting access to the configured mailbox
-/// sender.
-///
-/// This type exists to tie the lifetime of any `&BoxedMailboxSender`
-/// reference to a lock guard, so the underlying state cannot be
-/// reconfigured while the reference is in use.
-///
-/// A **read** guard is sufficient because we only need to *observe*
-/// and borrow the configured sender, not mutate state. While a
-/// `RwLockReadGuard` is held, `configure()` cannot acquire the write
-/// lock, so the state cannot transition from `Configured(..)` to any
-/// other variant during the guard’s lifetime.
-pub(crate) struct ReconfigurableMailboxSenderInner<'a> {
-    guard: RwLockReadGuard<'a, ReconfigurableMailboxSenderState>,
-}
-
-impl<'a> ReconfigurableMailboxSenderInner<'a> {
-    pub(crate) fn as_configured(&self) -> Option<&BoxedMailboxSender> {
-        self.guard.as_configured()
-    }
-}
-
-type Post = (MessageEnvelope, PortHandle<Undeliverable<MessageEnvelope>>);
-
-#[derive(EnumAsInner, Debug)]
-enum ReconfigurableMailboxSenderState {
-    Queueing(Mutex<Vec<Post>>),
-    Configured(BoxedMailboxSender),
-}
-
-impl ReconfigurableMailboxSender {
-    pub(crate) fn new() -> Self {
-        Self {
-            state: Arc::new(RwLock::new(ReconfigurableMailboxSenderState::Queueing(
-                Mutex::new(Vec::new()),
-            ))),
-        }
-    }
-
-    /// Configure this mailbox with the provided sender. This will first
-    /// enqueue any pending messages onto the sender; future messages are
-    /// posted directly to the configured sender.
-    pub(crate) fn configure(&self, sender: BoxedMailboxSender) -> bool {
-        // Hold the write lock until all queued messages are flushed.
-        let mut state = self.state.write().unwrap();
-        if state.is_configured() {
-            return false;
-        }
-
-        // Install the configured sender exactly once.
-        let queued = std::mem::replace(
-            &mut *state,
-            ReconfigurableMailboxSenderState::Configured(sender),
-        );
-
-        // Borrow the configured sender from the state (stable while
-        // we hold the lock).
-        let configured_sender = state.as_configured().expect("just configured");
-
-        // Flush the old queue while still holding the write lock.
-        for (envelope, return_handle) in queued.into_queueing().unwrap().into_inner().unwrap() {
-            configured_sender.post(envelope, return_handle);
-        }
-
-        true
-    }
-
-    pub(crate) fn as_inner<'a>(
-        &'a self,
-    ) -> Result<ReconfigurableMailboxSenderInner<'a>, anyhow::Error> {
-        let state = self.state.read().unwrap();
-        if state.is_configured() {
-            Ok(ReconfigurableMailboxSenderInner { guard: state })
-        } else {
-            Err(anyhow::anyhow!("cannot get inner sender: not configured"))
-        }
-    }
-}
-
-#[async_trait]
-impl MailboxSender for ReconfigurableMailboxSender {
-    fn post(
-        &self,
-        envelope: MessageEnvelope,
-        return_handle: PortHandle<Undeliverable<MessageEnvelope>>,
-    ) {
-        match &*self.state.read().unwrap() {
-            ReconfigurableMailboxSenderState::Queueing(queue) => {
-                queue.lock().unwrap().push((envelope, return_handle));
-            }
-            ReconfigurableMailboxSenderState::Configured(sender) => {
-                sender.post(envelope, return_handle);
-            }
-        }
-    }
-
-    fn post_unchecked(
-        &self,
-        envelope: MessageEnvelope,
-        return_handle: PortHandle<Undeliverable<MessageEnvelope>>,
-    ) {
-        match &*self.state.read().unwrap() {
-            ReconfigurableMailboxSenderState::Queueing(queue) => {
-                queue.lock().unwrap().push((envelope, return_handle));
-            }
-            ReconfigurableMailboxSenderState::Configured(sender) => {
-                sender.post_unchecked(envelope, return_handle);
-            }
-        }
-    }
-
-    async fn flush(&self) -> Result<(), anyhow::Error> {
-        let sender = match &*self.state.read().unwrap() {
-            ReconfigurableMailboxSenderState::Queueing(_) => return Ok(()),
-            ReconfigurableMailboxSenderState::Configured(sender) => sender.clone(),
-        };
-        sender.flush().await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::Mutex;
-
-    use hyperactor::mailbox::BoxedMailboxSender;
-    use hyperactor::mailbox::Mailbox;
-    use hyperactor::mailbox::MailboxSender;
-    use hyperactor::mailbox::MessageEnvelope;
-    use hyperactor::mailbox::PortHandle;
-    use hyperactor::mailbox::Undeliverable;
-    use hyperactor::testing::ids::test_actor_id;
-    use hyperactor::testing::ids::test_port_id;
-    use hyperactor_config::Flattrs;
 
     use super::*;
-
-    #[derive(Debug, Clone)]
-    struct QueueingMailboxSender {
-        messages: Arc<Mutex<Vec<MessageEnvelope>>>,
-    }
-
-    impl QueueingMailboxSender {
-        fn new() -> Self {
-            Self {
-                messages: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-
-        fn get_messages(&self) -> Vec<MessageEnvelope> {
-            self.messages.lock().unwrap().clone()
-        }
-    }
-
-    #[async_trait]
-    impl MailboxSender for QueueingMailboxSender {
-        fn post_unchecked(
-            &self,
-            envelope: MessageEnvelope,
-            _return_handle: PortHandle<Undeliverable<MessageEnvelope>>,
-        ) {
-            self.messages.lock().unwrap().push(envelope);
-        }
-    }
-
-    // Helper function to create a test message envelope
-    fn envelope(data: u64) -> MessageEnvelope {
-        MessageEnvelope::serialize(
-            test_actor_id("world_0", "sender"),
-            test_port_id("world_0", "receiver", 1),
-            &data,
-            Flattrs::new(),
-        )
-        .unwrap()
-    }
-
-    fn return_handle() -> PortHandle<Undeliverable<MessageEnvelope>> {
-        let mbox = Mailbox::new_detached(test_actor_id("0", "test"));
-        let (port, _receiver) = mbox.open_port::<Undeliverable<MessageEnvelope>>();
-        port
-    }
-
-    #[test]
-    fn test_queueing_before_configure() {
-        let sender = ReconfigurableMailboxSender::new();
-
-        let test_sender = QueueingMailboxSender::new();
-        let boxed_sender = BoxedMailboxSender::new(test_sender.clone());
-
-        let return_handle = return_handle();
-        sender.post(envelope(1), return_handle.clone());
-        sender.post(envelope(2), return_handle.clone());
-
-        assert_eq!(test_sender.get_messages().len(), 0);
-
-        sender.configure(boxed_sender);
-
-        let messages = test_sender.get_messages();
-        assert_eq!(messages.len(), 2);
-
-        assert_eq!(messages[0].deserialized::<u64>().unwrap(), 1);
-        assert_eq!(messages[1].deserialized::<u64>().unwrap(), 2);
-    }
-
-    #[test]
-    fn test_direct_delivery_after_configure() {
-        // Create a ReconfigurableMailboxSender
-        let sender = ReconfigurableMailboxSender::new();
-
-        let test_sender = QueueingMailboxSender::new();
-        let boxed_sender = BoxedMailboxSender::new(test_sender.clone());
-        sender.configure(boxed_sender);
-
-        let return_handle = return_handle();
-        sender.post(envelope(3), return_handle.clone());
-        sender.post(envelope(4), return_handle.clone());
-
-        let messages = test_sender.get_messages();
-        assert_eq!(messages.len(), 2);
-
-        assert_eq!(messages[0].deserialized::<u64>().unwrap(), 3);
-        assert_eq!(messages[1].deserialized::<u64>().unwrap(), 4);
-    }
-
-    #[test]
-    fn test_multiple_configurations() {
-        let sender = ReconfigurableMailboxSender::new();
-        let boxed_sender = BoxedMailboxSender::new(QueueingMailboxSender::new());
-
-        assert!(sender.configure(boxed_sender.clone()));
-        assert!(!sender.configure(boxed_sender));
-    }
-
-    #[test]
-    fn test_mixed_queueing_and_direct_delivery() {
-        let sender = ReconfigurableMailboxSender::new();
-
-        let test_sender = QueueingMailboxSender::new();
-        let boxed_sender = BoxedMailboxSender::new(test_sender.clone());
-
-        let return_handle = return_handle();
-        sender.post(envelope(5), return_handle.clone());
-        sender.post(envelope(6), return_handle.clone());
-
-        sender.configure(boxed_sender);
-
-        sender.post(envelope(7), return_handle.clone());
-        sender.post(envelope(8), return_handle.clone());
-
-        let messages = test_sender.get_messages();
-        assert_eq!(messages.len(), 4);
-
-        assert_eq!(messages[0].deserialized::<u64>().unwrap(), 5);
-        assert_eq!(messages[1].deserialized::<u64>().unwrap(), 6);
-        assert_eq!(messages[2].deserialized::<u64>().unwrap(), 7);
-        assert_eq!(messages[3].deserialized::<u64>().unwrap(), 8);
-    }
 
     // A no-op actor used to test direct proc-level spawning.
     #[derive(Debug, Default, Serialize, Deserialize)]
@@ -1907,7 +1457,8 @@ mod tests {
             .name_of::<ExtraActor>()
             .unwrap()
             .to_string();
-        let actor_params = bincode::serialize(&ExtraActor).unwrap();
+        let actor_params =
+            bincode::serde::encode_to_vec(&ExtraActor, bincode::config::legacy()).unwrap();
         let actor_name = Name::Reserved("test_actor".to_string());
 
         // 1. Spawn an actor via CreateOrUpdate.
@@ -2011,5 +1562,148 @@ mod tests {
             "expected terminating status, got {:?}",
             state.status,
         );
+    }
+
+    // ── PD-4/PD-5: live proc-agent queue pressure test ────────
+
+    // A blocking actor for inducing queue pressure. Uses a shared
+    // Notify for the block/unblock protocol since actor messages
+    // must be Serialize + Clone.
+    #[derive(Debug, Default, Serialize, Deserialize)]
+    #[hyperactor::export(handlers = [BlockMsg])]
+    struct BlockActor {
+        #[serde(skip)]
+        gate: Option<Arc<tokio::sync::Notify>>,
+    }
+    impl hyperactor::Actor for BlockActor {}
+
+    #[derive(
+        Debug,
+        Clone,
+        Serialize,
+        Deserialize,
+        Named,
+        hyperactor::Handler,
+        hyperactor::HandleClient
+    )]
+    enum BlockMsg {
+        /// Block until the shared Notify fires.
+        Block(),
+        /// No-op message to queue behind a blocked Block.
+        Noop(),
+    }
+    wirevalue::register_type!(BlockMsg);
+
+    #[async_trait::async_trait]
+    #[hyperactor::handle(BlockMsg)]
+    impl BlockMsgHandler for BlockActor {
+        async fn block(&mut self, _cx: &hyperactor::Context<Self>) -> Result<(), anyhow::Error> {
+            if let Some(gate) = &self.gate {
+                gate.notified().await;
+            }
+            Ok(())
+        }
+        async fn noop(&mut self, _cx: &hyperactor::Context<Self>) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+    }
+
+    // PD-4/PD-5: QueryChild(Proc) returns non-zero queue stats
+    // while actors are under induced pressure. This proves the
+    // live proc-agent introspection path carries the queue depth
+    // signal that the TUI depends on.
+    //
+    // Queue depth is an instantaneous snapshot at query time,
+    // not backlog history.
+    #[tokio::test]
+    async fn test_query_child_proc_queue_depth_under_pressure() {
+        use hyperactor::Proc;
+        use hyperactor::actor::ActorStatus;
+        use hyperactor::channel::ChannelTransport;
+        use hyperactor::introspect::IntrospectMessage;
+        use hyperactor::introspect::IntrospectResult;
+        use hyperactor::reference as hyperactor_reference;
+
+        let proc = Proc::direct(ChannelTransport::Unix.any(), "qd_proc".to_string()).unwrap();
+        let agent_handle = ProcAgent::boot_v1(proc.clone(), None).unwrap();
+
+        agent_handle
+            .status()
+            .wait_for(|s| matches!(s, ActorStatus::Idle))
+            .await
+            .unwrap();
+
+        let client_proc =
+            Proc::direct(ChannelTransport::Unix.any(), "qd_client".to_string()).unwrap();
+        let (client, _client_handle) = client_proc.instance("client").unwrap();
+
+        // Spawn a blocking actor with a shared gate.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let blocker = proc
+            .spawn(
+                "blocker",
+                BlockActor {
+                    gate: Some(Arc::clone(&gate)),
+                },
+            )
+            .unwrap();
+
+        // Block the actor and queue additional work behind it.
+        blocker.block(&client).await.unwrap();
+        // Give the actor time to enter the handler.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        blocker.noop(&client).await.unwrap();
+        blocker.noop(&client).await.unwrap();
+
+        // QueryChild(Proc) — same aggregation logic as mesh-admin
+        // resolution.
+        let agent_id = proc.proc_id().actor_id(PROC_AGENT_ACTOR_NAME, 0);
+        let port =
+            hyperactor_reference::PortRef::<IntrospectMessage>::attest_message_port(&agent_id);
+
+        // Poll until queue stats are non-zero.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let (reply_port, reply_rx) = client.open_once_port::<IntrospectResult>();
+            port.send(
+                &client,
+                IntrospectMessage::QueryChild {
+                    child_ref: hyperactor_reference::Reference::Proc(proc.proc_id().clone()),
+                    reply: reply_port.bind(),
+                },
+            )
+            .unwrap();
+            let payload = tokio::time::timeout(std::time::Duration::from_secs(3), reply_rx.recv())
+                .await
+                .expect("QueryChild timed out")
+                .expect("reply channel closed");
+
+            let attrs: hyperactor_config::Attrs =
+                serde_json::from_str(&payload.attrs).expect("valid attrs JSON");
+
+            let total = attrs
+                .get(crate::introspect::ACTOR_WORK_QUEUE_DEPTH_TOTAL)
+                .copied()
+                .unwrap_or(0);
+            let max = attrs
+                .get(crate::introspect::ACTOR_WORK_QUEUE_DEPTH_MAX)
+                .copied()
+                .unwrap_or(0);
+
+            if total > 0 {
+                assert!(max > 0, "max should be > 0 when total is {total}");
+                assert!(max <= total, "PD-1: max ({max}) <= total ({total})");
+                break;
+            }
+
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for non-zero queue depth in QueryChild(Proc)",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Unblock the actor.
+        gate.notify_one();
     }
 }

@@ -8,7 +8,6 @@
 
 from typing import Any, final
 
-from monarch._rust_bindings.monarch_hyperactor.alloc import Alloc
 from monarch._rust_bindings.monarch_hyperactor.context import Instance
 from monarch._rust_bindings.monarch_hyperactor.proc_mesh import ProcMesh
 from monarch._rust_bindings.monarch_hyperactor.pytokio import PythonTask
@@ -16,25 +15,6 @@ from monarch._rust_bindings.monarch_hyperactor.shape import Extent, Region
 
 @final
 class HostMesh:
-    @classmethod
-    def allocate_nonblocking(
-        self,
-        instance: Instance,
-        alloc: Alloc,
-        name: str,
-        bootstrap_command: BootstrapCommand | None,
-    ) -> PythonTask["HostMesh"]:
-        """
-        Allocate a host mesh according to the provided alloc.
-
-        Arguments:
-        - `instance`: The actor instance used to allocate the mesh.
-        - `alloc`: The alloc to allocate according to.
-        - `name`: Name of the mesh.
-        - `bootstrap_command`: Override the bootstrap command used to bootstrap procs.
-        """
-        ...
-
     def spawn_nonblocking(
         self,
         instance: Instance,
@@ -147,18 +127,25 @@ def shutdown_local_host_mesh() -> PythonTask[None]:
         RuntimeError: If no local host mesh exists (bootstrap_host not called)
     """
     ...
+@final
+class PyMeshAdminRef:
+    """Opaque capability token for ActorRef<MeshAdminAgent>.
+    No methods — used only to transport the typed ref across the
+    Python boundary from _spawn_admin to _start_periodic_snapshots."""
+
+    ...
 
 def _spawn_admin(
     host_meshes: list[HostMesh],
     instance: Instance,
     admin_addr: str | None = None,
     telemetry_url: str | None = None,
-) -> PythonTask[str]:
+) -> PythonTask[tuple[str, PyMeshAdminRef]]:
     """
     Spawn a MeshAdminAgent aggregating topology across one or more meshes.
 
-    The admin runs on the caller's local proc and serves the mesh-admin
-    HTTP API. Returns the admin HTTP URL.
+    Returns ``(admin_url, admin_ref)`` where ``admin_ref`` is an opaque
+    capability token for immediate use only.
 
     Arguments:
     - `host_meshes`: One or more HostMeshes whose hosts the admin will

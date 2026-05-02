@@ -68,16 +68,12 @@ from monarch._rust_bindings.monarch_hyperactor.pickle import (
 )
 from monarch._rust_bindings.monarch_hyperactor.proc import ActorId
 from monarch._rust_bindings.monarch_hyperactor.pytokio import PythonTask, Shared
-from monarch._rust_bindings.monarch_hyperactor.selection import (
-    Selection as HySelection,  # noqa: F401
-)
 from monarch._rust_bindings.monarch_hyperactor.shape import Point as HyPoint, Shape
 from monarch._rust_bindings.monarch_hyperactor.supervision import (
     MeshFailure,
     SupervisionError,
 )
 from monarch._src.actor import config
-from monarch._src.actor.allocator import LocalAllocator, ProcessAllocator
 from monarch._src.actor.debugger.pdb_wrapper import PdbWrapper
 from monarch._src.actor.endpoint import (
     Endpoint,
@@ -122,8 +118,6 @@ from monarch._src.actor.telemetry import get_monarch_tracer
 logger: logging.Logger = logging.getLogger(__name__)
 
 TRACER: Tracer = get_monarch_tracer()
-
-Allocator = ProcessAllocator | LocalAllocator
 
 try:
     from __manifest__ import fbmake  # noqa
@@ -419,6 +413,8 @@ def _init_client_context() -> Context:
     Create a client context that bootstraps an actor instance running on a real
     local proc mesh on a real local host mesh.
     """
+    import atexit
+
     from monarch._rust_bindings.monarch_hyperactor.host_mesh import bootstrap_host
     from monarch._src.actor.host_mesh import _bootstrap_cmd, HostMesh
     from monarch._src.actor.proc_mesh import ProcMesh
@@ -437,17 +433,33 @@ def _init_client_context() -> Context:
         _reset_context(token)
 
     ctx.actor_instance.proc_mesh = py_proc_mesh
+
+    # Register shutdown_context as an atexit handler. Python atexit handlers
+    # run in LIFO order. shutdown_tokio_runtime was registered earlier (during
+    # module init), so this handler runs first — ensuring the actor system is
+    # cleanly shut down (connections flushed, acks delivered) before the tokio
+    # runtime is torn down.
+    #
+    # The timeout must be short enough that the process exits before
+    # the test executor's SIGTERM grace period (~2s). Combined with
+    # the 1s shutdown_tokio_runtime timeout, total atexit budget is
+    # ~2s, so we allow 1s here.
+    atexit.register(lambda: shutdown_context().get(timeout=1.0))
+
     return ctx
 
 
 _client_context: _Lazy[Context] = _Lazy(_init_client_context)
 
 
+_shutdown_done = False
+
+
 def shutdown_context() -> "Future[None]":
     """Shutdown global actor context resources.
 
-    This should be called at the end of scripts that use the actor
-    system to ensure clean shutdown of background processes.
+    Idempotent: subsequent calls return an immediately-resolved future.
+    This is safe to call both explicitly and from atexit.
 
     Returns:
         Future[None]: A future that completes when shutdown is
@@ -456,23 +468,39 @@ def shutdown_context() -> "Future[None]":
     """
     from monarch._src.actor.future import Future
 
+    if _shutdown_done:
+
+        async def _noop() -> None:
+            pass
+
+        return Future(coro=_noop())
+
     c: Context | None = _context.get()
 
     async def _shutdown_sequence() -> None:
+        global _shutdown_done
+        if _shutdown_done:
+            return
+        _shutdown_done = True
+
         try:
             from monarch._rust_bindings.monarch_hyperactor.host_mesh import (
                 shutdown_local_host_mesh,
             )
 
-            # Shutdown the host mesh first, while the client actor is still alive
-            # to route messages.
+            # Shutdown the host mesh first, while the client actor is still
+            # alive to route messages. This drains children and joins the
+            # mailbox server, flushing receive-side acks.
             await shutdown_local_host_mesh()
         except RuntimeError:
             # No local host mesh to shutdown
             pass
-        # Stop the client actor after the host mesh shutdown completes.
+        # Stop the client actor and wait for it to reach terminal status.
+        # This ensures pending messages are drained and send-side acks
+        # are flushed before the tokio runtime is torn down.
         if c is not None:
-            c.actor_instance.stop()
+            instance = c.actor_instance._as_rust()
+            await instance.stop_and_wait("shutdown")
             _context.set(None)
 
     return Future(coro=_shutdown_sequence())
@@ -1356,7 +1384,14 @@ class _Actor:
         else:
             return False
 
-    def __supervise__(self, cx: Context, *args: Any, **kwargs: Any) -> object:
+    async def __supervise__(self, cx: Context, *args: Any, **kwargs: Any) -> object:
+        """Dispatch the user's ``__supervise__``.
+
+        Mirrors ``__cleanup__``: both sync and async user methods are
+        supported. An ``async def`` user method is awaited on the actor's
+        asyncio event loop; a sync one runs under :func:`fake_sync_state` so
+        it cannot observe a running loop.
+        """
         _set_context(cx)
         instance = self.instance
         if instance is None:
@@ -1378,15 +1413,18 @@ class _Actor:
                 )
             raise AssertionError(error_message)
 
-        # Forward a call to supervise on this actor to the user-provided instance.
-        if hasattr(instance, "__supervise__"):
-            # pyre-fixme[16]: Caller needs to handle the case where instance is None.
-            return instance.__supervise__(*args, **kwargs)
-        else:
+        supervise = getattr(instance, "__supervise__", None)
+        if supervise is None:
             # If there is no __supervise__ method, the default would be to return
             # None. That means the supervision error is not handled and will be
             # propagated to the next owner.
             return None
+
+        if inspect.iscoroutinefunction(supervise):
+            return await supervise(*args, **kwargs)
+        else:
+            with fake_sync_state():
+                return supervise(*args, **kwargs)
 
     async def __cleanup__(self, cx: Context, exc: str | Exception | None) -> None:
         """Cleans up any resources owned by this Actor before stopping. Automatically
@@ -1511,6 +1549,15 @@ class Actor(MeshTrait):
         propagate any further. If a falsey value is returned, the failure will be
         further sent to the owner of this Actor.
         Note that this is *not* called for errors within this Actor.
+
+        Overrides may be declared with either ``def`` or ``async def``. An
+        ``async def`` override is awaited on the actor's asyncio event loop --
+        the same loop that runs endpoint coroutines -- so it can ``await``
+        other endpoints or I/O. A sync override runs under ``fake_sync_state``
+        and cannot call ``asyncio.get_running_loop``. If the override raises,
+        the exception is treated as a new supervision event chained to the
+        one being handled, matching the ``__exit__`` convention of context
+        managers.
         """
         return False
 

@@ -31,16 +31,15 @@ use hyperactor::Instance;
 use hyperactor::PortHandle;
 use hyperactor::Proc;
 use hyperactor::RefClient;
-use hyperactor::channel::ChannelTransport;
 use hyperactor::context;
 use hyperactor::host::Host;
 use hyperactor::host::HostError;
 use hyperactor::host::LOCAL_PROC_NAME;
 use hyperactor::host::LocalProcManager;
 use hyperactor::host::SERVICE_PROC_NAME;
+use hyperactor::host::SingleTerminate;
 use hyperactor::mailbox::MailboxServerHandle;
 use hyperactor::reference as hyperactor_reference;
-use hyperactor_config::Flattrs;
 use hyperactor_config::attrs::Attrs;
 use serde::Deserialize;
 use serde::Serialize;
@@ -56,6 +55,8 @@ use crate::config_dump::ConfigDump;
 use crate::config_dump::ConfigDumpResult;
 use crate::proc_agent::ProcAgent;
 use crate::pyspy::PySpyDump;
+use crate::pyspy::PySpyProfile;
+use crate::pyspy::PySpyProfileWorker;
 use crate::pyspy::PySpyWorker;
 use crate::resource;
 use crate::resource::ProcSpec;
@@ -167,6 +168,7 @@ impl HostAgentMode {
 #[derive(Debug)]
 pub(crate) struct ProcCreationState {
     pub(crate) rank: usize,
+    pub(crate) host_mesh_name: Option<crate::Name>,
     pub(crate) created: Result<
         (
             hyperactor_reference::ProcId,
@@ -276,6 +278,7 @@ impl fmt::Debug for DrainWorker {
         SetClientConfig,
         ProcStatusChanged,
         PySpyDump,
+        PySpyProfile,
         ConfigDump,
     ]
 )]
@@ -377,6 +380,60 @@ impl HostAgent {
         self.created.clear();
     }
 
+    /// Selectively stop procs belonging to a specific host mesh.
+    /// Only procs whose `host_mesh_name` matches `filter` are stopped;
+    /// all other procs are left running.
+    async fn drain_by_mesh_name(
+        &mut self,
+        cx: &Context<'_, Self>,
+        timeout: std::time::Duration,
+        filter: Option<&crate::Name>,
+    ) {
+        let matching_names: Vec<crate::Name> = self
+            .created
+            .iter()
+            .filter(|(_, state)| state.host_mesh_name.as_ref() == filter)
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        if let Some(host_mode) = self.host() {
+            for name in &matching_names {
+                if let Some(ProcCreationState {
+                    created: Ok((proc_id, _)),
+                    ..
+                }) = self.created.get(name)
+                {
+                    match host_mode {
+                        HostAgentMode::Process { host, .. } => {
+                            let _ = host
+                                .terminate_proc(cx, proc_id, timeout, "selective drain")
+                                .await;
+                        }
+                        HostAgentMode::Local(host) => {
+                            let _ = host
+                                .terminate_proc(cx, proc_id, timeout, "selective drain")
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Remove drained entries and associated state so that
+        // future spawns with the same proc names get fresh watch bridges.
+        for name in &matching_names {
+            self.created.remove(name);
+            self.watching.remove(name);
+            self.pending_proc_waiters.remove(name);
+        }
+
+        tracing::info!(
+            count = matching_names.len(),
+            filter = ?filter,
+            "selectively drained procs",
+        );
+    }
+
     /// Publish the current host properties and child list for
     /// introspection. Called from init and after each state change
     /// (proc created/stopped).
@@ -388,7 +445,7 @@ impl HostAgent {
 
         let addr = host.addr().to_string();
         let mut children: Vec<hyperactor::introspect::IntrospectRef> = Vec::new();
-        let system_children: Vec<crate::introspect::NodeRef> = Vec::new();
+        let system_children: Vec<crate::introspect::NodeRef> = Vec::new(); // LC-2
 
         // Procs are not system — only actors are. Both service and
         // local appear as regular children; 's' in the TUI toggles
@@ -415,6 +472,12 @@ impl HostAgent {
         attrs.set(crate::introspect::NUM_PROCS, num_procs);
         attrs.set(hyperactor::introspect::CHILDREN, children);
         attrs.set(crate::introspect::SYSTEM_CHILDREN, system_children);
+        // PD-*: hosting-process memory stats. This is the same
+        // hosting OS process signal surfaced on the proc path, but
+        // the host path does not attempt to publish proc-local queue
+        // pressure.
+        let memory = crate::introspect::ProcessMemoryStats::read_from_procfs();
+        memory.to_attrs(&mut attrs);
         cx.publish_attrs(attrs);
     }
 }
@@ -499,6 +562,31 @@ impl Actor for HostAgent {
                     attrs.set(crate::introspect::PROC_NAME, label.to_string());
                     attrs.set(crate::introspect::NUM_ACTORS, actors.len());
                     attrs.set(crate::introspect::SYSTEM_CHILDREN, system_actors.clone());
+                    // PD-*: include proc debug stats so QueryChild
+                    // results carry real signal. Memory from procfs,
+                    // queue stats from the Proc's runtime accounting.
+                    let memory = crate::introspect::ProcessMemoryStats::read_from_procfs();
+                    memory.to_attrs(&mut attrs);
+                    attrs.set(
+                        crate::introspect::ACTOR_WORK_QUEUE_DEPTH_TOTAL,
+                        proc.queue_depth_total(),
+                    );
+                    // Per-actor max from the live actor scan.
+                    let mut queue_max: u64 = 0;
+                    for aid in proc.all_instance_keys() {
+                        if let Some(cell) = proc.get_instance(&aid) {
+                            queue_max = queue_max.max(cell.queue_depth());
+                        }
+                    }
+                    attrs.set(crate::introspect::ACTOR_WORK_QUEUE_DEPTH_MAX, queue_max);
+                    attrs.set(
+                        crate::introspect::ACTOR_WORK_QUEUE_DEPTH_HIGH_WATER_MARK,
+                        proc.queue_depth_high_water_mark(),
+                    );
+                    attrs.set(
+                        crate::introspect::LAST_NONZERO_QUEUE_DEPTH_AGE_MS,
+                        proc.last_nonzero_queue_depth_age_ms(),
+                    );
                     let attrs_json =
                         serde_json::to_string(&attrs).unwrap_or_else(|_| "{}".to_string());
 
@@ -572,9 +660,16 @@ impl Handler<resource::CreateOrUpdate<ProcSpec>> for HostAgent {
             return Ok(());
         }
 
-        let host = self
-            .host_mut()
-            .ok_or_else(|| anyhow::anyhow!("HostAgent has already shut down"))?;
+        let host = match self.host_mut() {
+            Some(h) => h,
+            None => {
+                tracing::warn!(
+                    name = %create_or_update.name,
+                    "ignoring CreateOrUpdate: HostAgent has already shut down"
+                );
+                return Ok(());
+            }
+        };
         let created = match host {
             HostAgentMode::Process { host, .. } => {
                 host.spawn(
@@ -605,7 +700,11 @@ impl Handler<resource::CreateOrUpdate<ProcSpec>> for HostAgent {
         let was_empty = self.created.is_empty();
         self.created.insert(
             create_or_update.name.clone(),
-            ProcCreationState { rank, created },
+            ProcCreationState {
+                rank,
+                host_mesh_name: create_or_update.spec.host_mesh_name.clone(),
+                created,
+            },
         );
 
         // Transition Detached → Attached on first proc creation.
@@ -664,9 +763,17 @@ impl Handler<resource::Stop> for HostAgent {
             reason = %message.reason,
             "stopping proc"
         );
-        let host = self
-            .host()
-            .ok_or(anyhow::anyhow!("HostAgent has already shut down"))?;
+        let host = match self.host() {
+            Some(h) => h,
+            None => {
+                // Host already shut down; all procs are terminated.
+                tracing::debug!(
+                    proc_name = %message.name,
+                    "ignoring Stop: HostAgent has already shut down"
+                );
+                return Ok(());
+            }
+        };
         let timeout = hyperactor_config::global::get(hyperactor::config::PROCESS_EXIT_TIMEOUT);
 
         if let Some(ProcCreationState {
@@ -700,6 +807,7 @@ impl Handler<resource::GetRankStatus> for HostAgent {
             Some(ProcCreationState {
                 rank,
                 created: Ok((proc_id, _mesh_agent)),
+                ..
             }) => {
                 let raw_status = match self.host() {
                     Some(host) => host.proc_status(proc_id).await.0,
@@ -751,6 +859,7 @@ impl Handler<resource::WaitRankStatus> for HostAgent {
             Some(ProcCreationState {
                 rank,
                 created: Ok((proc_id, _)),
+                ..
             }) => {
                 let rank = *rank;
                 let status = match self.host() {
@@ -937,13 +1046,18 @@ pub struct ShutdownHost {
 }
 wirevalue::register_type!(ShutdownHost);
 
-/// Drain all user procs on this host but keep the host, service
-/// proc, and networking alive. Used during mesh stop/shutdown so
-/// that forwarder flushes can still reach remote hosts.
+/// Drain user procs on this host but keep the host, service proc,
+/// and networking alive. Used during mesh stop/shutdown so that
+/// forwarder flushes can still reach remote hosts.
+///
+/// If `host_mesh_name` is `Some`, only procs belonging to that mesh
+/// are stopped (selective drain). If `None`, all procs are
+/// terminated (full drain).
 #[derive(Serialize, Deserialize, Debug, Named, Handler, RefClient, HandleClient)]
 pub struct DrainHost {
     pub timeout: std::time::Duration,
     pub max_in_flight: usize,
+    pub host_mesh_name: Option<crate::Name>,
     #[reply]
     pub ack: hyperactor::reference::PortRef<()>,
 }
@@ -952,6 +1066,15 @@ wirevalue::register_type!(DrainHost);
 #[async_trait]
 impl Handler<DrainHost> for HostAgent {
     async fn handle(&mut self, cx: &Context<Self>, msg: DrainHost) -> anyhow::Result<()> {
+        if msg.host_mesh_name.is_some() {
+            // Selective drain: stop only procs belonging to the named mesh.
+            self.drain_by_mesh_name(cx, msg.timeout, msg.host_mesh_name.as_ref())
+                .await;
+            msg.ack.send(cx, ())?;
+            return Ok(());
+        }
+
+        // Full drain: terminate all children.
         let host = match std::mem::replace(&mut self.state, HostAgentState::Draining) {
             HostAgentState::Attached(h) => h,
             other @ (HostAgentState::Detached(_) | HostAgentState::Draining) => {
@@ -1067,6 +1190,7 @@ impl Handler<resource::GetState<ProcState>> for HostAgent {
             Some(ProcCreationState {
                 rank,
                 created: Ok((proc_id, mesh_agent)),
+                ..
             }) => {
                 let (raw_status, proc_status, bootstrap_command) = match self.host() {
                     Some(host) => {
@@ -1216,6 +1340,17 @@ impl Handler<PySpyDump> for HostAgent {
 }
 
 #[async_trait]
+impl Handler<PySpyProfile> for HostAgent {
+    async fn handle(
+        &mut self,
+        cx: &Context<Self>,
+        message: PySpyProfile,
+    ) -> Result<(), anyhow::Error> {
+        PySpyProfileWorker::spawn_and_forward(cx, message.request, message.result)
+    }
+}
+
+#[async_trait]
 impl Handler<ConfigDump> for HostAgent {
     async fn handle(
         &mut self,
@@ -1228,93 +1363,6 @@ impl Handler<ConfigDump> for HostAgent {
         if let Err(e) = message.result.send(cx, ConfigDumpResult { entries }) {
             tracing::warn!("HostAgent: ConfigDump reply undeliverable (caller timed out): {e}",);
         }
-        Ok(())
-    }
-}
-
-/// A trampoline actor that spawns a [`Host`], and sends a reference to the
-/// corresponding [`HostAgent`] to the provided reply port.
-///
-/// This is used to bootstrap host meshes from proc meshes.
-#[derive(Debug)]
-#[hyperactor::export(
-    spawn = true,
-    handlers=[GetHostMeshAgent]
-)]
-pub(crate) struct HostMeshAgentProcMeshTrampoline {
-    host_mesh_agent: ActorHandle<HostAgent>,
-    reply_port: hyperactor_reference::PortRef<hyperactor_reference::ActorRef<HostAgent>>,
-}
-
-#[async_trait]
-impl Actor for HostMeshAgentProcMeshTrampoline {
-    async fn init(&mut self, this: &Instance<Self>) -> anyhow::Result<()> {
-        self.reply_port.send(this, self.host_mesh_agent.bind())?;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl hyperactor::RemoteSpawn for HostMeshAgentProcMeshTrampoline {
-    type Params = (
-        ChannelTransport,
-        hyperactor_reference::PortRef<hyperactor_reference::ActorRef<HostAgent>>,
-        Option<BootstrapCommand>,
-        bool, /* local? */
-    );
-
-    async fn new(
-        (transport, reply_port, command, local): Self::Params,
-        _environment: Flattrs,
-    ) -> anyhow::Result<Self> {
-        let host = if local {
-            let spawn: ProcManagerSpawnFn =
-                Box::new(|proc| Box::pin(std::future::ready(ProcAgent::boot_v1(proc, None))));
-            let manager = LocalProcManager::new(spawn);
-            let host = Host::new(manager, transport.any()).await?;
-            HostAgentMode::Local(host)
-        } else {
-            let command = match command {
-                Some(command) => command,
-                None => BootstrapCommand::current()?,
-            };
-            tracing::info!("booting host with proc command {:?}", command);
-            let manager = BootstrapProcManager::new(command).unwrap();
-            let host = Host::new(manager, transport.any()).await?;
-            HostAgentMode::Process {
-                host,
-                shutdown_tx: None,
-            }
-        };
-
-        let system_proc = host.system_proc().clone();
-        let host_mesh_agent =
-            system_proc.spawn(HOST_MESH_AGENT_ACTOR_NAME, HostAgent::new(host))?;
-
-        Ok(Self {
-            host_mesh_agent,
-            reply_port,
-        })
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Named, Handler, RefClient)]
-pub struct GetHostMeshAgent {
-    #[reply]
-    pub host_mesh_agent: hyperactor_reference::PortRef<hyperactor_reference::ActorRef<HostAgent>>,
-}
-wirevalue::register_type!(GetHostMeshAgent);
-
-#[async_trait]
-impl Handler<GetHostMeshAgent> for HostMeshAgentProcMeshTrampoline {
-    async fn handle(
-        &mut self,
-        cx: &Context<Self>,
-        get_host_mesh_agent: GetHostMeshAgent,
-    ) -> anyhow::Result<()> {
-        get_host_mesh_agent
-            .host_mesh_agent
-            .send(cx, self.host_mesh_agent.bind())?;
         Ok(())
     }
 }
@@ -1559,5 +1607,280 @@ mod tests {
             .expect("reply timed out — waiter was not flushed after CreateOrUpdate")
             .expect("reply channel closed");
         assert!(!overlay.is_empty(), "expected non-empty overlay");
+    }
+
+    /// DrainHost with a host_mesh_name filter only stops procs
+    /// belonging to that mesh; procs from other meshes are unaffected.
+    #[tokio::test]
+    #[cfg(fbcode_build)]
+    async fn test_drain_scoped_to_host_mesh_name() {
+        let host = Host::new(
+            BootstrapProcManager::new(BootstrapCommand::test()).unwrap(),
+            ChannelTransport::Unix.any(),
+        )
+        .await
+        .unwrap();
+
+        let system_proc = host.system_proc().clone();
+        let host_agent = system_proc
+            .spawn(
+                HOST_MESH_AGENT_ACTOR_NAME,
+                HostAgent::new(HostAgentMode::Process {
+                    host,
+                    shutdown_tx: None,
+                }),
+            )
+            .unwrap();
+
+        let client_proc = Proc::direct(ChannelTransport::Unix.any(), "client".to_string()).unwrap();
+        let (client, _client_handle) = client_proc.instance("client").unwrap();
+
+        let mesh_a = crate::Name::new("mesh_a").unwrap();
+        let mesh_b = crate::Name::new("mesh_b").unwrap();
+        let proc_a = crate::Name::new("proc_a").unwrap();
+        let proc_b = crate::Name::new("proc_b").unwrap();
+
+        // Create proc_a belonging to mesh_a.
+        let spec_a = ProcSpec {
+            host_mesh_name: Some(mesh_a.clone()),
+            ..Default::default()
+        };
+        host_agent
+            .create_or_update(&client, proc_a.clone(), resource::Rank::new(0), spec_a)
+            .await
+            .unwrap();
+
+        // Create proc_b belonging to mesh_b.
+        let spec_b = ProcSpec {
+            host_mesh_name: Some(mesh_b.clone()),
+            ..Default::default()
+        };
+        host_agent
+            .create_or_update(&client, proc_b.clone(), resource::Rank::new(1), spec_b)
+            .await
+            .unwrap();
+
+        // Both should be Running.
+        assert_matches!(
+            host_agent.get_state(&client, proc_a.clone()).await.unwrap(),
+            resource::State {
+                status: resource::Status::Running,
+                ..
+            }
+        );
+        assert_matches!(
+            host_agent.get_state(&client, proc_b.clone()).await.unwrap(),
+            resource::State {
+                status: resource::Status::Running,
+                ..
+            }
+        );
+
+        // Drain only mesh_a.
+        host_agent
+            .drain_host(&client, Duration::from_secs(5), 16, Some(mesh_a.clone()))
+            .await
+            .unwrap();
+
+        // proc_a should be gone (removed from created).
+        assert_matches!(
+            host_agent.get_state(&client, proc_a.clone()).await.unwrap(),
+            resource::State {
+                status: resource::Status::NotExist,
+                ..
+            }
+        );
+
+        // proc_b should still be Running.
+        assert_matches!(
+            host_agent.get_state(&client, proc_b.clone()).await.unwrap(),
+            resource::State {
+                status: resource::Status::Running,
+                ..
+            }
+        );
+    }
+
+    /// DrainHost with host_mesh_name=None drains all procs regardless
+    /// of their mesh affiliation (backwards compatibility).
+    #[tokio::test]
+    #[cfg(fbcode_build)]
+    async fn test_drain_none_drains_all() {
+        let host = Host::new(
+            BootstrapProcManager::new(BootstrapCommand::test()).unwrap(),
+            ChannelTransport::Unix.any(),
+        )
+        .await
+        .unwrap();
+
+        let system_proc = host.system_proc().clone();
+        let host_agent = system_proc
+            .spawn(
+                HOST_MESH_AGENT_ACTOR_NAME,
+                HostAgent::new(HostAgentMode::Process {
+                    host,
+                    shutdown_tx: None,
+                }),
+            )
+            .unwrap();
+
+        let client_proc = Proc::direct(ChannelTransport::Unix.any(), "client".to_string()).unwrap();
+        let (client, _client_handle) = client_proc.instance("client").unwrap();
+
+        let mesh_a = crate::Name::new("mesh_a").unwrap();
+        let mesh_b = crate::Name::new("mesh_b").unwrap();
+        let proc_a = crate::Name::new("proc_a").unwrap();
+        let proc_b = crate::Name::new("proc_b").unwrap();
+
+        let spec_a = ProcSpec {
+            host_mesh_name: Some(mesh_a),
+            ..Default::default()
+        };
+        host_agent
+            .create_or_update(&client, proc_a.clone(), resource::Rank::new(0), spec_a)
+            .await
+            .unwrap();
+
+        let spec_b = ProcSpec {
+            host_mesh_name: Some(mesh_b),
+            ..Default::default()
+        };
+        host_agent
+            .create_or_update(&client, proc_b.clone(), resource::Rank::new(1), spec_b)
+            .await
+            .unwrap();
+
+        // Drain all (no filter).
+        host_agent
+            .drain_host(&client, Duration::from_secs(5), 16, None)
+            .await
+            .unwrap();
+
+        // Both should be gone.
+        assert_matches!(
+            host_agent.get_state(&client, proc_a).await.unwrap(),
+            resource::State {
+                status: resource::Status::NotExist,
+                ..
+            }
+        );
+        assert_matches!(
+            host_agent.get_state(&client, proc_b).await.unwrap(),
+            resource::State {
+                status: resource::Status::NotExist,
+                ..
+            }
+        );
+    }
+
+    // PD-6/PD-8 regression: QueryChild(Proc) on the service proc
+    // returns non-zero queue stats after the host_agent has handled
+    // messages. Guards against the bug where the HostAgent closure
+    // defaulted queue stats to zero because it predated Proc-level
+    // queue accessors.
+    #[tokio::test]
+    #[cfg(fbcode_build)]
+    async fn test_service_proc_query_child_has_queue_stats() {
+        use hyperactor::actor::ActorStatus;
+        use hyperactor::introspect::IntrospectMessage;
+        use hyperactor::introspect::IntrospectResult;
+        use hyperactor::reference as hyperactor_reference;
+
+        let host = Host::new(
+            BootstrapProcManager::new(BootstrapCommand::test()).unwrap(),
+            ChannelTransport::Unix.any(),
+        )
+        .await
+        .unwrap();
+
+        let system_proc = host.system_proc().clone();
+        let host_agent = system_proc
+            .spawn(
+                HOST_MESH_AGENT_ACTOR_NAME,
+                HostAgent::new(HostAgentMode::Process {
+                    host,
+                    shutdown_tx: None,
+                }),
+            )
+            .unwrap();
+
+        // Wait for HostAgent to finish init.
+        host_agent
+            .status()
+            .wait_for(|s| matches!(s, ActorStatus::Idle))
+            .await
+            .unwrap();
+
+        let client_proc =
+            Proc::direct(ChannelTransport::Unix.any(), "qd_client".to_string()).unwrap();
+        let (client, _client_handle) = client_proc.instance("client").unwrap();
+
+        // Spawn a proc so the host_agent processes at least one
+        // CreateOrUpdate message, which goes through the work queue.
+        let name = Name::new("qd_test_proc").unwrap();
+        host_agent
+            .create_or_update(
+                &client,
+                name.clone(),
+                resource::Rank::new(0),
+                ProcSpec::default(),
+            )
+            .await
+            .unwrap();
+
+        // The host_agent has now processed messages on the service
+        // proc. Query the service proc's introspection.
+        let agent_id = system_proc
+            .proc_id()
+            .actor_id(HOST_MESH_AGENT_ACTOR_NAME, 0);
+        let port =
+            hyperactor_reference::PortRef::<IntrospectMessage>::attest_message_port(&agent_id);
+
+        // Poll until we see non-zero watermark (evidence of queue
+        // traffic since startup).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (reply_port, reply_rx) = client.open_once_port::<IntrospectResult>();
+            port.send(
+                &client,
+                IntrospectMessage::QueryChild {
+                    child_ref: hyperactor_reference::Reference::Proc(system_proc.proc_id().clone()),
+                    reply: reply_port.bind(),
+                },
+            )
+            .unwrap();
+            let payload = tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx.recv())
+                .await
+                .expect("QueryChild timed out")
+                .expect("reply channel closed");
+
+            let attrs: hyperactor_config::Attrs =
+                serde_json::from_str(&payload.attrs).expect("valid attrs JSON");
+
+            let hwm = attrs
+                .get(crate::introspect::ACTOR_WORK_QUEUE_DEPTH_HIGH_WATER_MARK)
+                .copied()
+                .unwrap_or(0);
+            let last_nonzero: Option<u64> = attrs
+                .get(crate::introspect::LAST_NONZERO_QUEUE_DEPTH_AGE_MS)
+                .copied()
+                .flatten();
+
+            if hwm > 0 {
+                // The service proc's watermark should reflect
+                // the messages the host_agent processed.
+                assert!(
+                    last_nonzero.is_some(),
+                    "last-nonzero should be Some when watermark is {hwm}",
+                );
+                break;
+            }
+
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for service proc watermark > 0",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 }

@@ -28,6 +28,7 @@ from monarch._src.actor.host_mesh import HostMesh, this_host
 from monarch._src.actor.pickle import flatten, unflatten
 from monarch._src.actor.proc_mesh import get_or_spawn_controller
 from monarch._src.job.process import ProcessJob
+from monarch.config import configured
 from scoped_state import scoped_state
 
 
@@ -187,35 +188,78 @@ def test_shutdown_unpickled_host_mesh_throws_exception() -> None:
 @pytest.mark.timeout(120)
 @isolate_in_subprocess
 def test_stop_and_reconnect() -> None:
+    # Use a short message delivery timeout so we don't have to sleep 35 s
+    # waiting for undeliverable-message errors to surface.
+    with configured(message_delivery_timeout="5s"):
+        job = ProcessJob({"hosts": 2})
+
+        # First connection: spawn actors, verify they work.
+        hm = job.state(cached_path=None).hosts
+        pm = hm.spawn_procs(per_host={"gpus": 1})
+        am = pm.spawn("actor", RankActor)
+        pids = am.get_pid.call().get()
+        assert len(pids) == 2
+        pids = [pid for _, pid in pids.items()]
+
+        # Stop: terminate user procs but keep workers alive.
+        hm.stop().get()
+        # Ensure that the procs are actually dead.
+        assert all(not is_process_running(pid) for pid in pids)
+
+        # Sleep past the message delivery timeout to ensure that no errors
+        # surface from undeliverable messages to dead procs/actors.
+        time.sleep(7)
+
+        # Second connection: reconnect to the same workers via state().
+        hm2 = job.state(cached_path=None).hosts
+        pm2 = hm2.spawn_procs(per_host={"gpus": 1})
+        am2 = pm2.spawn("actor", RankActor)
+        ranks2 = am2.get_rank.call().get()
+        assert len(ranks2) == 2
+
+        # Shutdown: fully tear down and exit workers.
+        hm2.shutdown().get()
+
+
+@pytest.mark.timeout(120)
+@isolate_in_subprocess
+def test_stop_only_drains_own_mesh_procs() -> None:
+    """Stopping one mesh should not kill procs belonging to another mesh
+    on the same workers.
+
+    Simulates the real scenario where the main process and the mount
+    process each have their own HostMesh (with different names) connected
+    to the same remote workers.
+    """
     job = ProcessJob({"hosts": 2})
 
-    # First connection: spawn actors, verify they work.
-    hm = job.state(cached_path=None).hosts
-    pm = hm.spawn_procs(per_host={"gpus": 1})
-    am = pm.spawn("actor", RankActor)
-    pids = am.get_pid.call().get()
-    assert len(pids) == 2
-    pids = [pid for _, pid in pids.items()]
+    # First mesh: simulate the main process.
+    state1 = job.state(cached_path=None)
+    hm1 = state1.hosts
+    pm1 = hm1.spawn_procs(per_host={"gpus": 1}, name="proc1")
+    am1 = pm1.spawn("actor", RankActor)
+    pids1 = list(am1.get_pid.call().get().values())
+    assert len(pids1) == 2
 
-    # Stop: terminate user procs but keep workers alive.
-    hm.stop().get()
-    # Ensure that the procs are actually dead.
-    assert all(not is_process_running(pid) for pid in pids)
-
-    # Sleep for a bit to ensure that there's no error after the stop. 30 seconds
-    # is the default channel timeout for an undeliverable message. The actor
-    # mesh and proc mesh controllers should be able to stop fine and not send
-    # any messages to the dead procs and actors.
-    time.sleep(35)
-
-    # Second connection: reconnect to the same workers via state().
-    hm2 = job.state(cached_path=None).hosts
-    pm2 = hm2.spawn_procs(per_host={"gpus": 1})
+    # Second mesh: simulate the mount process reconnecting. This creates
+    # a new HostMesh with a different name via a second state() call.
+    state2 = job.state(cached_path=None)
+    hm2 = state2.hosts
+    pm2 = hm2.spawn_procs(per_host={"gpus": 1}, name="proc2")
     am2 = pm2.spawn("actor", RankActor)
-    ranks2 = am2.get_rank.call().get()
-    assert len(ranks2) == 2
+    pids2 = list(am2.get_pid.call().get().values())
+    assert len(pids2) == 2
 
-    # Shutdown: fully tear down and exit workers.
+    # Stop the first mesh — should only drain its own procs.
+    hm1.stop().get()
+
+    # Procs from mesh1 should be stopped.
+    assert all(not is_process_running(pid) for pid in pids1)
+
+    # Procs from mesh2 should still be alive.
+    assert all(is_process_running(pid) for pid in pids2)
+
+    # Clean up mesh2.
     hm2.shutdown().get()
 
 

@@ -21,12 +21,14 @@ mod mesh_controller;
 mod tensor_worker;
 
 mod blocking;
+#[cfg(target_os = "linux")]
 mod chunked_fuse;
 mod fast_pack;
 mod panic;
+#[cfg(target_os = "linux")]
 mod readonly_fuse;
-mod tls_receiver;
-mod tls_sender;
+#[cfg(feature = "distributed_sql_telemetry")]
+pub mod snapshot_integration;
 mod trace;
 
 use pyo3::prelude::*;
@@ -67,12 +69,16 @@ fn get_or_add_new_module<'py>(
 #[pyo3(name = "_rust_bindings")]
 pub fn mod_init(module: &Bound<'_, PyModule>) -> PyResult<()> {
     hyperactor_telemetry::trace::get_or_create_trace_id();
+
+    let py = module.py();
+    py.import("os")?.getattr("environ")?.set_item(
+        hyperactor_telemetry::env::HYPERACTOR_EXECUTION_ID_ENV,
+        hyperactor_telemetry::env::execution_id(),
+    )?;
+
     monarch_hyperactor::runtime::initialize(module.py())?;
     let runtime = monarch_hyperactor::runtime::get_tokio_runtime();
-    ::hyperactor::initialize_with_log_prefix(
-        runtime.handle().clone(),
-        Some(::hyperactor_mesh::bootstrap::BOOTSTRAP_INDEX_ENV.to_string()),
-    );
+    ::hyperactor::initialize(runtime.handle().clone());
     monarch_hyperactor::buffers::register_python_bindings(&get_or_add_new_module(
         module,
         "monarch_hyperactor.buffers",
@@ -184,10 +190,6 @@ pub fn mod_init(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "monarch_hyperactor.config",
     )?)?;
 
-    monarch_hyperactor::alloc::register_python_bindings(&get_or_add_new_module(
-        module,
-        "monarch_hyperactor.alloc",
-    )?)?;
     monarch_hyperactor::channel::register_python_bindings(&get_or_add_new_module(
         module,
         "monarch_hyperactor.channel",
@@ -238,21 +240,13 @@ pub fn mod_init(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "monarch_extension.fast_pack",
     )?)?;
 
-    crate::tls_receiver::register_python_bindings(&get_or_add_new_module(
-        module,
-        "monarch_extension.tls_receiver",
-    )?)?;
-
-    crate::tls_sender::register_python_bindings(&get_or_add_new_module(
-        module,
-        "monarch_extension.tls_sender",
-    )?)?;
-
+    #[cfg(target_os = "linux")]
     crate::chunked_fuse::register_python_bindings(&get_or_add_new_module(
         module,
         "monarch_extension.chunked_fuse",
     )?)?;
 
+    #[cfg(target_os = "linux")]
     crate::readonly_fuse::register_python_bindings(&get_or_add_new_module(
         module,
         "monarch_extension.readonly_fuse",
@@ -261,11 +255,6 @@ pub fn mod_init(module: &Bound<'_, PyModule>) -> PyResult<()> {
     monarch_hyperactor::logging::register_python_bindings(&get_or_add_new_module(
         module,
         "monarch_hyperactor.logging",
-    )?)?;
-
-    monarch_hyperactor::namespace::register_python_bindings(&get_or_add_new_module(
-        module,
-        "monarch_hyperactor.namespace",
     )?)?;
 
     monarch_hyperactor::proc_launcher_probe::register_python_bindings(&get_or_add_new_module(
@@ -290,15 +279,12 @@ pub fn mod_init(module: &Bound<'_, PyModule>) -> PyResult<()> {
         monarch_distributed_telemetry::query_engine::register_python_bindings(
             &get_or_add_new_module(module, "monarch_distributed_telemetry.query_engine")?,
         )?;
-    }
-
-    #[cfg(fbcode_build)]
-    {
-        monarch_hyperactor::meta::alloc::register_python_bindings(&get_or_add_new_module(
+        crate::snapshot_integration::register_python_bindings(&get_or_add_new_module(
             module,
-            "monarch_hyperactor.meta.alloc",
+            "monarch_extension.snapshot_integration",
         )?)?;
     }
+
     // Add feature detection function
     module.add_function(wrap_pyfunction!(has_tensor_engine, module)?)?;
 

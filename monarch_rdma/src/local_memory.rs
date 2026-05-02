@@ -44,6 +44,106 @@ pub fn is_device_ptr(_addr: usize) -> bool {
     false
 }
 
+/// RAII guard that restores the previous CUDA context on drop and, if a
+/// primary context was retained, releases it.
+///
+/// CUDA-only — gated off on NPU/HiXL builds where ``rdmaxcel-sys`` is an
+/// optional dependency that is not compiled in (see
+/// ``monarch_rdma/Cargo.toml``).
+#[cfg(not(feature = "hixl"))]
+pub(crate) struct CudaCtxGuard {
+    prev: rdmaxcel_sys::CUcontext,
+    /// Set when the fallback path called `cuDevicePrimaryCtxRetain`.
+    retained_device: Option<rdmaxcel_sys::CUdevice>,
+}
+
+#[cfg(not(feature = "hixl"))]
+impl Drop for CudaCtxGuard {
+    fn drop(&mut self) {
+        unsafe {
+            rdmaxcel_sys::rdmaxcel_cuCtxSetCurrent(self.prev);
+            if let Some(device) = self.retained_device {
+                rdmaxcel_sys::rdmaxcel_cuDevicePrimaryCtxRelease(device);
+            }
+        }
+    }
+}
+
+/// Make the CUDA context that owns `addr` current on the calling
+/// thread, returning a guard that restores the previous context on
+/// drop.
+///
+/// First tries `CU_POINTER_ATTRIBUTE_CONTEXT` to get the exact context
+/// the allocation belongs to.  When that returns null (runtime-API or
+/// memory-pool allocations such as PyTorch's caching allocator), falls
+/// back to the device's primary context via
+/// `CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL` + `cuDevicePrimaryCtxRetain`.
+///
+/// CUDA-only — see [`CudaCtxGuard`] for the gating rationale.
+///
+/// # Safety
+///
+/// `addr` must be a valid CUDA device pointer.
+#[cfg(not(feature = "hixl"))]
+pub(crate) unsafe fn set_ctx_for_ptr(addr: usize) -> Result<CudaCtxGuard, anyhow::Error> {
+    let mut prev: rdmaxcel_sys::CUcontext = std::ptr::null_mut();
+    unsafe {
+        rdmaxcel_sys::rdmaxcel_cuCtxGetCurrent(&mut prev);
+    }
+
+    let mut ctx: rdmaxcel_sys::CUcontext = std::ptr::null_mut();
+    let rc = unsafe {
+        rdmaxcel_sys::rdmaxcel_cuPointerGetAttribute(
+            &mut ctx as *mut _ as *mut std::ffi::c_void,
+            rdmaxcel_sys::CU_POINTER_ATTRIBUTE_CONTEXT,
+            addr as rdmaxcel_sys::CUdeviceptr,
+        )
+    };
+
+    // Null context: allocation came from the runtime API or a memory
+    // pool.  Fall back to the owning device's primary context.
+    let mut retained_device = None;
+    if rc != rdmaxcel_sys::CUDA_SUCCESS || ctx.is_null() {
+        let mut ordinal: i32 = -1;
+        let rc = unsafe {
+            rdmaxcel_sys::rdmaxcel_cuPointerGetAttribute(
+                &mut ordinal as *mut _ as *mut std::ffi::c_void,
+                rdmaxcel_sys::CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+                addr as rdmaxcel_sys::CUdeviceptr,
+            )
+        };
+        anyhow::ensure!(
+            rc == rdmaxcel_sys::CUDA_SUCCESS,
+            "cuPointerGetAttribute(DEVICE_ORDINAL) failed with error code {rc}"
+        );
+
+        let mut device: rdmaxcel_sys::CUdevice = 0;
+        let rc = unsafe { rdmaxcel_sys::rdmaxcel_cuDeviceGet(&mut device, ordinal) };
+        anyhow::ensure!(
+            rc == rdmaxcel_sys::CUDA_SUCCESS,
+            "cuDeviceGet({ordinal}) failed with error code {rc}"
+        );
+
+        let rc = unsafe { rdmaxcel_sys::rdmaxcel_cuDevicePrimaryCtxRetain(&mut ctx, device) };
+        anyhow::ensure!(
+            rc == rdmaxcel_sys::CUDA_SUCCESS,
+            "cuDevicePrimaryCtxRetain failed with error code {rc}"
+        );
+        retained_device = Some(device);
+    }
+
+    let rc = unsafe { rdmaxcel_sys::rdmaxcel_cuCtxSetCurrent(ctx) };
+    anyhow::ensure!(
+        rc == rdmaxcel_sys::CUDA_SUCCESS,
+        "cuCtxSetCurrent failed with error code {rc}"
+    );
+
+    Ok(CudaCtxGuard {
+        prev,
+        retained_device,
+    })
+}
+
 /// Handle to a contiguous region of local memory.
 ///
 /// Implementations must guarantee the underlying allocation is valid for the
@@ -97,6 +197,7 @@ unsafe fn write_cpu(addr: usize, offset: usize, src: &[u8]) {
 
 #[cfg(not(feature = "hixl"))]
 unsafe fn read_gpu(addr: usize, offset: usize, dst: &mut [u8]) -> Result<(), anyhow::Error> {
+    let _guard = unsafe { set_ctx_for_ptr(addr)? };
     let rc = unsafe {
         rdmaxcel_sys::rdmaxcel_cuMemcpyDtoH_v2(
             dst.as_mut_ptr() as *mut std::ffi::c_void,
@@ -113,6 +214,7 @@ unsafe fn read_gpu(addr: usize, offset: usize, dst: &mut [u8]) -> Result<(), any
 
 #[cfg(not(feature = "hixl"))]
 unsafe fn write_gpu(addr: usize, offset: usize, src: &[u8]) -> Result<(), anyhow::Error> {
+    let _guard = unsafe { set_ctx_for_ptr(addr)? };
     let rc = unsafe {
         rdmaxcel_sys::rdmaxcel_cuMemcpyHtoD_v2(
             (addr + offset) as rdmaxcel_sys::CUdeviceptr,

@@ -1110,6 +1110,7 @@ class LsActor(Actor):
 
 
 # Workspace sync test - requires rsync server infrastructure.
+@pytest.mark.skipif(sys.platform != "linux", reason="linux-only")
 async def test_sync_workspace() -> None:
     # create two workspaces: one for local and one for remote
     with (
@@ -1458,7 +1459,7 @@ def test_config_propagates_to_host_agent():
     from monarch.config import configure
 
     # Set a non-default admin address on the client side.
-    configure(mesh_admin_addr="[::]:9999")
+    configure(mesh_admin_addr="[::]:0")
 
     with TemporaryDirectory() as d:
         procs = []
@@ -1485,16 +1486,65 @@ def test_config_propagates_to_host_agent():
         # _spawn_admin() spawns MeshAdminAgent on the caller's local
         # proc. The admin agent reads MESH_ADMIN_ADDR from config.
         head = hosts.slice(hosts=0)
-        admin_addr = _spawn_admin([head]).get()
+        admin_addr, _admin_ref = _spawn_admin([head]).get()
 
-        assert ":9999" in admin_addr, (
-            f"Expected :9999 in admin addr '{admin_addr}', "
+        assert ":1729" not in admin_addr, (
+            f"Expected non-default port in admin addr '{admin_addr}', "
             "client config not propagated to host agent process"
         )
 
         for proc in procs:
             proc.kill()
             proc.wait()
+
+
+@isolate_in_subprocess
+def test_fd_bootstrap():
+    """Test that a worker can be started using a pre-opened fd for its listening socket."""
+    import socket
+
+    procs = []
+    workers = []
+
+    for _i in range(2):
+        # Create a TCP socket bound to an ephemeral port.
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        fd = sock.fileno()
+
+        env = {**os.environ}
+        if "FB_XAR_INVOKED_NAME" in os.environ:
+            env["PYTHONPATH"] = ":".join(sys.path)
+
+        # Spawn the worker, passing the fd. The worker will adopt the fd
+        # via the tcp://host:fdNNN syntax and serve on it.
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                f"import sys; from monarch.actor import run_worker_loop_forever; "
+                f'run_worker_loop_forever(address="tcp://127.0.0.1:fd{fd}", ca="trust_all_connections")',
+            ],
+            env=env,
+            pass_fds=(fd,),
+        )
+        # Close our copy of the fd — the child owns it now.
+        sock.close()
+        procs.append(proc)
+        # The client connects to the real port, not the fd syntax.
+        workers.append(f"tcp://127.0.0.1:{port}")
+
+    hosts = attach_to_workers(ca="trust_all_connections", workers=workers)
+    hello = hosts.spawn_procs().spawn("hello", Hello)
+
+    r = hello.doit.call().get()
+    for _, v in r.items():
+        assert v == "hello!"
+    hosts.shutdown().get()
+    for proc in procs:
+        proc.wait()
 
 
 class HostMeshActor(Actor):

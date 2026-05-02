@@ -18,7 +18,6 @@ for infrastructure actors that aren't flagged (e.g. telemetry, setup).
 import logging
 import os
 import re
-import time
 import urllib.parse
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -27,11 +26,6 @@ import requests
 from . import db
 
 logger = logging.getLogger(__name__)
-
-# Cache the built DAG to avoid re-walking on every poll.
-_dag_cache: Optional[Dict[str, Any]] = None
-_dag_cache_time: float = 0.0
-_DAG_CACHE_TTL = 2.0  # seconds
 
 # Max walk depth: Root(0) -> Host(1) -> Proc(2) -> Actor(3).
 _MAX_TREE_DEPTH = 4
@@ -42,9 +36,20 @@ _SYSTEM_NAME_PATTERNS = re.compile(
     r"(telemetry|setup[-_]|SetupActor|comm[-_]|CommActor|"
     r"logger[-_]|LoggerActor|log_client|MeshAdminAgent|HostAgent|ProcAgent|"
     r"host_agent|proc_agent|mesh_admin|controller_controller|"
-    r"proc_mesh_controller|actor_mesh_controller|client\[)",
+    r"proc_mesh_controller|actor_mesh_controller)",
     re.IGNORECASE,
 )
+
+
+def _is_client_actor(ref: str) -> bool:
+    """The root client actor (client[0]) is the user's entrypoint.
+
+    It is marked ``is_system`` by the admin API and listed in
+    ``system_children``, but it sends all user-visible messages
+    (e.g. accumulate_gradients, get_status) to user actors. Keeping
+    it in the DAG preserves message edge visibility.
+    """
+    return ref.endswith(",client[0]")
 
 
 def _get_admin_url() -> Optional[str]:
@@ -234,17 +239,9 @@ def build_admin_dag(hide_system: bool = True) -> Dict[str, Any]:
 
     Returns ``{"nodes": [...], "edges": [...]}``.
     """
-    global _dag_cache, _dag_cache_time
-
     admin_url = _get_admin_url()
     if not admin_url:
         return {"nodes": [], "edges": []}
-
-    now = time.monotonic()
-    cached = _dag_cache
-    if cached is not None and now - _dag_cache_time < _DAG_CACHE_TTL:
-        if cached.get("_hide_system") == hide_system:
-            return cached
 
     session = requests.Session()
     configure_tls(session)
@@ -280,8 +277,10 @@ def build_admin_dag(hide_system: bool = True) -> Dict[str, Any]:
             continue
 
         # Filter system actors — both API flag and name heuristic.
+        # The root client actor is exempt: it is the user's entrypoint
+        # and the source of all user-visible messages.
         label = _derive_label(payload)
-        if hide_system:
+        if hide_system and not _is_client_actor(ref):
             if _extract_is_system(props):
                 continue
             if ntype == "actor" and _is_system_by_name(label):
@@ -328,7 +327,11 @@ def build_admin_dag(hide_system: bool = True) -> Dict[str, Any]:
 
         if depth < _MAX_TREE_DEPTH:
             for child_ref in children_refs:
-                if hide_system and child_ref in system_children:
+                if (
+                    hide_system
+                    and child_ref in system_children
+                    and not _is_client_actor(child_ref)
+                ):
                     continue
                 queue.append((child_ref, ref, depth + 1))
 
@@ -380,10 +383,7 @@ def build_admin_dag(hide_system: bool = True) -> Dict[str, Any]:
     # Add message edges from telemetry.
     _add_message_edges(nodes, edges)
 
-    result = {"nodes": nodes, "edges": edges, "_hide_system": hide_system}
-    _dag_cache = result
-    _dag_cache_time = now
-    return result
+    return {"nodes": nodes, "edges": edges}
 
 
 def _add_message_edges(
