@@ -59,6 +59,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use clap::Arg;
 use clap::Command as ClapCommand;
+use hyperactor as reference;
 use hyperactor::Actor;
 use hyperactor::Bind;
 use hyperactor::Context;
@@ -67,16 +68,16 @@ use hyperactor::Instance;
 use hyperactor::RemoteSpawn;
 use hyperactor::Unbind;
 use hyperactor::channel::ChannelAddr;
-use hyperactor::reference;
+use hyperactor::id::Label;
 use hyperactor::supervision::ActorSupervisionEvent;
 use hyperactor_config::Flattrs;
 use hyperactor_mesh::ActorMesh;
 use hyperactor_mesh::Bootstrap;
 use hyperactor_mesh::HostMeshRef;
-use hyperactor_mesh::Name;
 use hyperactor_mesh::ProcMesh;
 use hyperactor_mesh::context;
 use hyperactor_mesh::host_mesh::HostMesh;
+use hyperactor_mesh::mesh_id::HostMeshId;
 use monarch_rdma::IbvConfig;
 use monarch_rdma::RdmaManagerActor;
 use monarch_rdma::RdmaManagerMessageClient;
@@ -246,8 +247,8 @@ impl CliConfig {
 
 // CUDA RDMA Actor
 #[derive(Debug)]
+#[hyperactor::spawnable]
 #[hyperactor::export(
-    spawn = true,
     handlers = [
         InitializeBuffer,
         PerformPingPong,
@@ -751,11 +752,11 @@ pub async fn run() -> Result<(), anyhow::Error> {
 
     // Create separate host meshes for each device to maintain different configs
     let host_mesh_1 = HostMeshRef::from_hosts(
-        Name::new("cuda_ping_pong_host1").unwrap(),
+        HostMeshId::unique(Label::new("cuda-ping-pong-host1").unwrap()),
         vec![host_addrs[0].clone()],
     );
     let host_mesh_2 = HostMeshRef::from_hosts(
-        Name::new("cuda_ping_pong_host2").unwrap(),
+        HostMeshId::unique(Label::new("cuda-ping-pong-host2").unwrap()),
         vec![host_addrs[1].clone()],
     );
 

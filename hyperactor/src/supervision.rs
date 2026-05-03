@@ -45,16 +45,16 @@ use indenter::indented;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::ActorAddr;
 use crate::actor::ActorErrorKind;
 use crate::actor::ActorStatus;
-use crate::reference;
 
 /// This is the local actor supervision event. Child actor will propagate this event to its parent.
 #[derive(Clone, Debug, Derivative, Serialize, Deserialize, typeuri::Named)]
 #[derivative(PartialEq, Eq)]
 pub struct ActorSupervisionEvent {
     /// The actor id of the child actor where the event is triggered.
-    pub actor_id: reference::ActorId,
+    pub actor_id: ActorAddr,
     /// Friendly display name, if the actor class customized it.
     pub display_name: Option<String>,
     /// The time when the event is triggered.
@@ -71,13 +71,13 @@ wirevalue::register_type!(ActorSupervisionEvent);
 impl ActorSupervisionEvent {
     /// Create a new supervision event. Timestamp is set to the current time.
     pub fn new(
-        actor_id: reference::ActorId,
+        actor_id: impl Into<ActorAddr>,
         display_name: Option<String>,
         actor_status: ActorStatus,
         message_headers: Option<Flattrs>,
     ) -> Self {
         Self {
-            actor_id,
+            actor_id: actor_id.into(),
             display_name,
             occurred_at: std::time::SystemTime::now(),
             actor_status,
@@ -86,9 +86,13 @@ impl ActorSupervisionEvent {
     }
 
     fn actor_name(&self) -> String {
-        self.display_name
-            .clone()
-            .unwrap_or_else(|| self.actor_id.to_string())
+        self.display_name.clone().unwrap_or_else(|| {
+            if self.actor_id.is_root() {
+                format!("{},{}", self.actor_id.proc_ref(), self.actor_id.log_name())
+            } else {
+                self.actor_id.to_string()
+            }
+        })
     }
 
     /// Walk the `UnhandledSupervisionEvent` chain to the root-cause
@@ -210,9 +214,12 @@ impl fmt::Display for ActorSupervisionEvent {
                 write!(indented(f).with_str("  "), "{}", child)
             }
             ActorStatus::Stopped(_)
-                if self.actor_id.name() == "host_agent" || self.actor_id.name() == "proc_agent" =>
+                if self
+                    .actor_id
+                    .label()
+                    .is_some_and(|l| l.as_str() == "host_agent" || l.as_str() == "proc_agent") =>
             {
-                let addr = self.actor_id.proc_id().addr().to_string();
+                let addr = self.actor_id.proc_ref().addr().to_string();
                 write!(
                     f,
                     "Supervision event: the process {} owned by actor {} became unresponsive \
@@ -232,14 +239,15 @@ impl fmt::Display for ActorSupervisionEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ProcAddr;
     use crate::actor::ActorErrorKind;
     use crate::actor::ActorStatus;
     use crate::channel::ChannelAddr;
 
     fn test_event(name: &str, status: ActorStatus) -> ActorSupervisionEvent {
-        let proc_id = reference::ProcId::with_name(ChannelAddr::Local(0), "test_proc");
+        let proc_id = ProcAddr::from_resource_name(ChannelAddr::Local(0), "test_proc");
         ActorSupervisionEvent::new(
-            proc_id.actor_id(name, 0),
+            proc_id.actor_ref(name),
             Some(name.to_string()),
             status,
             None,
@@ -251,8 +259,8 @@ mod tests {
         addr: ChannelAddr,
         status: ActorStatus,
     ) -> ActorSupervisionEvent {
-        let proc_id = reference::ProcId::with_name(addr, "test_proc");
-        ActorSupervisionEvent::new(proc_id.actor_id(name, 0), None, status, None)
+        let proc_id = ProcAddr::from_resource_name(addr, "test_proc");
+        ActorSupervisionEvent::new(proc_id.actor_ref(name), None, status, None)
     }
 
     fn generic(name: &str, msg: &str) -> ActorSupervisionEvent {
@@ -565,9 +573,9 @@ mod tests {
     /// root cause for structured failure attribution.
     #[test]
     fn test_sv1_actually_failing_actor_returns_stopped_child() {
-        let proc_id = reference::ProcId::with_name(ChannelAddr::Local(0), "test_proc");
-        let child_id = proc_id.actor_id("proc_agent", 0);
-        let parent_id = proc_id.actor_id("controller", 0);
+        let proc_id = ProcAddr::from_resource_name(ChannelAddr::Local(0), "test_proc");
+        let child_id = proc_id.actor_id("proc_agent");
+        let parent_id = proc_id.actor_id("controller");
 
         let child_event = ActorSupervisionEvent::new(
             child_id.clone(),

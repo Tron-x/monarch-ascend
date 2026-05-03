@@ -22,7 +22,7 @@ def init_proc(
     Helper function to bootstrap a new Proc.
 
     Arguments:
-    - `proc_id`: String representation of the ProcId eg. `"world_name[0]"`
+    - `proc_id`: String representation of the ProcAddr eg. `"worker<2MuAHeDjLCEd>@tcp://[::1]:2345"`
     - `bootstrap_addr`: String representation of the channel address of the system
         actor. eg. `"tcp![::1]:2345"`
     - `timeout`: Number of seconds to wait to successfully connect to the system.
@@ -41,21 +41,18 @@ class Serialized:
     ...
 
 @final
-class ActorId:
+class ActorAddr:
     """
-    A python wrapper around hyperactor ActorId. It represents a unique reference
+    A python wrapper around hyperactor ActorAddr. It represents a unique reference
     for an actor.
 
     Arguments:
     - `addr`: The channel address of the proc containing the actor.
     - `proc_name`: The name of the proc containing the actor.
-    - `actor_name`: Name of the actor.
-    - `pid`: The pid of the actor.
+    - `actor_name`: Resource name of the actor.
     """
 
-    def __init__(
-        self, *, addr: str, proc_name: str, actor_name: str, pid: int = 0
-    ) -> None: ...
+    def __init__(self, *, addr: str, proc_name: str, actor_name: str) -> None: ...
     def __str__(self) -> str: ...
     def __hash__(self) -> int: ...
     def __eq__(self, other: object) -> bool: ...
@@ -71,26 +68,46 @@ class ActorId:
 
     @property
     def actor_name(self) -> str:
-        """Name of the actor."""
+        """Compatibility alias for the actor label, or uid when unlabeled."""
         ...
 
     @property
-    def pid(self) -> int:
-        """The pid of the actor."""
+    def label(self) -> Optional[str]:
+        """The actor label, if present."""
+        ...
+
+    @property
+    def proc_label(self) -> Optional[str]:
+        """The proc label, if present."""
+        ...
+
+    @property
+    def uid(self) -> str:
+        """String representation of the actor uid."""
+        ...
+
+    @property
+    def pid(self) -> str:
+        """Compatibility alias for `uid`."""
         ...
 
     @property
     def proc_id(self) -> str:
-        """String representation of the ProcId."""
+        """String representation of the ProcAddr in Rust-compatible `proc@location` form."""
+        ...
+
+    @property
+    def is_root(self) -> bool:
+        """Whether this actor address names a singleton root actor."""
         ...
 
     @staticmethod
-    def from_string(actor_id_str: str) -> ActorId:
+    def from_string(actor_addr_str: str) -> ActorAddr:
         """
-        Create an ActorId from a string representation.
+        Create an ActorAddr from a string representation.
 
         Arguments:
-        - `actor_id_str`: String representation of the actor id.
+        - `actor_addr_str`: String representation of the actor address.
         """
         ...
 

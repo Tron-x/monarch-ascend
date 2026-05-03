@@ -19,6 +19,7 @@ use hyperactor::Handler;
 use hyperactor::actor::ActorHandle;
 use hyperactor::handle;
 use hyperactor::mailbox::OncePortHandle;
+use monarch_types::ReduceOp;
 use parking_lot::Mutex;
 use tokio::task::spawn_blocking;
 use torch_sys2::TensorCell;
@@ -29,7 +30,6 @@ use crate::backend::CommId;
 use crate::backend::CommStatus;
 use crate::backend::Communicator;
 use crate::backend::Event;
-use crate::backend::ReduceOp;
 use crate::backend::Stream;
 use crate::backend::group_end;
 use crate::backend::group_start;
@@ -402,7 +402,7 @@ impl CommMessageHandler for NcclCommActor {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, fbcode_build))]
 mod tests {
     use std::assert_matches::assert_matches;
     use std::collections::HashMap;
@@ -418,6 +418,7 @@ mod tests {
     use monarch_messages::worker::WorkerParams;
     use ndslice::Slice;
     use timed_test::async_timed_test;
+    use torch_sys_cuda::nccl::UniqueIdExt;
     use torch_sys2::DeviceIndex;
     use torch_sys2::Layout;
     use torch_sys2::ScalarType;

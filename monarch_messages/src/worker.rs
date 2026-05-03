@@ -24,13 +24,15 @@ use derive_more::Display;
 use derive_more::From;
 use derive_more::TryInto;
 use enum_as_inner::EnumAsInner;
+use hyperactor as reference;
 use hyperactor::Bind;
 use hyperactor::HandleClient;
 use hyperactor::Handler;
 use hyperactor::RefClient;
 use hyperactor::Unbind;
-use hyperactor::reference;
+use monarch_types::ReduceOp;
 use monarch_types::SerializablePyErr;
+use monarch_types::UniqueId;
 use monarch_types::py_global;
 use ndslice::Slice;
 use pyo3::exceptions::PyValueError;
@@ -41,15 +43,6 @@ use pyo3::types::PyTuple;
 use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
-#[cfg(feature = "cuda_backend")]
-use torch_sys_cuda::nccl::ReduceOp;
-#[cfg(feature = "cuda_backend")]
-use torch_sys_cuda::nccl::UniqueId;
-
-#[cfg(feature = "ascend_backend")]
-use torch_sys_ascend::hccl::ReduceOp;
-#[cfg(feature = "ascend_backend")]
-use torch_sys_ascend::hccl::RootInfo as UniqueId;
 use torch_sys2::BorrowError;
 use torch_sys2::Device;
 use torch_sys2::Layout;
@@ -865,7 +858,7 @@ pub enum WorkerMessage {
         /// - error message or stacktrace
         ///
         /// The worker process will be stopped if the error is provided.
-        error: Option<(Option<reference::ActorId>, String)>,
+        error: Option<(Option<reference::ActorAddr>, String)>,
     },
 
     /// Defines (part of) a new recording on the worker. This is a list of commands

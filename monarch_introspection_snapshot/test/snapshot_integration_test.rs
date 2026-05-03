@@ -49,7 +49,8 @@ use ndslice::view::Ranked;
 // requirement for at least one handler.
 
 #[derive(Default, Debug)]
-#[hyperactor::export(spawn = true, handlers = [()])]
+#[hyperactor::spawnable]
+#[hyperactor::export(handlers = [()])]
 struct SnapshotTestActor;
 
 impl Actor for SnapshotTestActor {}
@@ -416,7 +417,7 @@ async fn test_pt3_immediate_first_capture() -> Result<()> {
     );
 
     // Stop the actor and clean up.
-    let actor_id = instance.proc().proc_id().actor_id("snapshot_capture", 0);
+    let actor_id = instance.proc().proc_id().actor_ref("snapshot_capture");
     instance
         .proc()
         .stop_actor(&actor_id, "PT-3 test cleanup".to_string());
@@ -465,7 +466,7 @@ async fn test_pt5_drain_halts_future_captures() -> Result<()> {
 
     // Stop the snapshot actor directly. In production, job teardown
     // stops the proc which stops all actors on it.
-    let actor_id = instance.proc().proc_id().actor_id("snapshot_capture", 0);
+    let actor_id = instance.proc().proc_id().actor_ref("snapshot_capture");
     let status_rx = instance
         .proc()
         .stop_actor(&actor_id, "PT-5 test shutdown".to_string());

@@ -57,6 +57,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use hyperactor as reference;
 use hyperactor::Actor;
 use hyperactor::Bind;
 use hyperactor::Context;
@@ -66,15 +67,15 @@ use hyperactor::RemoteSpawn;
 use hyperactor::Unbind;
 use hyperactor::channel::ChannelTransport;
 use hyperactor::context::Mailbox as _;
-use hyperactor::reference;
+use hyperactor::id::Label;
 use hyperactor::supervision::ActorSupervisionEvent;
 use hyperactor_config::Flattrs;
 use hyperactor_mesh::ActorMesh;
 use hyperactor_mesh::Bootstrap;
 use hyperactor_mesh::HostMeshRef;
-use hyperactor_mesh::Name;
 use hyperactor_mesh::comm::multicast::CastInfo;
 use hyperactor_mesh::context;
+use hyperactor_mesh::mesh_id::HostMeshId;
 use monarch_rdma::IbvConfig;
 use monarch_rdma::RdmaManagerActor;
 use monarch_rdma::RdmaManagerMessageClient;
@@ -93,8 +94,8 @@ const BUFFER_SIZE: usize = 8;
 
 // Parameter Server Actor
 #[derive(Debug)]
+#[hyperactor::spawnable]
 #[hyperactor::export(
-    spawn = true,
     handlers = [
         PsGetBuffers,
         PsUpdate,
@@ -203,7 +204,8 @@ impl Handler<PsGetBuffers> for ParameterServerActor {
                     .owner_ref
                     .downcast_handle(cx)
                     .ok_or_else(|| anyhow::anyhow!("failed to get handle"))?;
-                let grad_buffer_handle = handle.request_buffer(cx, local_memory).await?;
+                let grad_buffer_handle: RdmaRemoteBuffer =
+                    handle.request_buffer(cx, local_memory).await?;
                 e.insert(grad_buffer_handle.clone());
                 grad_buffer_handle
             }
@@ -248,8 +250,8 @@ impl Handler<Log> for ParameterServerActor {
 
 // Worker Actor
 #[derive(Debug)]
+#[hyperactor::spawnable]
 #[hyperactor::export(
-    spawn = true,
     handlers = [
         WorkerInit { cast = true },
         WorkerStep { cast = true },
@@ -482,7 +484,10 @@ pub async fn run(num_workers: usize, num_steps: usize) -> Result<(), anyhow::Err
     command.kill_on_drop(true);
     let _child = command.spawn().unwrap();
 
-    let host_mesh = HostMeshRef::from_hosts(Name::new("test").unwrap(), vec![host_addr]);
+    let host_mesh = HostMeshRef::from_hosts(
+        HostMeshId::unique(Label::new("test").unwrap()),
+        vec![host_addr],
+    );
     let ps_proc_mesh = host_mesh
         .spawn(instance, "ps", extent!(gpu = 1), None)
         .await?;

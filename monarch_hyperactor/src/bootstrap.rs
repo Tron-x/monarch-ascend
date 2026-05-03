@@ -8,18 +8,18 @@
 
 use futures::future::try_join_all;
 use hyperactor::channel::ChannelAddr;
-use hyperactor_mesh::Name;
+use hyperactor::id::Label;
 use hyperactor_mesh::bootstrap::BootstrapCommand;
 use hyperactor_mesh::bootstrap::bootstrap;
 use hyperactor_mesh::bootstrap::halt;
 use hyperactor_mesh::bootstrap::host;
 use hyperactor_mesh::host_mesh::HostMesh;
+use hyperactor_mesh::mesh_id::HostMeshId;
 use monarch_types::MapPyErr;
 use pyo3::Bound;
 use pyo3::PyAny;
 use pyo3::PyResult;
 use pyo3::Python;
-use pyo3::exceptions::PyException;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::pyfunction;
 use pyo3::types::PyAnyMethods;
@@ -123,8 +123,11 @@ pub fn attach_to_workers<'py>(
         .map(|x| x.borrow_mut().take_task())
         .collect::<PyResult<Vec<_>>>()?;
 
-    let name =
-        Name::new(name.unwrap_or("hosts")).map_err(|err| PyException::new_err(err.to_string()))?;
+    // `Label::strip` (vs. `Label::new`) sanitizes user-supplied names — lowercases,
+    // drops illegal characters, falls back to "nil" if empty. Callers pass names
+    // derived from experiment / job names that may contain uppercase or punctuation;
+    // rejecting them surfaces as an opaque PyException far from the input site.
+    let name = HostMeshId::unique(Label::strip(name.unwrap_or("hosts")));
     let instance = instance.clone();
     PyPythonTask::new(async move {
         let results = try_join_all(tasks).await?;

@@ -28,4 +28,7 @@ build_utils = { path = "../../build_utils" }
 [features]
 cuda = ["monarch_rdma/cuda"]
 hixl = ["monarch_rdma/hixl"]
-default = ["cuda"]
+# Keep default = [] so NPU consumers (monarch_extension/ascend_engine) don't
+# accidentally pull rdmaxcel-sys via the transitive cuda default.  Mirrors the
+# corresponding fix in monarch_rdma/Cargo.toml.
+default = []

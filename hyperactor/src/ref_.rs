@@ -6,853 +6,625 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! References: identifiers paired with a network location.
+//! Typed capability references for Hyperactor actors and ports.
 
+use std::cmp::Ordering;
 use std::fmt;
-use std::str::FromStr;
+use std::hash::Hash;
+use std::hash::Hasher;
+use std::marker::PhantomData;
 
+use derivative::Derivative;
+use hyperactor_config::Flattrs;
 use serde::Deserialize;
+use serde::Deserializer;
 use serde::Serialize;
+use serde::Serializer;
+use typeuri::Named;
 
-use crate::channel::ChannelAddr;
-use crate::id::ActorId;
-use crate::id::IdParseError;
-use crate::id::PortId;
-use crate::id::ProcId;
+use crate::Actor;
+use crate::ActorAddr;
+use crate::ActorHandle;
+use crate::PortAddr;
+use crate::RemoteHandles;
+use crate::RemoteMessage;
+use crate::accum::ReducerSpec;
+use crate::accum::StreamingReducerOpts;
+use crate::actor::Referable;
+use crate::context;
+use crate::context::MailboxExt;
+use crate::mailbox::MailboxSenderError;
+use crate::mailbox::MailboxSenderErrorKind;
+use crate::mailbox::PortSink;
+use crate::message::Bind;
+use crate::message::Bindings;
+use crate::message::Unbind;
+use crate::port::Port;
 
-/// A network location, wrapping a [`ChannelAddr`].
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct Location(ChannelAddr);
+/// ActorRefs are typed references to actors.
+#[derive(typeuri::Named)]
+pub struct ActorRef<A: Referable> {
+    pub(crate) actor_addr: ActorAddr,
+    // fn() -> A so that the struct remains Send
+    phantom: PhantomData<fn() -> A>,
+}
 
-impl Location {
-    /// Returns the underlying channel address.
-    pub fn addr(&self) -> &ChannelAddr {
-        &self.0
+impl<A: Referable> ActorRef<A> {
+    /// Get the remote port for message type [`M`] for the referenced actor.
+    pub fn port<M: RemoteMessage>(&self) -> PortRef<M>
+    where
+        A: RemoteHandles<M>,
+    {
+        PortRef::attest(self.actor_addr.port_ref(Port::from(<M as Named>::port())))
+    }
+
+    /// Send an [`M`]-typed message to the referenced actor.
+    pub fn send<M: RemoteMessage>(
+        &self,
+        cx: &impl context::Actor,
+        message: M,
+    ) -> Result<(), MailboxSenderError>
+    where
+        A: RemoteHandles<M>,
+    {
+        self.port().send(cx, message)
+    }
+
+    /// Send an [`M`]-typed message to the referenced actor, with additional context provided by
+    /// headers.
+    pub fn send_with_headers<M: RemoteMessage>(
+        &self,
+        cx: &impl context::Actor,
+        headers: Flattrs,
+        message: M,
+    ) -> Result<(), MailboxSenderError>
+    where
+        A: RemoteHandles<M>,
+    {
+        self.port().send_with_headers(cx, headers, message)
+    }
+
+    /// The caller guarantees that the provided actor ID is also a valid,
+    /// typed reference.  This is usually invoked to provide a guarantee
+    /// that an externally-provided actor ID (e.g., through a command
+    /// line argument) is a valid reference.
+    pub fn attest(actor_addr: ActorAddr) -> Self {
+        Self {
+            actor_addr,
+            phantom: PhantomData,
+        }
+    }
+
+    /// The actor address corresponding with this reference.
+    pub fn actor_addr(&self) -> &ActorAddr {
+        &self.actor_addr
+    }
+
+    /// Convert this actor reference into its corresponding actor address.
+    pub fn into_actor_addr(self) -> ActorAddr {
+        self.actor_addr
+    }
+
+    /// The actor address corresponding with this reference.
+    pub fn actor_id(&self) -> &ActorAddr {
+        &self.actor_addr
+    }
+
+    /// Convert this actor reference into its corresponding actor address.
+    pub fn into_actor_id(self) -> ActorAddr {
+        self.actor_addr
+    }
+
+    /// Attempt to downcast this reference into a (local) actor handle.
+    /// This will only succeed when the referenced actor is in the same
+    /// proc as the caller.
+    pub fn downcast_handle(&self, cx: &impl context::Actor) -> Option<ActorHandle<A>>
+    where
+        A: Actor,
+    {
+        cx.instance().proc().resolve_actor_ref(self)
     }
 }
 
-impl From<ChannelAddr> for Location {
-    fn from(addr: ChannelAddr) -> Self {
-        Self(addr)
+// Implement Serialize manually, without requiring A: Serialize
+impl<A: Referable> Serialize for ActorRef<A> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Serialize only the fields that don't depend on A
+        self.actor_addr.serialize(serializer)
     }
 }
 
-impl fmt::Display for Location {
+// Implement Deserialize manually, without requiring A: Deserialize
+impl<'de, A: Referable> Deserialize<'de> for ActorRef<A> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let actor_addr = <ActorAddr>::deserialize(deserializer)?;
+        Ok(ActorRef {
+            actor_addr,
+            phantom: PhantomData,
+        })
+    }
+}
+
+// Implement Debug manually, without requiring A: Debug
+impl<A: Referable> fmt::Debug for ActorRef<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0.to_zmq_url())
+        f.debug_struct("ActorRef")
+            .field("actor_addr", &self.actor_addr)
+            .field("type", &std::any::type_name::<A>())
+            .finish()
     }
 }
 
-impl fmt::Debug for Location {
+impl<A: Referable> fmt::Display for ActorRef<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, f)
+        fmt::Display::fmt(&self.actor_addr, f)?;
+        write!(f, "<{}>", std::any::type_name::<A>())
     }
 }
 
-impl FromStr for Location {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        ChannelAddr::from_zmq_url(s).map(Self)
-    }
-}
-
-/// Errors that can occur when parsing a [`ProcRef`] or [`ActorRef`].
-#[derive(Debug, thiserror::Error)]
-pub enum RefParseError {
-    /// The `@` separator between id and location is missing.
-    #[error("missing '@' separator between id and location")]
-    MissingSeparator,
-    /// The id portion is invalid.
-    #[error("invalid id: {0}")]
-    InvalidId(#[from] IdParseError),
-    /// The location portion is invalid.
-    #[error("invalid location: {0}")]
-    InvalidLocation(#[source] anyhow::Error),
-}
-
-/// A process identifier paired with a network location.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct ProcRef {
-    id: ProcId,
-    location: Location,
-}
-
-impl ProcRef {
-    /// Create a new [`ProcRef`].
-    pub fn new(id: ProcId, location: Location) -> Self {
-        Self { id, location }
-    }
-
-    /// Returns the process id.
-    pub fn id(&self) -> &ProcId {
-        &self.id
-    }
-
-    /// Returns the location.
-    pub fn location(&self) -> &Location {
-        &self.location
-    }
-}
-
-impl PartialEq for ProcRef {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.location == other.location
-    }
-}
-
-impl Eq for ProcRef {}
-
-impl std::hash::Hash for ProcRef {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-        self.location.hash(state);
-    }
-}
-
-impl PartialOrd for ProcRef {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for ProcRef {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.id
-            .cmp(&other.id)
-            .then_with(|| self.location.cmp(&other.location))
-    }
-}
-
-impl fmt::Display for ProcRef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}@{}", self.id, self.location)
-    }
-}
-
-impl fmt::Debug for ProcRef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.id.label() {
-            Some(label) => write!(f, "<'{}' {}@{}>", label, self.id, self.location),
-            None => write!(f, "<{}@{}>", self.id, self.location),
+// We implement Clone manually to avoid imposing A: Clone.
+impl<A: Referable> Clone for ActorRef<A> {
+    fn clone(&self) -> Self {
+        Self {
+            actor_addr: self.actor_addr.clone(),
+            phantom: PhantomData,
         }
     }
 }
 
-impl FromStr for ProcRef {
-    type Err = RefParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let at = s.find('@').ok_or(RefParseError::MissingSeparator)?;
-        let id: ProcId = s[..at].parse()?;
-        let location: Location = s[at + 1..]
-            .parse()
-            .map_err(RefParseError::InvalidLocation)?;
-        Ok(Self { id, location })
-    }
-}
-
-/// An actor identifier paired with a network location.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct ActorRef {
-    id: ActorId,
-    location: Location,
-}
-
-impl ActorRef {
-    /// Create a new [`ActorRef`].
-    pub fn new(id: ActorId, location: Location) -> Self {
-        Self { id, location }
-    }
-
-    /// Returns the actor id.
-    pub fn id(&self) -> &ActorId {
-        &self.id
-    }
-
-    /// Returns the location.
-    pub fn location(&self) -> &Location {
-        &self.location
-    }
-}
-
-impl PartialEq for ActorRef {
+impl<A: Referable> PartialEq for ActorRef<A> {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.location == other.location
+        self.actor_addr == other.actor_addr
     }
 }
 
-impl Eq for ActorRef {}
+impl<A: Referable> Eq for ActorRef<A> {}
 
-impl std::hash::Hash for ActorRef {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-        self.location.hash(state);
-    }
-}
-
-impl PartialOrd for ActorRef {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+impl<A: Referable> PartialOrd for ActorRef<A> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for ActorRef {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.id
-            .cmp(&other.id)
-            .then_with(|| self.location.cmp(&other.location))
+impl<A: Referable> Ord for ActorRef<A> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.actor_addr.cmp(&other.actor_addr)
     }
 }
 
-impl fmt::Display for ActorRef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}@{}", self.id, self.location)
+impl<A: Referable> Hash for ActorRef<A> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.actor_addr.hash(state);
     }
 }
 
-impl fmt::Debug for ActorRef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (self.id.label(), self.id.proc_id().label()) {
-            (Some(actor_label), Some(proc_label)) => {
-                write!(
-                    f,
-                    "<'{}.{}' {}@{}>",
-                    actor_label, proc_label, self.id, self.location
-                )
-            }
-            (Some(actor_label), None) => {
-                write!(f, "<'{}' {}@{}>", actor_label, self.id, self.location)
-            }
-            (None, Some(proc_label)) => {
-                write!(f, "<'.{}' {}@{}>", proc_label, self.id, self.location)
-            }
-            (None, None) => {
-                write!(f, "<{}@{}>", self.id, self.location)
-            }
+/// A reference to a remote port. All messages passed through
+/// PortRefs will be serialized. PortRefs are always streaming.
+#[derive(Debug, Serialize, Deserialize, Derivative, typeuri::Named)]
+#[derivative(PartialEq, Eq, PartialOrd, Hash, Ord)]
+pub struct PortRef<M> {
+    port_addr: PortAddr,
+    #[derivative(
+        PartialEq = "ignore",
+        PartialOrd = "ignore",
+        Ord = "ignore",
+        Hash = "ignore"
+    )]
+    reducer_spec: Option<ReducerSpec>,
+    #[derivative(
+        PartialEq = "ignore",
+        PartialOrd = "ignore",
+        Ord = "ignore",
+        Hash = "ignore"
+    )]
+    streaming_opts: StreamingReducerOpts,
+    phantom: PhantomData<M>,
+    return_undeliverable: bool,
+    #[derivative(
+        PartialEq = "ignore",
+        PartialOrd = "ignore",
+        Ord = "ignore",
+        Hash = "ignore"
+    )]
+    unsplit: bool,
+}
+
+impl<M: RemoteMessage> PortRef<M> {
+    /// The caller attests that the provided PortId can be
+    /// converted to a reachable, typed port reference.
+    pub fn attest(port_addr: PortAddr) -> Self {
+        Self {
+            port_addr,
+            reducer_spec: None,
+            streaming_opts: StreamingReducerOpts::default(),
+            phantom: PhantomData,
+            return_undeliverable: true,
+            unsplit: false,
+        }
+    }
+
+    /// The caller attests that the provided PortId can be
+    /// converted to a reachable, typed port reference.
+    pub fn attest_reducible(
+        port_addr: PortAddr,
+        reducer_spec: Option<ReducerSpec>,
+        streaming_opts: StreamingReducerOpts,
+    ) -> Self {
+        Self {
+            port_addr,
+            reducer_spec,
+            streaming_opts,
+            phantom: PhantomData,
+            return_undeliverable: true,
+            unsplit: false,
+        }
+    }
+
+    /// Prevents the port from being split.
+    pub fn unsplit(mut self) -> Self {
+        self.unsplit = true;
+        self
+    }
+
+    /// The caller attests that the provided PortId can be
+    /// converted to a reachable, typed port reference.
+    pub fn attest_message_port(actor: &ActorAddr) -> Self {
+        PortRef::<M>::attest(actor.port_ref(Port::from(<M as Named>::port())))
+    }
+
+    /// The typehash of this port's reducer, if any. Reducers
+    /// may be used to coalesce messages sent to a port.
+    pub fn reducer_spec(&self) -> &Option<ReducerSpec> {
+        &self.reducer_spec
+    }
+
+    /// This port's address.
+    pub fn port_addr(&self) -> &PortAddr {
+        &self.port_addr
+    }
+
+    /// Convert this PortRef into its corresponding port address.
+    pub fn into_port_addr(self) -> PortAddr {
+        self.port_addr
+    }
+
+    /// This port's address.
+    pub fn port_id(&self) -> &PortAddr {
+        &self.port_addr
+    }
+
+    /// Convert this PortRef into its corresponding port address.
+    pub fn into_port_id(self) -> PortAddr {
+        self.port_addr
+    }
+
+    /// coerce it into OncePortRef so we can send messages to this port from
+    /// APIs requires OncePortRef.
+    pub fn into_once(self) -> OncePortRef<M> {
+        let return_undeliverable = self.return_undeliverable;
+        let unsplit = self.unsplit;
+        let mut once = OncePortRef::attest(self.into_port_addr());
+        once.return_undeliverable = return_undeliverable;
+        once.unsplit = unsplit;
+        once
+    }
+
+    /// Send a message to this port, provided a sending capability, such as
+    /// [`crate::actor::Instance`].
+    pub fn send(&self, cx: &impl context::Actor, message: M) -> Result<(), MailboxSenderError> {
+        self.send_with_headers(cx, Flattrs::new(), message)
+    }
+
+    /// Send a message to this port, provided a sending capability, such as
+    /// [`crate::actor::Instance`]. Additional context can be provided in the form of
+    /// headers.
+    pub fn send_with_headers(
+        &self,
+        cx: &impl context::Actor,
+        headers: Flattrs,
+        message: M,
+    ) -> Result<(), MailboxSenderError> {
+        let serialized = wirevalue::Any::serialize(&message).map_err(|err| {
+            MailboxSenderError::new_bound(
+                self.port_addr.clone(),
+                MailboxSenderErrorKind::Serialize(err.into()),
+            )
+        })?;
+        self.send_serialized(cx, headers, serialized);
+        Ok(())
+    }
+
+    /// Send a serialized message to this port, provided a sending capability, such as
+    /// [`crate::actor::Instance`].
+    pub fn send_serialized(
+        &self,
+        cx: &impl context::Actor,
+        mut headers: Flattrs,
+        message: wirevalue::Any,
+    ) {
+        crate::mailbox::headers::set_send_timestamp(&mut headers);
+        crate::mailbox::headers::set_rust_message_type::<M>(&mut headers);
+        cx.post(
+            self.port_addr.clone(),
+            headers,
+            message,
+            self.return_undeliverable,
+            context::SeqInfoPolicy::AssignNew,
+        );
+    }
+
+    /// Convert this port into a sink that can be used to send messages using the given capability.
+    pub fn into_sink<C: context::Actor>(self, cx: C) -> PortSink<C, M> {
+        PortSink::new(cx, self)
+    }
+
+    /// Get whether or not messages sent to this port that are undeliverable should
+    /// be returned to the sender.
+    pub fn get_return_undeliverable(&self) -> bool {
+        self.return_undeliverable
+    }
+
+    /// Set whether or not messages sent to this port that are undeliverable
+    /// should be returned to the sender.
+    pub fn return_undeliverable(&mut self, return_undeliverable: bool) {
+        self.return_undeliverable = return_undeliverable;
+    }
+}
+
+impl<M: RemoteMessage> Clone for PortRef<M> {
+    fn clone(&self) -> Self {
+        Self {
+            port_addr: self.port_addr.clone(),
+            reducer_spec: self.reducer_spec.clone(),
+            streaming_opts: self.streaming_opts.clone(),
+            phantom: PhantomData,
+            return_undeliverable: self.return_undeliverable,
+            unsplit: self.unsplit,
         }
     }
 }
 
-impl FromStr for ActorRef {
-    type Err = RefParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let at = s.find('@').ok_or(RefParseError::MissingSeparator)?;
-        let id: ActorId = s[..at].parse()?;
-        let location: Location = s[at + 1..]
-            .parse()
-            .map_err(RefParseError::InvalidLocation)?;
-        Ok(Self { id, location })
-    }
-}
-
-/// A port identifier paired with a network location.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct PortRef {
-    id: PortId,
-    location: Location,
-}
-
-impl PortRef {
-    /// Create a new [`PortRef`].
-    pub fn new(id: PortId, location: Location) -> Self {
-        Self { id, location }
-    }
-
-    /// Returns the port id.
-    pub fn id(&self) -> &PortId {
-        &self.id
-    }
-
-    /// Returns the location.
-    pub fn location(&self) -> &Location {
-        &self.location
-    }
-
-    /// Returns the actor id (delegates to port id).
-    pub fn actor_id(&self) -> &ActorId {
-        self.id.actor_id()
-    }
-}
-
-impl PartialEq for PortRef {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.location == other.location
-    }
-}
-
-impl Eq for PortRef {}
-
-impl std::hash::Hash for PortRef {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-        self.location.hash(state);
-    }
-}
-
-impl PartialOrd for PortRef {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for PortRef {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.id
-            .cmp(&other.id)
-            .then_with(|| self.location.cmp(&other.location))
-    }
-}
-
-impl fmt::Display for PortRef {
+impl<M: RemoteMessage> fmt::Display for PortRef<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}@{}", self.id, self.location)
+        fmt::Display::fmt(&self.port_addr, f)
     }
 }
 
-impl fmt::Debug for PortRef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (
-            self.id.actor_id().label(),
-            self.id.actor_id().proc_id().label(),
-        ) {
-            (Some(actor_label), Some(proc_label)) => {
-                write!(
-                    f,
-                    "<'{}.{}' {}@{}>",
-                    actor_label, proc_label, self.id, self.location
-                )
+/// The kind of unbound port.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Named)]
+pub enum UnboundPortKind {
+    /// A streaming port, which should be reduced with the provided options.
+    Streaming(Option<StreamingReducerOpts>),
+    /// A OncePort, which must be one-shot aggregated.
+    Once,
+}
+
+/// The parameters extracted from [`PortRef`] to [`Bindings`].
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, typeuri::Named)]
+pub struct UnboundPort(
+    pub PortAddr,
+    pub Option<ReducerSpec>,
+    pub bool, // return_undeliverable
+    pub UnboundPortKind,
+    pub bool, // unsplit
+);
+wirevalue::register_type!(UnboundPort);
+
+impl UnboundPort {
+    /// Update the port id of this binding.
+    pub fn update(&mut self, port_addr: PortAddr) {
+        self.0 = port_addr;
+    }
+}
+
+impl<M: RemoteMessage> From<&PortRef<M>> for UnboundPort {
+    fn from(port_ref: &PortRef<M>) -> Self {
+        UnboundPort(
+            port_ref.port_addr.clone(),
+            port_ref.reducer_spec.clone(),
+            port_ref.return_undeliverable,
+            UnboundPortKind::Streaming(Some(port_ref.streaming_opts.clone())),
+            port_ref.unsplit,
+        )
+    }
+}
+
+impl<M: RemoteMessage> Unbind for PortRef<M> {
+    fn unbind(&self, bindings: &mut Bindings) -> anyhow::Result<()> {
+        bindings.push_back(&UnboundPort::from(self))
+    }
+}
+
+impl<M: RemoteMessage> Bind for PortRef<M> {
+    fn bind(&mut self, bindings: &mut Bindings) -> anyhow::Result<()> {
+        let UnboundPort(port_addr, reducer_spec, return_undeliverable, port_kind, unsplit) =
+            bindings.try_pop_front::<UnboundPort>()?;
+        self.port_addr = port_addr;
+        self.reducer_spec = reducer_spec;
+        self.return_undeliverable = return_undeliverable;
+        self.unsplit = unsplit;
+        self.streaming_opts = match port_kind {
+            UnboundPortKind::Streaming(opts) => opts.unwrap_or_default(),
+            UnboundPortKind::Once => {
+                anyhow::bail!("OncePortRef cannot be bound to PortRef")
             }
-            (Some(actor_label), None) => {
-                write!(f, "<'{}' {}@{}>", actor_label, self.id, self.location)
-            }
-            (None, Some(proc_label)) => {
-                write!(f, "<'.{}' {}@{}>", proc_label, self.id, self.location)
-            }
-            (None, None) => {
-                write!(f, "<{}@{}>", self.id, self.location)
-            }
+        };
+        Ok(())
+    }
+}
+
+/// A remote reference to a [`OncePort`]. References are serializable
+/// and may be passed to remote actors, which can then use it to send
+/// a message to this port.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct OncePortRef<M> {
+    port_addr: PortAddr,
+    reducer_spec: Option<ReducerSpec>,
+    return_undeliverable: bool,
+    unsplit: bool,
+    phantom: PhantomData<M>,
+}
+
+impl<M: RemoteMessage> OncePortRef<M> {
+    pub(crate) fn attest(port_addr: PortAddr) -> Self {
+        Self {
+            port_addr,
+            reducer_spec: None,
+            return_undeliverable: true,
+            unsplit: false,
+            phantom: PhantomData,
+        }
+    }
+
+    /// The caller attests that the provided PortId can be
+    /// converted to a reachable, typed once port reference.
+    pub fn attest_reducible(port_addr: PortAddr, reducer_spec: Option<ReducerSpec>) -> Self {
+        Self {
+            port_addr,
+            reducer_spec,
+            return_undeliverable: true,
+            unsplit: false,
+            phantom: PhantomData,
+        }
+    }
+
+    /// Prevents the port from being split.
+    pub fn unsplit(mut self) -> Self {
+        self.unsplit = true;
+        self
+    }
+
+    /// The typehash of this port's reducer, if any.
+    pub fn reducer_spec(&self) -> &Option<ReducerSpec> {
+        &self.reducer_spec
+    }
+
+    /// This port's address.
+    pub fn port_addr(&self) -> &PortAddr {
+        &self.port_addr
+    }
+
+    /// Convert this OncePortRef into its corresponding port address.
+    pub fn into_port_addr(self) -> PortAddr {
+        self.port_addr
+    }
+
+    /// This port's address.
+    pub fn port_id(&self) -> &PortAddr {
+        &self.port_addr
+    }
+
+    /// Convert this PortRef into its corresponding port address.
+    pub fn into_port_id(self) -> PortAddr {
+        self.port_addr
+    }
+
+    /// Send a message to this port, provided a sending capability, such as
+    /// [`crate::actor::Instance`].
+    pub fn send(self, cx: &impl context::Actor, message: M) -> Result<(), MailboxSenderError> {
+        self.send_with_headers(cx, Flattrs::new(), message)
+    }
+
+    /// Send a message to this port, provided a sending capability, such as
+    /// [`crate::actor::Instance`]. Additional context can be provided in the form of headers.
+    pub fn send_with_headers(
+        self,
+        cx: &impl context::Actor,
+        mut headers: Flattrs,
+        message: M,
+    ) -> Result<(), MailboxSenderError> {
+        crate::mailbox::headers::set_send_timestamp(&mut headers);
+        let serialized = wirevalue::Any::serialize(&message).map_err(|err| {
+            MailboxSenderError::new_bound(
+                self.port_addr.clone(),
+                MailboxSenderErrorKind::Serialize(err.into()),
+            )
+        })?;
+        cx.post(
+            self.port_addr.clone(),
+            headers,
+            serialized,
+            self.return_undeliverable,
+            context::SeqInfoPolicy::AssignNew,
+        );
+        Ok(())
+    }
+
+    /// Get whether or not messages sent to this port that are undeliverable should
+    /// be returned to the sender.
+    pub fn get_return_undeliverable(&self) -> bool {
+        self.return_undeliverable
+    }
+
+    /// Set whether or not messages sent to this port that are undeliverable
+    /// should be returned to the sender.
+    pub fn return_undeliverable(&mut self, return_undeliverable: bool) {
+        self.return_undeliverable = return_undeliverable;
+    }
+}
+
+impl<M: RemoteMessage> Clone for OncePortRef<M> {
+    fn clone(&self) -> Self {
+        Self {
+            port_addr: self.port_addr.clone(),
+            reducer_spec: self.reducer_spec.clone(),
+            return_undeliverable: self.return_undeliverable,
+            unsplit: self.unsplit,
+            phantom: PhantomData,
         }
     }
 }
 
-impl FromStr for PortRef {
-    type Err = RefParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let at = s.find('@').ok_or(RefParseError::MissingSeparator)?;
-        let id: PortId = s[..at].parse()?;
-        let location: Location = s[at + 1..]
-            .parse()
-            .map_err(RefParseError::InvalidLocation)?;
-        Ok(Self { id, location })
+impl<M: RemoteMessage> fmt::Display for OncePortRef<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.port_addr, f)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::hash::Hash;
-
-    use super::*;
-    use crate::id::Label;
-    use crate::id::Uid;
-    use crate::port::Port;
-
-    #[test]
-    fn test_location_display_fromstr_roundtrip() {
-        let loc: Location = ChannelAddr::Local(42).into();
-        let s = loc.to_string();
-        assert_eq!(s, "inproc://42");
-        let parsed: Location = s.parse().unwrap();
-        assert_eq!(loc, parsed);
+impl<M: RemoteMessage> Named for OncePortRef<M> {
+    fn typename() -> &'static str {
+        wirevalue::intern_typename!(Self, "hyperactor::mailbox::OncePortRef<{}>", M)
     }
+}
 
-    #[test]
-    fn test_location_tcp() {
-        let addr: ChannelAddr = "tcp:127.0.0.1:8080".parse().unwrap();
-        let loc = Location::from(addr.clone());
-        assert_eq!(loc.to_string(), "tcp://127.0.0.1:8080");
-        assert_eq!(loc.addr(), &addr);
+impl<M: RemoteMessage> From<&OncePortRef<M>> for UnboundPort {
+    fn from(port_ref: &OncePortRef<M>) -> Self {
+        UnboundPort(
+            port_ref.port_addr.clone(),
+            port_ref.reducer_spec.clone(),
+            true, // return_undeliverable
+            UnboundPortKind::Once,
+            port_ref.unsplit,
+        )
     }
+}
 
-    #[test]
-    fn test_location_debug_same_as_display() {
-        let loc: Location = ChannelAddr::Local(7).into();
-        assert_eq!(format!("{:?}", loc), format!("{}", loc));
+impl<M: RemoteMessage> Unbind for OncePortRef<M> {
+    fn unbind(&self, bindings: &mut Bindings) -> anyhow::Result<()> {
+        bindings.push_back(&UnboundPort::from(self))
     }
+}
 
-    #[test]
-    fn test_proc_ref_display() {
-        let pid = ProcId::new(
-            Uid::Instance(0xabc123),
-            Some(Label::new("my-proc").unwrap()),
-        );
-        let loc: Location = ChannelAddr::Local(42).into();
-        let pref = ProcRef::new(pid, loc);
-        assert_eq!(pref.to_string(), "0000000000abc123@inproc://42");
-    }
-
-    #[test]
-    fn test_proc_ref_debug_with_label() {
-        let pid = ProcId::new(
-            Uid::Instance(0xabc123),
-            Some(Label::new("my-proc").unwrap()),
-        );
-        let loc: Location = ChannelAddr::Local(42).into();
-        let pref = ProcRef::new(pid, loc);
-        assert_eq!(
-            format!("{:?}", pref),
-            "<'my-proc' 0000000000abc123@inproc://42>"
-        );
-    }
-
-    #[test]
-    fn test_proc_ref_debug_without_label() {
-        let pid = ProcId::new(Uid::Instance(0xabc123), None);
-        let loc: Location = ChannelAddr::Local(42).into();
-        let pref = ProcRef::new(pid, loc);
-        assert_eq!(format!("{:?}", pref), "<0000000000abc123@inproc://42>");
-    }
-
-    #[test]
-    fn test_proc_ref_fromstr_roundtrip() {
-        let pid = ProcId::new(
-            Uid::Instance(0xabc123),
-            Some(Label::new("my-proc").unwrap()),
-        );
-        let loc: Location = ChannelAddr::Local(42).into();
-        let pref = ProcRef::new(pid, loc);
-        let s = pref.to_string();
-        let parsed: ProcRef = s.parse().unwrap();
-        assert_eq!(pref, parsed);
-    }
-
-    #[test]
-    fn test_proc_ref_fromstr_tcp() {
-        let parsed: ProcRef = "0000000000abc123@tcp://127.0.0.1:8080".parse().unwrap();
-        assert_eq!(*parsed.id().uid(), Uid::Instance(0xabc123));
-        assert_eq!(
-            *parsed.location().addr(),
-            "tcp:127.0.0.1:8080".parse::<ChannelAddr>().unwrap()
-        );
-    }
-
-    #[test]
-    fn test_proc_ref_fromstr_missing_separator() {
-        let err = "0000000000abc123".parse::<ProcRef>().unwrap_err();
-        assert!(matches!(err, RefParseError::MissingSeparator));
-    }
-
-    #[test]
-    fn test_actor_ref_display() {
-        let aid = ActorId::new(
-            Uid::Instance(0xabc123),
-            ProcId::new(
-                Uid::Instance(0xdef456),
-                Some(Label::new("my-proc").unwrap()),
-            ),
-            Some(Label::new("my-actor").unwrap()),
-        );
-        let loc: Location = ChannelAddr::Local(42).into();
-        let aref = ActorRef::new(aid, loc);
-        assert_eq!(
-            aref.to_string(),
-            "0000000000abc123.0000000000def456@inproc://42"
-        );
-    }
-
-    #[test]
-    fn test_actor_ref_debug_all_labels() {
-        let aid = ActorId::new(
-            Uid::Instance(0xabc123),
-            ProcId::new(
-                Uid::Instance(0xdef456),
-                Some(Label::new("my-proc").unwrap()),
-            ),
-            Some(Label::new("my-actor").unwrap()),
-        );
-        let loc: Location = ChannelAddr::Local(42).into();
-        let aref = ActorRef::new(aid, loc);
-        assert_eq!(
-            format!("{:?}", aref),
-            "<'my-actor.my-proc' 0000000000abc123.0000000000def456@inproc://42>"
-        );
-    }
-
-    #[test]
-    fn test_actor_ref_debug_no_labels() {
-        let aid = ActorId::new(
-            Uid::Instance(0xabc123),
-            ProcId::new(Uid::Instance(0xdef456), None),
-            None,
-        );
-        let loc: Location = ChannelAddr::Local(42).into();
-        let aref = ActorRef::new(aid, loc);
-        assert_eq!(
-            format!("{:?}", aref),
-            "<0000000000abc123.0000000000def456@inproc://42>"
-        );
-    }
-
-    #[test]
-    fn test_actor_ref_debug_actor_label_only() {
-        let aid = ActorId::new(
-            Uid::Instance(0xabc123),
-            ProcId::new(Uid::Instance(0xdef456), None),
-            Some(Label::new("my-actor").unwrap()),
-        );
-        let loc: Location = ChannelAddr::Local(42).into();
-        let aref = ActorRef::new(aid, loc);
-        assert_eq!(
-            format!("{:?}", aref),
-            "<'my-actor' 0000000000abc123.0000000000def456@inproc://42>"
-        );
-    }
-
-    #[test]
-    fn test_actor_ref_debug_proc_label_only() {
-        let aid = ActorId::new(
-            Uid::Instance(0xabc123),
-            ProcId::new(
-                Uid::Instance(0xdef456),
-                Some(Label::new("my-proc").unwrap()),
-            ),
-            None,
-        );
-        let loc: Location = ChannelAddr::Local(42).into();
-        let aref = ActorRef::new(aid, loc);
-        assert_eq!(
-            format!("{:?}", aref),
-            "<'.my-proc' 0000000000abc123.0000000000def456@inproc://42>"
-        );
-    }
-
-    #[test]
-    fn test_actor_ref_fromstr_roundtrip() {
-        let aid = ActorId::new(
-            Uid::Instance(0xabc123),
-            ProcId::new(
-                Uid::Instance(0xdef456),
-                Some(Label::new("my-proc").unwrap()),
-            ),
-            Some(Label::new("my-actor").unwrap()),
-        );
-        let loc: Location = ChannelAddr::Local(42).into();
-        let aref = ActorRef::new(aid, loc);
-        let s = aref.to_string();
-        let parsed: ActorRef = s.parse().unwrap();
-        assert_eq!(aref, parsed);
-    }
-
-    #[test]
-    fn test_actor_ref_fromstr_missing_separator() {
-        let err = "0000000000abc123.0000000000def456"
-            .parse::<ActorRef>()
-            .unwrap_err();
-        assert!(matches!(err, RefParseError::MissingSeparator));
-    }
-
-    #[test]
-    fn test_proc_ref_eq_and_hash() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::Hasher;
-
-        let pid = ProcId::new(Uid::Instance(0x42), Some(Label::new("proc").unwrap()));
-        let loc: Location = ChannelAddr::Local(1).into();
-        let a = ProcRef::new(pid.clone(), loc.clone());
-        let b = ProcRef::new(pid, loc);
-        assert_eq!(a, b);
-
-        let hash = |r: &ProcRef| {
-            let mut h = DefaultHasher::new();
-            r.hash(&mut h);
-            h.finish()
-        };
-        assert_eq!(hash(&a), hash(&b));
-    }
-
-    #[test]
-    fn test_proc_ref_neq_different_location() {
-        let pid = ProcId::new(Uid::Instance(0x42), Some(Label::new("proc").unwrap()));
-        let a = ProcRef::new(pid.clone(), ChannelAddr::Local(1).into());
-        let b = ProcRef::new(pid, ChannelAddr::Local(2).into());
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn test_actor_ref_eq_and_hash() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::Hasher;
-
-        let aid = ActorId::new(
-            Uid::Instance(0x42),
-            ProcId::new(Uid::Instance(0x99), Some(Label::new("proc").unwrap())),
-            Some(Label::new("actor").unwrap()),
-        );
-        let loc: Location = ChannelAddr::Local(1).into();
-        let a = ActorRef::new(aid.clone(), loc.clone());
-        let b = ActorRef::new(aid, loc);
-        assert_eq!(a, b);
-
-        let hash = |r: &ActorRef| {
-            let mut h = DefaultHasher::new();
-            r.hash(&mut h);
-            h.finish()
-        };
-        assert_eq!(hash(&a), hash(&b));
-    }
-
-    #[test]
-    fn test_proc_ref_singleton() {
-        let pid = ProcId::new(
-            Uid::singleton(Label::new("my-proc").unwrap()),
-            Some(Label::new("my-proc").unwrap()),
-        );
-        let loc: Location = ChannelAddr::Local(0).into();
-        let pref = ProcRef::new(pid, loc);
-        let s = pref.to_string();
-        assert_eq!(s, "_my-proc@inproc://0");
-        let parsed: ProcRef = s.parse().unwrap();
-        assert_eq!(pref, parsed);
-    }
-
-    #[test]
-    fn test_location_serde_roundtrip() {
-        let loc: Location = ChannelAddr::Local(42).into();
-        let json = serde_json::to_string(&loc).unwrap();
-        let parsed: Location = serde_json::from_str(&json).unwrap();
-        assert_eq!(loc, parsed);
-    }
-
-    #[test]
-    fn test_proc_ref_serde_roundtrip() {
-        let pid = ProcId::new(
-            Uid::Instance(0xabcdef),
-            Some(Label::new("my-proc").unwrap()),
-        );
-        let loc: Location = ChannelAddr::Local(42).into();
-        let pref = ProcRef::new(pid, loc);
-        let json = serde_json::to_string(&pref).unwrap();
-        let parsed: ProcRef = serde_json::from_str(&json).unwrap();
-        assert_eq!(pref, parsed);
-    }
-
-    #[test]
-    fn test_actor_ref_serde_roundtrip() {
-        let aid = ActorId::new(
-            Uid::Instance(0xabcdef),
-            ProcId::new(
-                Uid::Instance(0x123456),
-                Some(Label::new("my-proc").unwrap()),
-            ),
-            Some(Label::new("my-actor").unwrap()),
-        );
-        let loc: Location = ChannelAddr::Local(42).into();
-        let aref = ActorRef::new(aid, loc);
-        let json = serde_json::to_string(&aref).unwrap();
-        let parsed: ActorRef = serde_json::from_str(&json).unwrap();
-        assert_eq!(aref, parsed);
-    }
-
-    #[test]
-    fn test_proc_ref_with_metatls_location() {
-        use crate::channel::TlsAddr;
-
-        let pid = ProcId::new(Uid::Instance(0x42), None);
-        let loc: Location = ChannelAddr::MetaTls(TlsAddr::new("example.com", 443)).into();
-        let pref = ProcRef::new(pid, loc);
-        let s = pref.to_string();
-        assert_eq!(s, "0000000000000042@metatls://example.com:443");
-        let parsed: ProcRef = s.parse().unwrap();
-        assert_eq!(pref, parsed);
-    }
-
-    #[test]
-    fn test_port_ref_construction_and_accessors() {
-        let aid = ActorId::new(
-            Uid::Instance(0xabc123),
-            ProcId::new(
-                Uid::Instance(0xdef456),
-                Some(Label::new("my-proc").unwrap()),
-            ),
-            Some(Label::new("my-actor").unwrap()),
-        );
-        let port_id = PortId::new(aid.clone(), Port::from(42));
-        let loc: Location = ChannelAddr::Local(7).into();
-        let pref = PortRef::new(port_id.clone(), loc.clone());
-        assert_eq!(pref.id(), &port_id);
-        assert_eq!(pref.location(), &loc);
-        assert_eq!(pref.actor_id(), &aid);
-    }
-
-    #[test]
-    fn test_port_ref_display() {
-        let aid = ActorId::new(
-            Uid::Instance(0xabc123),
-            ProcId::new(
-                Uid::Instance(0xdef456),
-                Some(Label::new("my-proc").unwrap()),
-            ),
-            Some(Label::new("my-actor").unwrap()),
-        );
-        let port_id = PortId::new(aid, Port::from(42));
-        let loc: Location = ChannelAddr::Local(7).into();
-        let pref = PortRef::new(port_id, loc);
-        assert_eq!(
-            pref.to_string(),
-            "0000000000abc123.0000000000def456:42@inproc://7"
-        );
-    }
-
-    #[test]
-    fn test_port_ref_debug_all_labels() {
-        let aid = ActorId::new(
-            Uid::Instance(0xabc123),
-            ProcId::new(
-                Uid::Instance(0xdef456),
-                Some(Label::new("my-proc").unwrap()),
-            ),
-            Some(Label::new("my-actor").unwrap()),
-        );
-        let port_id = PortId::new(aid, Port::from(42));
-        let loc: Location = ChannelAddr::Local(7).into();
-        let pref = PortRef::new(port_id, loc);
-        assert_eq!(
-            format!("{:?}", pref),
-            "<'my-actor.my-proc' 0000000000abc123.0000000000def456:42@inproc://7>"
-        );
-    }
-
-    #[test]
-    fn test_port_ref_debug_no_labels() {
-        let aid = ActorId::new(
-            Uid::Instance(0xabc123),
-            ProcId::new(Uid::Instance(0xdef456), None),
-            None,
-        );
-        let port_id = PortId::new(aid, Port::from(42));
-        let loc: Location = ChannelAddr::Local(7).into();
-        let pref = PortRef::new(port_id, loc);
-        assert_eq!(
-            format!("{:?}", pref),
-            "<0000000000abc123.0000000000def456:42@inproc://7>"
-        );
-    }
-
-    #[test]
-    fn test_port_ref_debug_actor_label_only() {
-        let aid = ActorId::new(
-            Uid::Instance(0xabc123),
-            ProcId::new(Uid::Instance(0xdef456), None),
-            Some(Label::new("my-actor").unwrap()),
-        );
-        let port_id = PortId::new(aid, Port::from(42));
-        let loc: Location = ChannelAddr::Local(7).into();
-        let pref = PortRef::new(port_id, loc);
-        assert_eq!(
-            format!("{:?}", pref),
-            "<'my-actor' 0000000000abc123.0000000000def456:42@inproc://7>"
-        );
-    }
-
-    #[test]
-    fn test_port_ref_debug_proc_label_only() {
-        let aid = ActorId::new(
-            Uid::Instance(0xabc123),
-            ProcId::new(
-                Uid::Instance(0xdef456),
-                Some(Label::new("my-proc").unwrap()),
-            ),
-            None,
-        );
-        let port_id = PortId::new(aid, Port::from(42));
-        let loc: Location = ChannelAddr::Local(7).into();
-        let pref = PortRef::new(port_id, loc);
-        assert_eq!(
-            format!("{:?}", pref),
-            "<'.my-proc' 0000000000abc123.0000000000def456:42@inproc://7>"
-        );
-    }
-
-    #[test]
-    fn test_port_ref_fromstr_roundtrip() {
-        let aid = ActorId::new(
-            Uid::Instance(0xabc123),
-            ProcId::new(
-                Uid::Instance(0xdef456),
-                Some(Label::new("my-proc").unwrap()),
-            ),
-            Some(Label::new("my-actor").unwrap()),
-        );
-        let port_id = PortId::new(aid, Port::from(42));
-        let loc: Location = ChannelAddr::Local(7).into();
-        let pref = PortRef::new(port_id, loc);
-        let s = pref.to_string();
-        let parsed: PortRef = s.parse().unwrap();
-        assert_eq!(pref, parsed);
-    }
-
-    #[test]
-    fn test_port_ref_fromstr_missing_separator() {
-        let err = "0000000000abc123.0000000000def456:42"
-            .parse::<PortRef>()
-            .unwrap_err();
-        assert!(matches!(err, RefParseError::MissingSeparator));
-    }
-
-    #[test]
-    fn test_port_ref_eq_and_hash() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::Hasher;
-
-        let aid = ActorId::new(
-            Uid::Instance(0x42),
-            ProcId::new(Uid::Instance(0x99), Some(Label::new("proc").unwrap())),
-            Some(Label::new("actor").unwrap()),
-        );
-        let port_id = PortId::new(aid, Port::from(10));
-        let loc: Location = ChannelAddr::Local(1).into();
-        let a = PortRef::new(port_id.clone(), loc.clone());
-        let b = PortRef::new(port_id, loc);
-        assert_eq!(a, b);
-
-        let hash = |r: &PortRef| {
-            let mut h = DefaultHasher::new();
-            r.hash(&mut h);
-            h.finish()
-        };
-        assert_eq!(hash(&a), hash(&b));
-    }
-
-    #[test]
-    fn test_port_ref_neq_different_location() {
-        let aid = ActorId::new(
-            Uid::Instance(0x42),
-            ProcId::new(Uid::Instance(0x99), Some(Label::new("proc").unwrap())),
-            Some(Label::new("actor").unwrap()),
-        );
-        let port_id = PortId::new(aid, Port::from(10));
-        let a = PortRef::new(port_id.clone(), ChannelAddr::Local(1).into());
-        let b = PortRef::new(port_id, ChannelAddr::Local(2).into());
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn test_port_ref_serde_roundtrip() {
-        let aid = ActorId::new(
-            Uid::Instance(0xabcdef),
-            ProcId::new(
-                Uid::Instance(0x123456),
-                Some(Label::new("my-proc").unwrap()),
-            ),
-            Some(Label::new("my-actor").unwrap()),
-        );
-        let port_id = PortId::new(aid, Port::from(42));
-        let loc: Location = ChannelAddr::Local(7).into();
-        let pref = PortRef::new(port_id, loc);
-        let json = serde_json::to_string(&pref).unwrap();
-        let parsed: PortRef = serde_json::from_str(&json).unwrap();
-        assert_eq!(pref, parsed);
+impl<M: RemoteMessage> Bind for OncePortRef<M> {
+    fn bind(&mut self, bindings: &mut Bindings) -> anyhow::Result<()> {
+        let UnboundPort(port_addr, reducer_spec, _return_undeliverable, port_kind, unsplit) =
+            bindings.try_pop_front::<UnboundPort>()?;
+        match port_kind {
+            UnboundPortKind::Once => {
+                self.port_addr = port_addr;
+                self.reducer_spec = reducer_spec;
+                self.unsplit = unsplit;
+                Ok(())
+            }
+            UnboundPortKind::Streaming(_) => {
+                anyhow::bail!("PortRef cannot be bound to OncePortRef")
+            }
+        }
     }
 }

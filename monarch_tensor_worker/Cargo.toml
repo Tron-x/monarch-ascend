@@ -26,7 +26,7 @@ serde = { version = "1.0.219", features = ["derive", "rc"] }
 sorted-vec = "0.8.10"
 tokio = { version = "1.52.1", features = ["full", "test-util", "tracing"] }
 torch-sys-ascend = { version = "0.0.0", path = "../torch-sys-ascend", optional = true }
-torch-sys-cuda = { version = "0.0.0", path = "../torch-sys-cuda", optional = true }
+torch-sys-cuda = { version = "0.0.0", path = "../torch-sys-cuda", optional = true, default-features = false }
 torch-sys2 = { version = "0.0.0", path = "../torch-sys2" }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
@@ -41,6 +41,12 @@ timed_test = { version = "0.0.0", path = "../timed_test" }
 build_utils = { path = "../build_utils" }
 
 [features]
-default = ["cuda_backend"]
-cuda_backend = ["dep:torch-sys-cuda", "monarch_messages/cuda_backend"]
+default = []
+cuda = ["dep:torch-sys-cuda", "monarch_messages/cuda", "torch-sys-cuda/cuda"]
+# Legacy alias retained while ascend_engine downstream features still
+# reference the pre-rename name "monarch_tensor_worker/cuda_backend".
+cuda_backend = ["cuda"]
 ascend_backend = ["dep:torch-sys-ascend", "monarch_messages/ascend_backend"]
+
+[lints]
+rust = { unexpected_cfgs = { check-cfg = ["cfg(fbcode_build)"], level = "warn" } }

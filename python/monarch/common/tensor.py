@@ -676,6 +676,8 @@ class InputChecker:
                 self.errors[t].append(explain["REQUIRES_GRAD"])
 
     def check_cuda(self):
+        if not torch.cuda.is_available():
+            return
         for t in self.tensors:
             if not (t.is_cuda or getattr(t, "is_npu", False)):
                 self.errors[t].append(explain["CROSS_DEVICE_REQUIRES_CUDA"])

@@ -19,7 +19,7 @@ serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_bytes = "0.11"
 thiserror = "2.0.18"
 torch-sys-ascend = { version = "0.0.0", path = "../torch-sys-ascend", optional = true }
-torch-sys-cuda = { version = "0.0.0", path = "../torch-sys-cuda", optional = true }
+torch-sys-cuda = { version = "0.0.0", path = "../torch-sys-cuda", optional = true, default-features = false }
 torch-sys2 = { version = "0.0.0", path = "../torch-sys2" }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 typeuri = { version = "0.0.0", path = "../typeuri" }
@@ -29,5 +29,10 @@ wirevalue = { version = "0.0.0", path = "../wirevalue" }
 build_utils = { path = "../build_utils" }
 
 [features]
-cuda_backend = ["dep:torch-sys-cuda"]
+cuda = ["dep:torch-sys-cuda"]
 ascend_backend = ["dep:torch-sys-ascend"]
+default = []
+# Legacy alias retained so that downstream features that say
+# "monarch_messages/cuda_backend" keep resolving across the upstream
+# rename (cuda_backend -> cuda) until ascend_engine is fully migrated.
+cuda_backend = ["cuda"]

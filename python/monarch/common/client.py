@@ -56,6 +56,22 @@ logger = logging.getLogger(__name__)
 _CONTROLLER_STATUS_INTERVAL = 2
 
 
+def _npu_available() -> bool:
+    """Return True if Ascend NPUs are visible to torch via ``torch_npu``.
+
+    NPU support arrives via the ``torch_npu`` extension which monkey-patches a
+    ``torch.npu`` namespace.  We need this check separately from
+    ``torch.cuda.is_available()`` so that the tensor-engine collective
+    bootstrap (``BackendNetworkInit``, ``SplitComm``, ...) is correctly issued
+    on NPU-only hosts where CUDA is absent.
+    """
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return False
+    return bool(getattr(torch, "npu", None)) and torch.npu.is_available()
+
+
 def TTL(timeout: Optional[float]) -> Callable[[], float]:
     if timeout is None:
         return lambda: math.inf
@@ -84,7 +100,14 @@ class Client:
 
         # stream._active = Stream("main2", _default=True)
 
-        self._backend_network_init = False
+        # Collective-bootstrap messages (BackendNetworkInit, SplitComm, etc.)
+        # are only useful when workers have an accelerator with a real
+        # collective backend (NCCL on CUDA, HCCL on NPU).  On pure CPU builds
+        # we short-circuit these sends so the actor-only path still functions.
+        self._has_accelerator: bool = torch.cuda.is_available() or _npu_available()
+        # Kept under the historical name `_has_cuda` for downstream callers.
+        self._has_cuda: bool = self._has_accelerator
+        self._backend_network_init = not self._has_accelerator
         self._backend_network_init_point_to_point: Set[
             Tuple["StreamRef", "StreamRef"]
         ] = set()
@@ -353,6 +376,8 @@ class Client:
         """Create a split communicator group with the specified ranks, and
         associate it with a specific device mesh and stream.
         """
+        if not self._has_cuda:
+            return
         # For simplicity, just send this message to all ranks and split from the
         # global communicator. As an optimization, the client could remember
         # which comms have already been created and issue a message to a smaller
@@ -379,6 +404,8 @@ class Client:
     def backend_network_point_to_point_init(
         self, from_stream_ref: "StreamRef", to_stream_ref: "StreamRef"
     ) -> None:
+        if not self._has_cuda:
+            return
         key = (from_stream_ref, to_stream_ref)
 
         if key in self._backend_network_init_point_to_point:

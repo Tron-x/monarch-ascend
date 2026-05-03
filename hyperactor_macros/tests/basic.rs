@@ -14,6 +14,7 @@ use std::fmt::Debug;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use hyperactor as reference;
 use hyperactor::Actor;
 use hyperactor::Context;
 use hyperactor::HandleClient;
@@ -22,7 +23,6 @@ use hyperactor::RefClient;
 use hyperactor::handle;
 use hyperactor::instrument;
 use hyperactor::instrument_infallible;
-use hyperactor::reference;
 use serde::Deserialize;
 use serde::Serialize;
 use typeuri::Named;
@@ -196,7 +196,7 @@ mod tests {
     fn test_uid_macro_singleton() {
         let id = uid!(_my - singleton);
         assert_eq!(id, Uid::Singleton(Label::new("my-singleton").unwrap()));
-        assert_eq!(id.to_string(), "_my-singleton");
+        assert_eq!(id.to_string(), "my-singleton");
     }
 
     #[test]

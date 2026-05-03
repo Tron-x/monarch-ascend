@@ -113,7 +113,7 @@ mod tests {
     //! "with mesh name" and "without mesh name" rendered output is
     //! locked down and any regression surfaces here.
     //!
-    //! The `assert_eq!` literals capture the `ActorId::Display`
+    //! The `assert_eq!` literals capture the `ActorAddr::Display`
     //! output of the checkout the tests were generated against. If
     //! the identifier encoding changes (e.g. a reference-stack
     //! refactor lands in the same tree), the literals need to be
@@ -123,14 +123,13 @@ mod tests {
     use hyperactor::actor::ActorErrorKind;
     use hyperactor::actor::ActorStatus;
     use hyperactor::channel::ChannelAddr;
-    use hyperactor::reference;
 
     use super::*;
 
     fn test_event(name: &str, display_name: Option<String>) -> ActorSupervisionEvent {
-        let proc_id = reference::ProcId::with_name(ChannelAddr::Local(0), "test_proc");
+        let proc_id = hyperactor::ProcAddr::from_resource_name(ChannelAddr::Local(0), "test_proc");
         ActorSupervisionEvent::new(
-            proc_id.actor_id(name, 0),
+            proc_id.actor_id(name),
             display_name,
             ActorStatus::Failed(ActorErrorKind::Generic("boom".to_string())),
             None,
@@ -201,9 +200,10 @@ mod tests {
     // (`hyperactor_mesh/src/global_context.rs:278`): display_name =
     // None, actor_status = generic_failure("message not delivered: ...").
     fn undeliverable_synthesized_event() -> ActorSupervisionEvent {
-        let proc_id = reference::ProcId::with_name(ChannelAddr::Local(0), "worker_proc");
+        let proc_id =
+            hyperactor::ProcAddr::from_resource_name(ChannelAddr::Local(0), "worker_proc");
         ActorSupervisionEvent::new(
-            proc_id.actor_id("dead_actor", 0),
+            proc_id.actor_id("dead_actor"),
             None, // synthesized site has no PythonActor context; display_name stays None
             ActorStatus::generic_failure(
                 "message not delivered: undeliverable message error: ... \
@@ -239,13 +239,13 @@ mod tests {
             crashed_ranks: vec![],
         };
         let expected_without = "failure with event: Supervision event: \
-                                actor local:0,worker_proc,dead_actor[0] failed:\n  \
+                                actor worker_proc@inproc://0,dead_actor failed:\n  \
                                 message not delivered: undeliverable message error: \
                                 ... error: broken link: message returned to global \
                                 root client";
         let expected_with = "failure on mesh \"training\" with event: \
                              Supervision event: actor \
-                             local:0,worker_proc,dead_actor[0] failed:\n  \
+                             worker_proc@inproc://0,dead_actor failed:\n  \
                              message not delivered: undeliverable message error: \
                              ... error: broken link: message returned to global \
                              root client";
@@ -255,7 +255,7 @@ mod tests {
         // Note: the inner event here has `display_name = None` (the
         // synthesis site at `global_context.rs` has no PythonActor
         // context to populate it), so the inner actor mention
-        // renders via raw `ActorId` text. That is a separate concern
+        // renders via raw `ActorAddr` text. That is a separate concern
         // from mesh-name plumbing.
     }
 
@@ -276,9 +276,10 @@ mod tests {
     #[test]
     fn proof_direct_actor_handled_panic() {
         let panicked_event = {
-            let proc_id = reference::ProcId::with_name(ChannelAddr::Local(0), "worker_proc");
+            let proc_id =
+                hyperactor::ProcAddr::from_resource_name(ChannelAddr::Local(0), "worker_proc");
             ActorSupervisionEvent::new(
-                proc_id.actor_id("philosopher_1", 0),
+                proc_id.actor_id("philosopher_1"),
                 // `Proc::stop_actor` populates this via
                 // `actor.display_name()` on a PythonActor — which
                 // returns the Python-class-bearing `str(PyInstance)`.
@@ -324,9 +325,10 @@ mod tests {
     #[test]
     fn proof_controller_unreachable() {
         let controller_timeout_event = {
-            let proc_id = reference::ProcId::with_name(ChannelAddr::Local(0), "controller_proc");
+            let proc_id =
+                hyperactor::ProcAddr::from_resource_name(ChannelAddr::Local(0), "controller_proc");
             ActorSupervisionEvent::new(
-                proc_id.actor_id("training_controller", 0),
+                proc_id.actor_id("training_controller"),
                 None,
                 ActorStatus::generic_failure(
                     "timed out reaching controller ... Assuming controller's proc is dead"
@@ -342,7 +344,7 @@ mod tests {
         };
         let expected = "failure on mesh \"training\" with event: \
                         Supervision event: actor \
-                        local:0,controller_proc,training_controller[0] \
+                        controller_proc@inproc://0,training_controller \
                         failed:\n  \
                         timed out reaching controller ... Assuming \
                         controller's proc is dead";

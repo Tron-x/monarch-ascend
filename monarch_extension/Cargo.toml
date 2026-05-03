@@ -31,6 +31,7 @@ monarch_introspection_snapshot = { version = "0.0.0", path = "../monarch_introsp
 monarch_messages = { version = "0.0.0", path = "../monarch_messages", default-features = false, optional = true }
 monarch_rdma_extension = { version = "0.0.0", path = "../monarch_rdma/extension", default-features = false, optional = true }
 monarch_tensor_worker = { version = "0.0.0", path = "../monarch_tensor_worker", default-features = false, optional = true }
+monarch_types = { version = "0.0.0", path = "../monarch_types" }
 hccl-sys = { path = "../hccl-sys", optional = true }
 nccl-sys = { path = "../nccl-sys", optional = true }
 ndslice = { version = "0.0.0", path = "../ndslice" }

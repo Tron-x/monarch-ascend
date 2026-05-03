@@ -27,6 +27,7 @@ use enum_as_inner::EnumAsInner;
 use hyperactor::Bind;
 use hyperactor::HandleClient;
 use hyperactor::Handler;
+use hyperactor::PortRef;
 use hyperactor::RefClient;
 use hyperactor::RemoteMessage;
 use hyperactor::Unbind;
@@ -34,7 +35,6 @@ use hyperactor::mailbox::PortReceiver;
 use hyperactor::message::Bind;
 use hyperactor::message::Bindings;
 use hyperactor::message::Unbind;
-use hyperactor::reference as hyperactor_reference;
 use hyperactor_config::attrs::Attrs;
 use ndslice::Region;
 use ndslice::ViewExt;
@@ -42,12 +42,12 @@ use serde::Deserialize;
 use serde::Serialize;
 use typeuri::Named;
 
-use crate::Name;
 use crate::StatusOverlay;
 use crate::bootstrap;
 use crate::bootstrap::BootstrapCommand;
 use crate::bootstrap::ProcBind;
 use crate::host_mesh::host_agent::ProcState;
+use crate::mesh_id::ResourceId;
 use crate::proc_agent::ActorSpec;
 use crate::proc_agent::ActorState;
 
@@ -147,11 +147,11 @@ impl From<bootstrap::ProcStatus> for Status {
     }
 }
 
-impl From<hyperactor::host::LocalProcStatus> for Status {
-    fn from(status: hyperactor::host::LocalProcStatus) -> Self {
+impl From<crate::host::LocalProcStatus> for Status {
+    fn from(status: crate::host::LocalProcStatus) -> Self {
         match status {
-            hyperactor::host::LocalProcStatus::Stopping => Status::Stopping,
-            hyperactor::host::LocalProcStatus::Stopped => Status::Stopped,
+            crate::host::LocalProcStatus::Stopping => Status::Stopping,
+            crate::host::LocalProcStatus::Stopped => Status::Stopped,
         }
     }
 }
@@ -208,11 +208,11 @@ impl Bind for Rank {
     Unbind
 )]
 pub struct GetRankStatus {
-    /// The name of the resource.
-    pub name: Name,
+    /// The resource identifier.
+    pub id: ResourceId,
     /// Sparse status updates (overlays) from a rank.
     #[binding(include)]
-    pub reply: hyperactor_reference::PortRef<StatusOverlay>,
+    pub reply: PortRef<StatusOverlay>,
 }
 
 /// Like [`GetRankStatus`], but the handler defers its reply until the
@@ -231,15 +231,15 @@ pub struct GetRankStatus {
     Unbind
 )]
 pub struct WaitRankStatus {
-    /// The name of the resource.
-    pub name: Name,
+    /// The resource identifier.
+    pub id: ResourceId,
     /// The minimum status the caller wants to observe.
     /// The handler will not reply until the resource's status
     /// is >= this threshold.
     pub min_status: Status,
     /// Sparse status updates (overlays) from a rank.
     #[binding(include)]
-    pub reply: hyperactor_reference::PortRef<StatusOverlay>,
+    pub reply: PortRef<StatusOverlay>,
 }
 
 impl GetRankStatus {
@@ -300,8 +300,8 @@ impl GetRankStatus {
     Unbind
 )]
 pub struct State<S> {
-    /// The name of the resource.
-    pub name: Name,
+    /// The resource identifier.
+    pub id: ResourceId,
     /// Its status.
     pub status: Status,
     /// Optionally, a resource-defined state.
@@ -337,8 +337,8 @@ impl<S: Serialize> fmt::Display for State<S> {
     Unbind
 )]
 pub struct CreateOrUpdate<S> {
-    /// The name of the resource to create or update.
-    pub name: Name,
+    /// The resource identifier.
+    pub id: ResourceId,
     /// The rank of the resource, when available.
     #[binding(include)]
     pub rank: Rank,
@@ -362,8 +362,8 @@ wirevalue::register_type!(CreateOrUpdate<ActorSpec>);
     Unbind
 )]
 pub struct Stop {
-    /// The name of the resource to stop.
-    pub name: Name,
+    /// The resource identifier.
+    pub id: ResourceId,
     /// The reason for stopping the resource.
     pub reason: String,
 }
@@ -393,11 +393,11 @@ wirevalue::register_type!(StopAll);
 /// Retrieve the current state of the resource.
 #[derive(Debug, Serialize, Deserialize, Named, Handler, HandleClient, RefClient)]
 pub struct GetState<S> {
-    /// The name of the resource.
-    pub name: Name,
+    /// The resource identifier.
+    pub id: ResourceId,
     /// A reply containing the state.
     #[reply]
-    pub reply: hyperactor_reference::PortRef<State<S>>,
+    pub reply: PortRef<State<S>>,
 }
 wirevalue::register_type!(GetState<ProcState>);
 wirevalue::register_type!(GetState<ActorState>);
@@ -429,7 +429,7 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            name: self.name.clone(),
+            id: self.id.clone(),
             reply: self.reply.clone(),
         }
     }
@@ -485,10 +485,10 @@ where
 /// state changes. The current state is sent immediately upon subscription.
 #[derive(Debug, Serialize, Deserialize, Named, Handler, HandleClient, RefClient)]
 pub struct StreamState<S> {
-    /// The name of the resource to subscribe to.
-    pub name: Name,
+    /// The resource identifier.
+    pub id: ResourceId,
     /// A streaming port that will receive state updates.
-    pub subscriber: hyperactor_reference::PortRef<State<S>>,
+    pub subscriber: PortRef<State<S>>,
 }
 wirevalue::register_type!(StreamState<ActorState>);
 
@@ -519,7 +519,7 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            name: self.name.clone(),
+            id: self.id.clone(),
             subscriber: self.subscriber.clone(),
         }
     }
@@ -530,7 +530,7 @@ where
 pub struct List {
     /// List of resource names managed by this controller.
     #[reply]
-    pub reply: hyperactor_reference::PortRef<Vec<Name>>,
+    pub reply: PortRef<Vec<ResourceId>>,
 }
 wirevalue::register_type!(List);
 
@@ -808,10 +808,10 @@ pub(crate) struct ProcSpec {
     /// Optional bootstrap command override. When set, this command is used
     /// to spawn the proc instead of the host agent's default bootstrap command.
     pub(crate) bootstrap_command: Option<BootstrapCommand>,
-    /// The name of the HostMesh that owns this proc. Used by
+    /// The id of the HostMesh that owns this proc. Used by
     /// `DrainHost` to selectively drain only procs belonging to a
     /// specific mesh.
-    pub(crate) host_mesh_name: Option<crate::Name>,
+    pub(crate) host_mesh_id: Option<crate::mesh_id::HostMeshId>,
 }
 wirevalue::register_type!(ProcSpec);
 

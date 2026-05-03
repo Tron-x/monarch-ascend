@@ -6,10 +6,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use hyperactor as reference;
 use hyperactor::channel::ChannelAddr;
-use hyperactor::host::SERVICE_PROC_NAME;
-use hyperactor::reference;
 use hyperactor_mesh::context;
+use hyperactor_mesh::host::SERVICE_PROC_NAME;
 use hyperactor_mesh::host_mesh::host_agent::HOST_MESH_AGENT_ACTOR_NAME;
 use hyperactor_mesh::host_mesh::host_agent::HostAgent;
 use hyperactor_mesh::resource::ListClient;
@@ -37,8 +37,9 @@ impl ListCommand {
 
         // Codify obtaining a proc's agent in `hyperactor_mesh` somewhere.
         let agent: reference::ActorRef<HostAgent> = reference::ActorRef::attest(
-            reference::ProcId::with_name(host, SERVICE_PROC_NAME)
-                .actor_id(HOST_MESH_AGENT_ACTOR_NAME, 0),
+            reference::ProcAddr::from_resource_name(host, SERVICE_PROC_NAME)
+                .actor_id(HOST_MESH_AGENT_ACTOR_NAME)
+                .into(),
         );
 
         let resources = agent.list(&client).await?;

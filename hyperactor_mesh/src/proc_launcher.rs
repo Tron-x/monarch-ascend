@@ -46,8 +46,8 @@ use std::fmt;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use hyperactor as hyperactor_reference;
 use hyperactor::channel::ChannelAddr;
-use hyperactor::reference as hyperactor_reference;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::process::ChildStderr;
@@ -277,13 +277,16 @@ pub struct LaunchOptions {
 /// include a friendly identifier in logs, crash reports, etc.
 ///
 /// Format:
-/// - `ProcId(_, name)` → `<name> @ <host_process_name>`
+/// - `ProcAddr(_, name)` → `<name> @ <host_process_name>`
 ///
 /// The host identity is taken from the current process's
 /// `HYPERACTOR_PROCESS_NAME`, falling back to the machine hostname.
 /// This groups procs under their host process in traces and logs.
-pub fn format_process_name(proc_id: &hyperactor_reference::ProcId) -> String {
-    let who = proc_id.name();
+pub fn format_process_name(proc_id: &hyperactor::ProcAddr) -> String {
+    let who = proc_id
+        .label()
+        .map(|l| l.as_str().to_string())
+        .unwrap_or_else(|| proc_id.id().to_string());
 
     let host = std::env::var(bootstrap::PROCESS_NAME_ENV).unwrap_or_else(|_| {
         hostname::get()
@@ -340,7 +343,7 @@ pub trait ProcLauncher: Send + Sync + 'static {
     /// (pipes vs inherit, log streaming, etc.).
     async fn launch(
         &self,
-        proc_id: &hyperactor_reference::ProcId,
+        proc_id: &hyperactor::ProcAddr,
         opts: LaunchOptions,
     ) -> Result<LaunchResult, ProcLauncherError>;
 
@@ -358,7 +361,7 @@ pub trait ProcLauncher: Send + Sync + 'static {
     /// (agent-first) termination cannot be applied or fails.
     async fn terminate(
         &self,
-        proc_id: &hyperactor_reference::ProcId,
+        proc_id: &hyperactor::ProcAddr,
         timeout: Duration,
     ) -> Result<(), ProcLauncherError>;
 
@@ -384,5 +387,5 @@ pub trait ProcLauncher: Send + Sync + 'static {
     /// Idempotent behavior is preferred: killing an already-dead proc
     /// should not be treated as an error unless the backend cannot
     /// determine state.
-    async fn kill(&self, proc_id: &hyperactor_reference::ProcId) -> Result<(), ProcLauncherError>;
+    async fn kill(&self, proc_id: &hyperactor::ProcAddr) -> Result<(), ProcLauncherError>;
 }

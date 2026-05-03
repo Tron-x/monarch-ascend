@@ -8,8 +8,26 @@
 
 //! Universal identifier types for the actor system.
 //!
-//! [`Label`] is an RFC 1035 label: up to 63 lowercase alphanumeric characters
-//! plus hyphens, starting with a letter and ending with an alphanumeric.
+//! Concrete grammar:
+//!
+//! ```text
+//! label        := lowercase letter, then lowercase letters, digits, `-`, or `_`,
+//!                 ending in a lowercase letter or digit
+//! uid58        := base58(u64) using the Flickr alphabet
+//! uid          := label | "<" uid58 ">"
+//! proc-id      := label | "<" uid58 ">" | label "<" uid58 ">"
+//! actor-id     := actor-part "." proc-id
+//! actor-part   := label | "<" uid58 ">" | label "<" uid58 ">"
+//! port-id      := actor-id ":" decimal-port
+//! ```
+//!
+//! Singletons are self-documenting and therefore display as bare labels.
+//! Non-singleton ids display their semantic label, if any, outside the uid:
+//! `label<uid58>`. Unlabeled instances display as `<uid58>`.
+//!
+//! [`Label`] is an RFC 1035-style label: up to 63 lowercase alphanumeric
+//! characters plus `-` or `_`, starting with a letter and ending with an
+//! alphanumeric.
 //!
 //! [`Uid`] is either a singleton (identified by label) or an instance
 //! (identified by a random `u64`).
@@ -24,12 +42,20 @@ use serde::Deserialize;
 use serde::Serialize;
 use smol_str::SmolStr;
 
+use crate::parse::id::ActorIdParts;
+use crate::parse::id::IdComponent;
+use crate::parse::id::PortIdParts;
+use crate::parse::id::ProcIdParts;
 use crate::port::Port;
 
 /// Maximum length of an RFC 1035 label.
 const MAX_LABEL_LEN: usize = 63;
 
-/// An RFC 1035 label: 1–63 chars, lowercase ASCII alphanumeric plus `-`,
+/// Flickr base58 alphabet.
+const BASE58_FLICKR: &[u8; 58] = b"123456789abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ";
+
+/// An RFC 1035-style label: 1–63 chars, lowercase ASCII alphanumeric plus `-`
+/// or `_`,
 /// starting with a letter, ending with an alphanumeric character.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Label(SmolStr);
@@ -49,7 +75,8 @@ pub enum LabelError {
     /// The last character is not alphanumeric.
     #[error("label must end with a lowercase letter or digit")]
     InvalidEnd,
-    /// The input contains a character that is not lowercase alphanumeric or `-`.
+    /// The input contains a character that is not lowercase alphanumeric, `-`,
+    /// or `_`.
     #[error("label contains invalid character '{0}'")]
     InvalidChar(char),
 }
@@ -72,7 +99,7 @@ impl Label {
             return Err(LabelError::InvalidEnd);
         }
         for ch in s.chars() {
-            if !ch.is_ascii_lowercase() && !ch.is_ascii_digit() && ch != '-' {
+            if !ch.is_ascii_lowercase() && !ch.is_ascii_digit() && ch != '-' && ch != '_' {
                 return Err(LabelError::InvalidChar(ch));
             }
         }
@@ -89,7 +116,7 @@ impl Label {
             .chars()
             .filter_map(|ch| {
                 let ch = ch.to_ascii_lowercase();
-                if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' {
+                if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_' {
                     Some(ch)
                 } else {
                     None
@@ -176,9 +203,9 @@ pub enum UidParseError {
     /// Error parsing the label component.
     #[error("invalid label: {0}")]
     InvalidLabel(#[from] LabelError),
-    /// The hex uid portion is invalid.
-    #[error("invalid hex uid: {0}")]
-    InvalidHex(String),
+    /// The base58 uid portion is invalid.
+    #[error("invalid base58 uid: {0}")]
+    InvalidBase58(String),
 }
 
 impl Uid {
@@ -232,13 +259,12 @@ impl Ord for Uid {
     }
 }
 
-/// Displays as `_label` (singleton) or `hex16` (instance), where hex16 is
-/// a zero-padded 16-character lowercase hex string.
+/// Displays as `label` (singleton) or `<base58>` (instance).
 impl fmt::Debug for Uid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Uid::Singleton(label) => write!(f, "Uid(_{})", label),
-            Uid::Instance(uid) => write!(f, "Uid({:016x})", uid),
+            Uid::Singleton(label) => write!(f, "Uid({})", label),
+            Uid::Instance(uid) => write!(f, "Uid(<{}>)", encode_base58_uid(*uid)),
         }
     }
 }
@@ -246,36 +272,68 @@ impl fmt::Debug for Uid {
 impl fmt::Display for Uid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Uid::Singleton(label) => write!(f, "_{label}"),
-            Uid::Instance(uid) => write!(f, "{uid:016x}"),
+            Uid::Singleton(label) => write!(f, "{label}"),
+            Uid::Instance(uid) => write!(f, "<{}>", encode_base58_uid(*uid)),
         }
     }
 }
 
-/// Parses `_label` as singleton, bare hex as instance.
+/// Parses `label` as singleton, `<base58>` as instance.
 impl FromStr for Uid {
     type Err = UidParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Some(rest) = s.strip_prefix('_') {
-            let label = Label::new(rest)?;
-            return Ok(Uid::Singleton(label));
+        if let Some(inner) = s
+            .strip_prefix('<')
+            .and_then(|inner| inner.strip_suffix('>'))
+        {
+            let uid = parse_base58_uid(inner)?;
+            return Ok(Uid::Instance(uid));
         }
-        let uid = parse_hex_uid(s)?;
-        Ok(Uid::Instance(uid))
+        Ok(Uid::Singleton(Label::new(s)?))
     }
 }
 
-fn parse_hex_uid(s: &str) -> Result<u64, UidParseError> {
-    if s.is_empty() || s.len() > 16 {
-        return Err(UidParseError::InvalidHex(s.to_string()));
+fn encode_base58_uid(mut uid: u64) -> String {
+    if uid == 0 {
+        return "1".to_string();
     }
-    for ch in s.chars() {
-        if !ch.is_ascii_hexdigit() {
-            return Err(UidParseError::InvalidHex(s.to_string()));
-        }
+
+    let mut digits = Vec::new();
+    while uid > 0 {
+        digits.push(BASE58_FLICKR[(uid % 58) as usize] as char);
+        uid /= 58;
     }
-    u64::from_str_radix(s, 16).map_err(|_| UidParseError::InvalidHex(s.to_string()))
+    digits.iter().rev().collect()
+}
+
+fn parse_base58_uid(s: &str) -> Result<u64, UidParseError> {
+    if s.is_empty() {
+        return Err(UidParseError::InvalidBase58(s.to_string()));
+    }
+
+    let mut uid = 0u64;
+    for ch in s.bytes() {
+        let digit = BASE58_FLICKR
+            .iter()
+            .position(|candidate| *candidate == ch)
+            .ok_or_else(|| UidParseError::InvalidBase58(s.to_string()))? as u64;
+        uid = uid
+            .checked_mul(58)
+            .and_then(|value| value.checked_add(digit))
+            .ok_or_else(|| UidParseError::InvalidBase58(s.to_string()))?;
+    }
+    Ok(uid)
+}
+
+fn fmt_id_component(f: &mut fmt::Formatter<'_>, uid: &Uid, label: Option<&Label>) -> fmt::Result {
+    match uid {
+        Uid::Singleton(singleton) => write!(f, "{}", singleton),
+        Uid::Instance(uid) => match label {
+            Some(label) => write!(f, "{}<{}>", label, encode_base58_uid(*uid)),
+            None => write!(f, "<{}>", encode_base58_uid(*uid)),
+        },
+    }
 }
 
 impl Serialize for Uid {
@@ -298,7 +356,7 @@ pub enum IdParseError {
     #[error("invalid proc id: {0}")]
     InvalidProcId(#[from] UidParseError),
     /// Error parsing an [`ActorId`] (missing `.` separator).
-    #[error("invalid actor id: expected format `<actor_uid>.<proc_uid>`")]
+    #[error("invalid actor id: expected format `<actor>.<proc>`")]
     InvalidActorIdFormat,
     /// Error parsing the actor uid component of an [`ActorId`].
     #[error("invalid actor uid: {0}")]
@@ -307,7 +365,7 @@ pub enum IdParseError {
     #[error("invalid proc uid in actor id: {0}")]
     InvalidActorProcUid(UidParseError),
     /// The `<actor_id>:<port>` separator is missing.
-    #[error("invalid port id: expected format `<actor_id>:<port>`")]
+    #[error("invalid port id: expected format `<actor>:<port>`")]
     InvalidPortIdFormat,
     /// The port component is invalid.
     #[error("invalid port: {0}")]
@@ -328,6 +386,22 @@ impl ProcId {
     /// Create a new [`ProcId`].
     pub fn new(uid: Uid, label: Option<Label>) -> Self {
         Self { uid, label }
+    }
+
+    /// Create a singleton [`ProcId`] identified by the given label.
+    pub fn singleton(label: Label) -> Self {
+        Self {
+            uid: Uid::Singleton(label.clone()),
+            label: Some(label),
+        }
+    }
+
+    /// Create an instance [`ProcId`] with a random uid and the given label.
+    pub fn instance(label: Label) -> Self {
+        Self {
+            uid: Uid::instance(),
+            label: Some(label),
+        }
     }
 
     /// Returns the uid.
@@ -369,7 +443,7 @@ impl Ord for ProcId {
 
 impl fmt::Display for ProcId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.uid)
+        fmt_id_component(f, &self.uid, self.label.as_ref())
     }
 }
 
@@ -386,8 +460,9 @@ impl FromStr for ProcId {
     type Err = IdParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let uid: Uid = s.parse()?;
-        Ok(Self { uid, label: None })
+        let parts = crate::parse::id::parse_proc_id(s)
+            .map_err(|_| legacy_parse_id_component(s).unwrap_err())?;
+        Self::try_from(parts).map_err(IdParseError::InvalidProcId)
     }
 }
 
@@ -409,6 +484,33 @@ impl ActorId {
             uid,
             proc_id,
             label,
+        }
+    }
+
+    /// Create a singleton [`ActorId`] identified by the given label.
+    pub fn singleton(label: Label, proc_id: ProcId) -> Self {
+        Self {
+            uid: Uid::Singleton(label.clone()),
+            proc_id,
+            label: Some(label),
+        }
+    }
+
+    /// Create an instance [`ActorId`] with a random uid and no label.
+    pub fn instance(proc_id: ProcId) -> Self {
+        Self {
+            uid: Uid::instance(),
+            proc_id,
+            label: None,
+        }
+    }
+
+    /// Create an instance [`ActorId`] with a random uid and the given label.
+    pub fn instance_labeled(label: Label, proc_id: ProcId) -> Self {
+        Self {
+            uid: Uid::instance(),
+            proc_id,
+            label: Some(label),
         }
     }
 
@@ -459,7 +561,8 @@ impl Ord for ActorId {
 
 impl fmt::Display for ActorId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}", self.uid, self.proc_id.uid)
+        fmt_id_component(f, &self.uid, self.label.as_ref())?;
+        write!(f, ".{}", self.proc_id)
     }
 }
 
@@ -490,23 +593,8 @@ impl FromStr for ActorId {
     type Err = IdParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let dot = s.find('.').ok_or(IdParseError::InvalidActorIdFormat)?;
-        let actor_part = &s[..dot];
-        let proc_part = &s[dot + 1..];
-
-        let actor_uid: Uid = actor_part.parse().map_err(IdParseError::InvalidActorUid)?;
-        let proc_uid: Uid = proc_part
-            .parse()
-            .map_err(IdParseError::InvalidActorProcUid)?;
-
-        Ok(Self {
-            uid: actor_uid,
-            proc_id: ProcId {
-                uid: proc_uid,
-                label: None,
-            },
-            label: None,
-        })
+        let parts = crate::parse::id::parse_actor_id(s).map_err(|_| legacy_parse_actor_id(s))?;
+        Self::try_from(parts)
     }
 }
 
@@ -603,17 +691,112 @@ impl FromStr for PortId {
     type Err = IdParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let colon = s.rfind(':').ok_or(IdParseError::InvalidPortIdFormat)?;
-        let actor_part = &s[..colon];
-        let port_part = &s[colon + 1..];
+        let parts = crate::parse::id::parse_port_id(s).map_err(|_| legacy_port_parse_error(s))?;
+        Self::try_from(parts)
+    }
+}
 
-        let actor_id: ActorId = actor_part.parse()?;
-        let port: Port = port_part
+fn convert_id_component(component: IdComponent<'_>) -> Result<(Uid, Option<Label>), UidParseError> {
+    match component {
+        IdComponent::Singleton { label, .. } => {
+            let label = Label::new(label)?;
+            Ok((Uid::Singleton(label.clone()), Some(label)))
+        }
+        IdComponent::Instance { label, uid, .. } => {
+            let uid = Uid::Instance(parse_base58_uid(uid)?);
+            let label = label.map(Label::new).transpose()?;
+            Ok((uid, label))
+        }
+    }
+}
+
+impl TryFrom<ProcIdParts<'_>> for ProcId {
+    type Error = UidParseError;
+
+    fn try_from(parts: ProcIdParts<'_>) -> Result<Self, Self::Error> {
+        let (uid, label) = convert_id_component(parts.component)?;
+        Ok(Self { uid, label })
+    }
+}
+
+impl TryFrom<ActorIdParts<'_>> for ActorId {
+    type Error = IdParseError;
+
+    fn try_from(parts: ActorIdParts<'_>) -> Result<Self, Self::Error> {
+        let (uid, label) =
+            convert_id_component(parts.actor).map_err(IdParseError::InvalidActorUid)?;
+        let proc_id = ProcId::try_from(ProcIdParts {
+            component: parts.proc_,
+        })
+        .map_err(IdParseError::InvalidActorProcUid)?;
+        Ok(Self {
+            uid,
+            proc_id,
+            label,
+        })
+    }
+}
+
+impl TryFrom<PortIdParts<'_>> for PortId {
+    type Error = IdParseError;
+
+    fn try_from(parts: PortIdParts<'_>) -> Result<Self, Self::Error> {
+        let actor_id = ActorId::try_from(parts.actor)?;
+        let port = parts
+            .port
             .parse()
-            .map_err(|_| IdParseError::InvalidPort(port_part.to_string()))?;
-
+            .map_err(|_| IdParseError::InvalidPort(parts.port.to_string()))?;
         Ok(Self { actor_id, port })
     }
+}
+
+fn legacy_parse_id_component(s: &str) -> Result<(Uid, Option<Label>), UidParseError> {
+    if let Some(inner) = s
+        .strip_prefix('<')
+        .and_then(|inner| inner.strip_suffix('>'))
+    {
+        let uid = parse_base58_uid(inner)?;
+        return Ok((Uid::Instance(uid), None));
+    }
+
+    if let Some(open) = s.find('<')
+        && s.ends_with('>')
+    {
+        let label = Label::new(&s[..open])?;
+        let uid = parse_base58_uid(&s[open + 1..s.len() - 1])?;
+        return Ok((Uid::Instance(uid), Some(label)));
+    }
+
+    let label = Label::new(s)?;
+    Ok((Uid::Singleton(label.clone()), Some(label)))
+}
+
+fn legacy_parse_actor_id(s: &str) -> IdParseError {
+    let Some((actor_part, proc_part)) = s.split_once('.') else {
+        return IdParseError::InvalidActorIdFormat;
+    };
+
+    if let Err(err) = legacy_parse_id_component(actor_part) {
+        return IdParseError::InvalidActorUid(err);
+    }
+
+    if let Err(err) = legacy_parse_id_component(proc_part) {
+        return IdParseError::InvalidActorProcUid(err);
+    }
+
+    IdParseError::InvalidActorIdFormat
+}
+
+fn legacy_port_parse_error(s: &str) -> IdParseError {
+    let Some((actor_part, port_part)) = s.split_once(':') else {
+        return IdParseError::InvalidPortIdFormat;
+    };
+
+    if crate::parse::id::parse_actor_id(actor_part).is_ok() {
+        return IdParseError::InvalidPort(port_part.to_string());
+    }
+
+    IdParseError::InvalidPortIdFormat
 }
 
 #[cfg(test)]
@@ -658,9 +841,15 @@ mod tests {
 
     #[test]
     fn test_label_invalid_char() {
-        assert_eq!(Label::new("ab_c"), Err(LabelError::InvalidChar('_')));
         assert_eq!(Label::new("ab.c"), Err(LabelError::InvalidChar('.')));
         assert_eq!(Label::new("aBc"), Err(LabelError::InvalidChar('B')));
+    }
+
+    #[test]
+    fn test_label_allows_underscores() {
+        assert!(Label::new("ab_c").is_ok());
+        assert!(Label::new("proc_agent").is_ok());
+        assert!(Label::new("host_agent").is_ok());
     }
 
     #[test]
@@ -670,7 +859,7 @@ mod tests {
         assert_eq!(Label::strip("---abc---").as_str(), "abc");
         assert_eq!(Label::strip("").as_str(), "nil");
         assert_eq!(Label::strip("123").as_str(), "nil");
-        assert_eq!(Label::strip("My_Service!").as_str(), "myservice");
+        assert_eq!(Label::strip("My_Service!").as_str(), "my_service");
     }
 
     #[test]
@@ -702,7 +891,7 @@ mod tests {
     fn test_singleton_display_parse() {
         let uid = Uid::singleton(Label::new("my-actor").unwrap());
         let s = uid.to_string();
-        assert_eq!(s, "_my-actor");
+        assert_eq!(s, "my-actor");
         let parsed: Uid = s.parse().unwrap();
         assert_eq!(uid, parsed);
     }
@@ -711,7 +900,7 @@ mod tests {
     fn test_instance_display_parse() {
         let uid = Uid::Instance(0xd5d54d7201103869);
         let s = uid.to_string();
-        assert_eq!(s, "d5d54d7201103869");
+        assert_eq!(s, format!("<{}>", encode_base58_uid(0xd5d54d7201103869)));
         let parsed: Uid = s.parse().unwrap();
         assert_eq!(uid, parsed);
     }
@@ -753,15 +942,14 @@ mod tests {
 
     #[test]
     fn test_uid_parse_errors() {
-        // Empty string is invalid hex.
+        // Empty string is invalid.
         assert!("".parse::<Uid>().is_err());
         // Invalid singleton label.
-        assert!("_".parse::<Uid>().is_err());
-        assert!("_123bad".parse::<Uid>().is_err());
-        // Invalid hex.
-        assert!("xyz".parse::<Uid>().is_err());
-        // Hex too long.
-        assert!("00000000000000001".parse::<Uid>().is_err());
+        assert!("123bad".parse::<Uid>().is_err());
+        // Invalid base58.
+        assert!("<0>".parse::<Uid>().is_err());
+        // Missing closing delimiter.
+        assert!("<abc".parse::<Uid>().is_err());
     }
 
     #[test]
@@ -773,7 +961,7 @@ mod tests {
 
     #[test]
     fn test_short_hex_parse() {
-        let parsed: Uid = "1".parse().unwrap();
+        let parsed: Uid = "<2>".parse().unwrap();
         assert_eq!(parsed, Uid::Instance(1));
     }
 
@@ -823,13 +1011,16 @@ mod tests {
             Uid::Instance(0xd5d54d7201103869),
             Some(Label::new("my-proc").unwrap()),
         );
-        assert_eq!(pid.to_string(), "d5d54d7201103869");
+        assert_eq!(
+            pid.to_string(),
+            format!("my-proc<{}>", encode_base58_uid(0xd5d54d7201103869))
+        );
 
         let pid_singleton = ProcId::new(
             Uid::singleton(Label::new("my-proc").unwrap()),
             Some(Label::new("my-proc").unwrap()),
         );
-        assert_eq!(pid_singleton.to_string(), "_my-proc");
+        assert_eq!(pid_singleton.to_string(), "my-proc");
     }
 
     #[test]
@@ -838,10 +1029,16 @@ mod tests {
             Uid::Instance(0xd5d54d7201103869),
             Some(Label::new("my-proc").unwrap()),
         );
-        assert_eq!(format!("{:?}", pid), "<'my-proc' d5d54d7201103869>");
+        assert_eq!(
+            format!("{:?}", pid),
+            format!("<'my-proc' <{}>>", encode_base58_uid(0xd5d54d7201103869))
+        );
 
         let pid_no_label = ProcId::new(Uid::Instance(0xd5d54d7201103869), None);
-        assert_eq!(format!("{:?}", pid_no_label), "<d5d54d7201103869>");
+        assert_eq!(
+            format!("{:?}", pid_no_label),
+            format!("<<{}>>", encode_base58_uid(0xd5d54d7201103869))
+        );
     }
 
     #[test]
@@ -853,16 +1050,55 @@ mod tests {
         let s = pid.to_string();
         let parsed: ProcId = s.parse().unwrap();
         assert_eq!(pid, parsed);
+        assert_eq!(parsed.label().map(|l| l.as_str()), Some("my-proc"));
     }
 
     #[test]
     fn test_proc_id_fromstr_singleton() {
-        let parsed: ProcId = "_my-proc".parse().unwrap();
+        let parsed: ProcId = "my-proc".parse().unwrap();
         assert_eq!(
             *parsed.uid(),
             Uid::singleton(Label::new("my-proc").unwrap())
         );
+        assert_eq!(parsed.label().map(|l| l.as_str()), Some("my-proc"));
+    }
+
+    #[test]
+    fn test_proc_id_fromstr_unlabeled_instance() {
+        let expected_uid = Uid::Instance(0xabc123);
+        let parsed: ProcId = expected_uid.to_string().parse().unwrap();
+        assert_eq!(parsed.uid(), &expected_uid);
         assert_eq!(parsed.label(), None);
+    }
+
+    #[test]
+    fn test_proc_id_fromstr_labeled_instance_with_underscore() {
+        let expected_uid = Uid::Instance(0xabc123);
+        let parsed: ProcId = format!("proc_agent{}", expected_uid).parse().unwrap();
+        assert_eq!(parsed.uid(), &expected_uid);
+        assert_eq!(
+            parsed.label().map(|label| label.as_str()),
+            Some("proc_agent")
+        );
+    }
+
+    #[test]
+    fn test_proc_id_fromstr_errors_are_stable() {
+        assert_eq!(
+            "".parse::<ProcId>().unwrap_err().to_string(),
+            "invalid proc id: invalid label: label must not be empty"
+        );
+        assert_eq!(
+            "controller<2MuAHeDjLCEd"
+                .parse::<ProcId>()
+                .unwrap_err()
+                .to_string(),
+            "invalid proc id: invalid label: label contains invalid character '<'"
+        );
+        assert_eq!(
+            "controller@tcp".parse::<ProcId>().unwrap_err().to_string(),
+            "invalid proc id: invalid label: label contains invalid character '@'"
+        );
     }
 
     #[test]
@@ -880,6 +1116,57 @@ mod tests {
         let json_none = serde_json::to_string(&pid_none).unwrap();
         let parsed_none: ProcId = serde_json::from_str(&json_none).unwrap();
         assert_eq!(parsed_none.label(), None);
+    }
+
+    #[test]
+    fn test_proc_id_singleton() {
+        let label = Label::new("my-proc").unwrap();
+        let pid = ProcId::singleton(label.clone());
+        assert_eq!(*pid.uid(), Uid::Singleton(label.clone()));
+        assert_eq!(pid.label(), Some(&label));
+    }
+
+    #[test]
+    fn test_proc_id_instance() {
+        let label = Label::new("my-proc").unwrap();
+        let pid = ProcId::instance(label.clone());
+        assert!(matches!(pid.uid(), Uid::Instance(_)));
+        assert_eq!(pid.label(), Some(&label));
+        let pid2 = ProcId::instance(label);
+        assert_ne!(pid, pid2);
+    }
+
+    #[test]
+    fn test_actor_id_singleton() {
+        let label = Label::new("my-actor").unwrap();
+        let proc_id = ProcId::singleton(Label::new("my-proc").unwrap());
+        let aid = ActorId::singleton(label.clone(), proc_id.clone());
+        assert_eq!(*aid.uid(), Uid::Singleton(label.clone()));
+        assert_eq!(aid.proc_id(), &proc_id);
+        assert_eq!(aid.label(), Some(&label));
+    }
+
+    #[test]
+    fn test_actor_id_instance() {
+        let proc_id = ProcId::singleton(Label::new("my-proc").unwrap());
+        let aid = ActorId::instance(proc_id.clone());
+        assert!(matches!(aid.uid(), Uid::Instance(_)));
+        assert_eq!(aid.proc_id(), &proc_id);
+        assert_eq!(aid.label(), None);
+        let aid2 = ActorId::instance(proc_id);
+        assert_ne!(aid, aid2);
+    }
+
+    #[test]
+    fn test_actor_id_instance_labeled() {
+        let label = Label::new("my-actor").unwrap();
+        let proc_id = ProcId::singleton(Label::new("my-proc").unwrap());
+        let aid = ActorId::instance_labeled(label.clone(), proc_id.clone());
+        assert!(matches!(aid.uid(), Uid::Instance(_)));
+        assert_eq!(aid.proc_id(), &proc_id);
+        assert_eq!(aid.label(), Some(&label));
+        let aid2 = ActorId::instance_labeled(label, proc_id);
+        assert_ne!(aid, aid2);
     }
 
     #[test]
@@ -978,7 +1265,14 @@ mod tests {
             ),
             Some(Label::new("my-actor").unwrap()),
         );
-        assert_eq!(aid.to_string(), "0000000000abc123.0000000000def456");
+        assert_eq!(
+            aid.to_string(),
+            format!(
+                "my-actor<{}>.my-proc<{}>",
+                encode_base58_uid(0xabc123),
+                encode_base58_uid(0xdef456)
+            )
+        );
     }
 
     #[test]
@@ -993,7 +1287,11 @@ mod tests {
         );
         assert_eq!(
             format!("{:?}", aid),
-            "<'my-actor.my-proc' 0000000000abc123.0000000000def456>"
+            format!(
+                "<'my-actor.my-proc' <{}>.<{}>>",
+                encode_base58_uid(0xabc123),
+                encode_base58_uid(0xdef456)
+            )
         );
 
         let aid_no_labels = ActorId::new(
@@ -1003,7 +1301,11 @@ mod tests {
         );
         assert_eq!(
             format!("{:?}", aid_no_labels),
-            "<0000000000abc123.0000000000def456>"
+            format!(
+                "<<{}>.<{}>>",
+                encode_base58_uid(0xabc123),
+                encode_base58_uid(0xdef456)
+            )
         );
     }
 
@@ -1020,11 +1322,16 @@ mod tests {
         let s = aid.to_string();
         let parsed: ActorId = s.parse().unwrap();
         assert_eq!(aid, parsed);
+        assert_eq!(parsed.label().map(|l| l.as_str()), Some("my-actor"));
+        assert_eq!(
+            parsed.proc_id().label().map(|l| l.as_str()),
+            Some("my-proc")
+        );
     }
 
     #[test]
     fn test_actor_id_fromstr_with_singletons() {
-        let parsed: ActorId = "_my-actor._my-proc".parse().unwrap();
+        let parsed: ActorId = "my-actor.my-proc".parse().unwrap();
         assert_eq!(
             *parsed.uid(),
             Uid::singleton(Label::new("my-actor").unwrap())
@@ -1032,6 +1339,60 @@ mod tests {
         assert_eq!(
             *parsed.proc_id().uid(),
             Uid::singleton(Label::new("my-proc").unwrap())
+        );
+        assert_eq!(parsed.label().map(|l| l.as_str()), Some("my-actor"));
+        assert_eq!(
+            parsed.proc_id().label().map(|l| l.as_str()),
+            Some("my-proc")
+        );
+    }
+
+    #[test]
+    fn test_actor_id_fromstr_mixed_examples() {
+        let proc_uid = Uid::Instance(0xabc123);
+        let parsed: ActorId = format!("controller.some-proc-123{}", proc_uid)
+            .parse()
+            .unwrap();
+        assert_eq!(
+            parsed.uid(),
+            &Uid::singleton(Label::new("controller").unwrap())
+        );
+        assert_eq!(parsed.proc_id().uid(), &proc_uid);
+        assert_eq!(
+            parsed.label().map(|label| label.as_str()),
+            Some("controller")
+        );
+        assert_eq!(
+            parsed.proc_id().label().map(|label| label.as_str()),
+            Some("some-proc-123")
+        );
+
+        let expected_actor_uid = Uid::Instance(0xabc123);
+        let expected_proc_uid = Uid::Instance(0xdef456);
+        let parsed: ActorId = format!("{}.{}", expected_actor_uid, expected_proc_uid)
+            .parse()
+            .unwrap();
+        assert_eq!(parsed.uid(), &expected_actor_uid);
+        assert_eq!(parsed.proc_id().uid(), &expected_proc_uid);
+        assert_eq!(parsed.label(), None);
+        assert_eq!(parsed.proc_id().label(), None);
+
+        let expected_actor_uid = Uid::Instance(0xabc123);
+        let parsed: ActorId = format!("controller{}.local", expected_actor_uid)
+            .parse()
+            .unwrap();
+        assert_eq!(parsed.uid(), &expected_actor_uid);
+        assert_eq!(
+            parsed.proc_id().uid(),
+            &Uid::singleton(Label::new("local").unwrap())
+        );
+        assert_eq!(
+            parsed.label().map(|label| label.as_str()),
+            Some("controller")
+        );
+        assert_eq!(
+            parsed.proc_id().label().map(|label| label.as_str()),
+            Some("local")
         );
     }
 
@@ -1041,6 +1402,26 @@ mod tests {
         assert!(".".parse::<ActorId>().is_err());
         assert!("abc.".parse::<ActorId>().is_err());
         assert!(".abc".parse::<ActorId>().is_err());
+    }
+
+    #[test]
+    fn test_actor_id_fromstr_errors_are_stable() {
+        assert_eq!(
+            "local".parse::<ActorId>().unwrap_err().to_string(),
+            "invalid actor id: expected format `<actor>.<proc>`"
+        );
+        assert_eq!(
+            ".local".parse::<ActorId>().unwrap_err().to_string(),
+            "invalid actor uid: invalid label: label must not be empty"
+        );
+        assert_eq!(
+            "local.".parse::<ActorId>().unwrap_err().to_string(),
+            "invalid proc uid in actor id: invalid label: label must not be empty"
+        );
+        assert_eq!(
+            "local.<bad!>".parse::<ActorId>().unwrap_err().to_string(),
+            "invalid proc uid in actor id: invalid base58 uid: bad!"
+        );
     }
 
     #[test]
@@ -1166,7 +1547,52 @@ mod tests {
             Some(Label::new("my-actor").unwrap()),
         );
         let pid = PortId::new(aid, Port::from(42));
-        assert_eq!(pid.to_string(), "0000000000abc123.0000000000def456:42");
+        assert_eq!(
+            pid.to_string(),
+            format!(
+                "my-actor<{}>.my-proc<{}>:42",
+                encode_base58_uid(0xabc123),
+                encode_base58_uid(0xdef456)
+            )
+        );
+    }
+
+    #[test]
+    fn test_port_id_fromstr_examples() {
+        let parsed: PortId = "local.local:0".parse().unwrap();
+        assert_eq!(
+            parsed.actor_id().uid(),
+            &Uid::singleton(Label::new("local").unwrap())
+        );
+        assert_eq!(
+            parsed.proc_id().uid(),
+            &Uid::singleton(Label::new("local").unwrap())
+        );
+        assert_eq!(parsed.port(), Port::from(0));
+
+        let expected_actor_uid = Uid::Instance(0xabc123);
+        let parsed: PortId = format!("controller{}.local:42", expected_actor_uid)
+            .parse()
+            .unwrap();
+        assert_eq!(parsed.actor_id().uid(), &expected_actor_uid);
+        assert_eq!(
+            parsed.actor_id().label().map(|label| label.as_str()),
+            Some("controller")
+        );
+        assert_eq!(
+            parsed.proc_id().uid(),
+            &Uid::singleton(Label::new("local").unwrap())
+        );
+        assert_eq!(parsed.port(), Port::from(42));
+
+        let expected_actor_uid = Uid::Instance(0xabc123);
+        let expected_proc_uid = Uid::Instance(0xdef456);
+        let parsed: PortId = format!("{}.{}:7", expected_actor_uid, expected_proc_uid)
+            .parse()
+            .unwrap();
+        assert_eq!(parsed.actor_id().uid(), &expected_actor_uid);
+        assert_eq!(parsed.proc_id().uid(), &expected_proc_uid);
+        assert_eq!(parsed.port(), Port::from(7));
     }
 
     #[test]
@@ -1182,7 +1608,11 @@ mod tests {
         let pid = PortId::new(aid, Port::from(42));
         assert_eq!(
             format!("{:?}", pid),
-            "<'my-actor.my-proc' 0000000000abc123.0000000000def456:42>"
+            format!(
+                "<'my-actor.my-proc' my-actor<{}>.my-proc<{}>:42>",
+                encode_base58_uid(0xabc123),
+                encode_base58_uid(0xdef456)
+            )
         );
     }
 
@@ -1196,7 +1626,11 @@ mod tests {
         let pid = PortId::new(aid, Port::from(42));
         assert_eq!(
             format!("{:?}", pid),
-            "<0000000000abc123.0000000000def456:42>"
+            format!(
+                "<<{}>.<{}>:42>",
+                encode_base58_uid(0xabc123),
+                encode_base58_uid(0xdef456)
+            )
         );
     }
 
@@ -1210,7 +1644,11 @@ mod tests {
         let pid = PortId::new(aid, Port::from(42));
         assert_eq!(
             format!("{:?}", pid),
-            "<'my-actor' 0000000000abc123.0000000000def456:42>"
+            format!(
+                "<'my-actor' my-actor<{}>.<{}>:42>",
+                encode_base58_uid(0xabc123),
+                encode_base58_uid(0xdef456)
+            )
         );
     }
 
@@ -1227,7 +1665,11 @@ mod tests {
         let pid = PortId::new(aid, Port::from(42));
         assert_eq!(
             format!("{:?}", pid),
-            "<'.my-proc' 0000000000abc123.0000000000def456:42>"
+            format!(
+                "<'.my-proc' <{}>.my-proc<{}>:42>",
+                encode_base58_uid(0xabc123),
+                encode_base58_uid(0xdef456)
+            )
         );
     }
 
@@ -1245,22 +1687,48 @@ mod tests {
         let s = pid.to_string();
         let parsed: PortId = s.parse().unwrap();
         assert_eq!(pid, parsed);
+        assert_eq!(
+            parsed.actor_id().label().map(|l| l.as_str()),
+            Some("my-actor")
+        );
+        assert_eq!(
+            parsed.actor_id().proc_id().label().map(|l| l.as_str()),
+            Some("my-proc")
+        );
+    }
+
+    #[test]
+    fn test_port_id_fromstr_errors_are_stable() {
+        assert_eq!(
+            "local.local".parse::<PortId>().unwrap_err().to_string(),
+            "invalid port id: expected format `<actor>:<port>`"
+        );
+        assert_eq!(
+            "local.local:".parse::<PortId>().unwrap_err().to_string(),
+            "invalid port: "
+        );
+        assert_eq!(
+            "local.local:not-a-port"
+                .parse::<PortId>()
+                .unwrap_err()
+                .to_string(),
+            "invalid port: not-a-port"
+        );
+        assert_eq!(
+            "local.local:7@tcp://127.0.0.1:1"
+                .parse::<PortId>()
+                .unwrap_err()
+                .to_string(),
+            "invalid port: 7@tcp://127.0.0.1:1"
+        );
     }
 
     #[test]
     fn test_port_id_fromstr_errors() {
         // Missing colon.
-        assert!(
-            "0000000000abc123.0000000000def456"
-                .parse::<PortId>()
-                .is_err()
-        );
+        assert!("<abc>.<def>".parse::<PortId>().is_err());
         // Invalid port.
-        assert!(
-            "0000000000abc123.0000000000def456:notanumber"
-                .parse::<PortId>()
-                .is_err()
-        );
+        assert!("actor.proc:notanumber".parse::<PortId>().is_err());
     }
 
     #[test]

@@ -36,7 +36,7 @@ use hyperactor::Context;
 use hyperactor::HandleClient;
 use hyperactor::Handler;
 use hyperactor::Instance;
-use hyperactor::reference::OncePortRef;
+use hyperactor::OncePortRef;
 use hyperactor::RefClient;
 use serde::Deserialize;
 use serde::Serialize;

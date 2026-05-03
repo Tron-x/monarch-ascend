@@ -16,6 +16,7 @@ use std::mem::MaybeUninit;
 
 use fxhash::FxHasher32;
 use hccl_sys::*;
+use monarch_types::UniqueId;
 use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
@@ -86,6 +87,9 @@ pub enum HcclError {
 
     #[error("ReduceOp::Avg is not supported by HCCL")]
     AvgNotSupported,
+
+    #[error("expected UniqueId::Hccl variant, got UniqueId::Nccl")]
+    WrongUniqueIdVariant,
 
     #[error("output tensor must have the same type as input tensor")]
     TypeMismatch,
@@ -165,6 +169,58 @@ impl RootInfo {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Conversions to/from the portable `monarch_types::UniqueId` enum.
+//
+// The wire-format type used by the WorkerMessage protocol is
+// `monarch_types::UniqueId`, an enum holding either NCCL or HCCL bytes.  At
+// the FFI boundary we need to convert in both directions:
+//   * RootInfo -> UniqueId : when bootstrapping a new HCCL communicator and
+//     broadcasting the root info to peer ranks.
+//   * UniqueId -> RootInfo : when a peer rank receives the broadcast and
+//     needs to bind it into a real HCCL communicator.
+// ---------------------------------------------------------------------------
+
+impl From<RootInfo> for UniqueId {
+    fn from(ri: RootInfo) -> Self {
+        UniqueId::from_hccl_internal(ri.inner.internal)
+    }
+}
+
+impl<'a> From<&'a RootInfo> for UniqueId {
+    fn from(ri: &'a RootInfo) -> Self {
+        UniqueId::from_hccl_internal(ri.inner.internal)
+    }
+}
+
+impl TryFrom<UniqueId> for RootInfo {
+    type Error = HcclError;
+    fn try_from(uid: UniqueId) -> Result<Self, Self::Error> {
+        match uid {
+            UniqueId::Hccl(bytes) => Ok(RootInfo {
+                inner: HcclRootInfo {
+                    internal: bytes.internal,
+                },
+            }),
+            UniqueId::Nccl(_) => Err(HcclError::WrongUniqueIdVariant),
+        }
+    }
+}
+
+impl<'a> TryFrom<&'a UniqueId> for RootInfo {
+    type Error = HcclError;
+    fn try_from(uid: &'a UniqueId) -> Result<Self, Self::Error> {
+        match uid {
+            UniqueId::Hccl(bytes) => Ok(RootInfo {
+                inner: HcclRootInfo {
+                    internal: bytes.internal,
+                },
+            }),
+            UniqueId::Nccl(_) => Err(HcclError::WrongUniqueIdVariant),
+        }
+    }
+}
+
 /// Rust version of `HcclDataType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
@@ -212,25 +268,19 @@ impl TryFrom<ScalarType> for DataType {
     }
 }
 
-/// Rust version of `HcclReduceOp`.
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-pub enum ReduceOp {
-    Sum = 0,
-    Prod = 1,
-    Max = 2,
-    Min = 3,
-    Avg = 4,
-}
+// Re-export the portable `ReduceOp` from `monarch_types` so callers (e.g.
+// `monarch_tensor_worker`) can pass the wire type straight through to HCCL
+// without an extra conversion at the boundary.  This mirrors what
+// `torch-sys-cuda::nccl` does for the NCCL backend.
+pub use monarch_types::ReduceOp;
 
-impl ReduceOp {
-    fn to_hccl(self) -> Result<HcclReduceOp, HcclError> {
-        match self {
-            ReduceOp::Sum => Ok(HcclReduceOp(0)),
-            ReduceOp::Prod => Ok(HcclReduceOp(1)),
-            ReduceOp::Max => Ok(HcclReduceOp(2)),
-            ReduceOp::Min => Ok(HcclReduceOp(3)),
-            ReduceOp::Avg => Err(HcclError::AvgNotSupported),
-        }
+fn reduce_op_to_hccl(reduce_op: ReduceOp) -> Result<HcclReduceOp, HcclError> {
+    match reduce_op {
+        ReduceOp::Sum => Ok(HcclReduceOp(0)),
+        ReduceOp::Prod => Ok(HcclReduceOp(1)),
+        ReduceOp::Max => Ok(HcclReduceOp(2)),
+        ReduceOp::Min => Ok(HcclReduceOp(3)),
+        ReduceOp::Avg => Err(HcclError::AvgNotSupported),
     }
 }
 
@@ -388,7 +438,7 @@ impl Communicator {
         if is_float8_type(tensor.scalar_type()) {
             return Err(HcclError::Float8Reduction);
         }
-        let op = reduce_op.to_hccl()?;
+        let op = reduce_op_to_hccl(reduce_op)?;
         unsafe {
             Ok(hccl_check(HcclAllReduce(
                 tensor.data_ptr() as *mut _,
@@ -437,7 +487,7 @@ impl Communicator {
             return Err(HcclError::Float8Reduction);
         }
         let data_type: DataType = tensor.scalar_type().try_into()?;
-        let op = reduce_op.to_hccl()?;
+        let op = reduce_op_to_hccl(reduce_op)?;
         unsafe {
             Ok(hccl_check(HcclReduce(
                 tensor.data_ptr() as *mut _,
@@ -571,7 +621,7 @@ impl Communicator {
             return Err(HcclError::Float8Reduction);
         }
         let data_type: DataType = input.scalar_type().try_into()?;
-        let op = reduce_op.to_hccl()?;
+        let op = reduce_op_to_hccl(reduce_op)?;
         unsafe {
             Ok(hccl_check(HcclReduceScatter(
                 input.data_ptr() as *mut _,

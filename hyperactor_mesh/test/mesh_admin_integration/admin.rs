@@ -12,6 +12,7 @@
 //! AI-4 (`host` derives from `url`) is a constructor guarantee of
 //! `AdminInfo::new()` — not a live invariant tested here.
 
+use hyperactor::ProcAddr;
 use hyperactor_mesh::mesh_admin::AdminInfo;
 
 use crate::dining::DiningScenario;
@@ -34,11 +35,9 @@ pub(crate) async fn assert_admin_info(s: &DiningScenario) {
     // AI-2: proc_id is populated and well-formed. Placement equality
     // is proved by the SA-5 unit test; here we validate the HTTP layer.
     assert!(!info.proc_id.is_empty(), "AI-2: proc_id must be non-empty");
-    // The proc_id should look like a hyperactor ProcId — at minimum
-    // it contains a transport address component.
     assert!(
-        info.proc_id.contains("unix:") || info.proc_id.contains("tcp:"),
-        "AI-2: proc_id '{}' does not look like a valid ProcId",
+        info.proc_id.parse::<ProcAddr>().is_ok(),
+        "AI-2: proc_id '{}' does not look like a valid ProcAddr",
         info.proc_id
     );
 

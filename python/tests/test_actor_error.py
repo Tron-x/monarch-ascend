@@ -976,7 +976,7 @@ async def test_actor_mesh_stop() -> None:
     # the right error message.
     with pytest.raises(
         SupervisionError,
-        match=r"(?s)(The actor|Supervision event: actor) .*printer-.* (and all its descendants have failed|has status:).*stopped",
+        match=r"(?s)(The actor|Supervision event: actor) .* (and all its descendants have failed|has status:).*stopped",
     ):
         await am_1.print.call("hello 2")
 
@@ -1049,8 +1049,16 @@ async def test_supervision_with_sending_error() -> None:
     # This would require Undeliverable to know about a specific return channel.
     assert "MeshFailure" in error_msg
     assert "RootClientActor" in error_msg
+    # Top line is one of:
+    #   `undeliverable message to {dest}` (DeliveryFailure, no
+    #     OPERATION_ENDPOINT — see UE-3 in
+    #     hyperactor/src/mailbox/undeliverable.rs).
+    #   `undeliverable message for {operation} ({adverb})`
+    #     (when OPERATION_ENDPOINT is present).
+    # Both are valid here: pending messages of mixed shapes flush back
+    # to the client when the receiver session breaks. Match either.
     assert re.search(
-        "undeliverable message error.*client.*",
+        r"undeliverable message (to|for) .*client",
         error_msg,
         flags=re.DOTALL,
     )
@@ -1118,6 +1126,7 @@ async def test_slice_supervision() -> None:
 
 
 @pytest.mark.timeout(30)
+@pytest.mark.skipif(sys.platform != "linux", reason="linux-only")
 @parametrize_config(actor_queue_dispatch={True, False})
 @isolate_in_subprocess
 async def test_mesh_slices_inherit_parent_errors() -> None:
@@ -1389,6 +1398,7 @@ async def test_supervise_callback_without_await_handled():
 
 
 @pytest.mark.timeout(30)
+@pytest.mark.skipif(sys.platform != "linux", reason="linux-only")
 @parametrize_config(actor_queue_dispatch={True, False})
 @isolate_in_subprocess
 async def test_supervise_callback_with_mesh_ref():

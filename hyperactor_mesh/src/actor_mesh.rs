@@ -21,6 +21,8 @@ use std::sync::OnceLock as OnceCell;
 use std::time::Duration;
 
 use hyperactor::ActorLocal;
+use hyperactor::ActorRef;
+use hyperactor::PortRef;
 use hyperactor::RemoteHandles;
 use hyperactor::RemoteMessage;
 use hyperactor::actor::ActorStatus;
@@ -30,7 +32,6 @@ use hyperactor::mailbox::PortReceiver;
 use hyperactor::message::Castable;
 use hyperactor::message::IndexedErasedUnbound;
 use hyperactor::message::Unbound;
-use hyperactor::reference as hyperactor_reference;
 use hyperactor::supervision::ActorSupervisionEvent;
 use hyperactor_config::CONFIG;
 use hyperactor_config::ConfigAttr;
@@ -50,7 +51,6 @@ use tokio::sync::watch;
 
 use crate::CommActor;
 use crate::Error;
-use crate::Name;
 use crate::ProcMeshRef;
 use crate::ValueMesh;
 use crate::casting;
@@ -61,9 +61,9 @@ use crate::mesh_controller::ActorMeshController;
 use crate::mesh_controller::SUPERVISION_POLL_FREQUENCY;
 use crate::mesh_controller::Subscribe;
 use crate::mesh_controller::Unsubscribe;
+use crate::mesh_id::ActorMeshId;
 use crate::proc_agent::ActorState;
 use crate::proc_mesh::GET_ACTOR_STATE_MAX_IDLE;
-use crate::reference::ActorMeshId;
 use crate::resource;
 use crate::supervision::MeshFailure;
 use crate::supervision::Unhealthy;
@@ -87,30 +87,29 @@ declare_attrs! {
 /// An ActorMesh is a collection of ranked A-typed actors.
 ///
 /// Bound note: `A: Referable` because the mesh stores/returns
-/// `hyperactor_reference::ActorRef<A>`, which is only defined for `A: Referable`.
+/// `ActorRef<A>`, which is only defined for `A: Referable`.
 #[derive(Debug)]
 pub struct ActorMesh<A: Referable> {
     proc_mesh: ProcMeshRef,
-    name: Name,
+    id: ActorMeshId,
     current_ref: ActorMeshRef<A>,
     /// If present, this is the controller for the mesh. The controller ensures
     /// the mesh is stopped when the actor owning it is stopped, and can provide
     /// supervision events via subscribing.
     /// It may not be present for some types of actors, typically system actors
     /// such as ProcAgent or CommActor.
-    controller: Option<hyperactor_reference::ActorRef<ActorMeshController<A>>>,
+    controller: Option<ActorRef<ActorMeshController<A>>>,
 }
 
-// `A: Referable` for the same reason as the struct: the mesh holds
-// `hyperactor_reference::ActorRef<A>`.
+// `A: Referable` for the same reason as the struct: the mesh holds `ActorRef<A>`.
 impl<A: Referable> ActorMesh<A> {
     pub(crate) fn new(
         proc_mesh: ProcMeshRef,
-        name: Name,
-        controller: Option<hyperactor_reference::ActorRef<ActorMeshController<A>>>,
+        id: ActorMeshId,
+        controller: Option<ActorRef<ActorMeshController<A>>>,
     ) -> Self {
         let current_ref = ActorMeshRef::with_page_size(
-            name.clone(),
+            id.clone(),
             proc_mesh.clone(),
             DEFAULT_PAGE,
             controller.clone(),
@@ -118,20 +117,17 @@ impl<A: Referable> ActorMesh<A> {
 
         Self {
             proc_mesh,
-            name,
+            id,
             current_ref,
             controller,
         }
     }
 
-    pub fn name(&self) -> &Name {
-        &self.name
+    pub fn id(&self) -> &ActorMeshId {
+        &self.id
     }
 
-    pub(crate) fn set_controller(
-        &mut self,
-        controller: Option<hyperactor_reference::ActorRef<ActorMeshController<A>>>,
-    ) {
+    pub(crate) fn set_controller(&mut self, controller: Option<ActorRef<ActorMeshController<A>>>) {
         self.controller = controller.clone();
         self.current_ref.set_controller(controller);
     }
@@ -149,7 +145,7 @@ impl<A: Referable> ActorMesh<A> {
                 .send(
                     cx,
                     resource::Stop {
-                        name: self.name.clone(),
+                        id: self.id.resource_id().clone(),
                         reason,
                     },
                 )
@@ -165,7 +161,7 @@ impl<A: Referable> ActorMesh<A> {
                 .send(
                     cx,
                     resource::GetState::<resource::mesh::State<()>> {
-                        name: self.name.clone(),
+                        id: self.id.resource_id().clone(),
                         reply: port.bind(),
                     },
                 )
@@ -200,7 +196,7 @@ impl<A: Referable> ActorMesh<A> {
             let mut entry = self.health_state.entry(cx).or_default();
             let health_state = entry.get_mut();
             health_state.unhealthy_event = Some(Unhealthy::StreamClosed(MeshFailure {
-                actor_mesh_name: Some(self.name().to_string()),
+                actor_mesh_name: Some(self.id().to_string()),
                 event: ActorSupervisionEvent::new(
                     // Use an actor id from the mesh.
                     ndslice::view::Ranked::get(&self.current_ref, 0)
@@ -241,7 +237,7 @@ impl<A: Referable> Clone for ActorMesh<A> {
     fn clone(&self) -> Self {
         Self {
             proc_mesh: self.proc_mesh.clone(),
-            name: self.name.clone(),
+            id: self.id.clone(),
             current_ref: self.current_ref.clone(),
             controller: self.controller.clone(),
         }
@@ -252,7 +248,7 @@ impl<A: Referable> Drop for ActorMesh<A> {
     fn drop(&mut self) {
         tracing::info!(
             name = "ActorMeshStatus",
-            actor_name = %self.name,
+            actor_name = %self.id,
             status = "Dropped",
         );
     }
@@ -265,7 +261,7 @@ const DEFAULT_PAGE: usize = 1024;
 
 /// A lazily materialized page of ActorRefs.
 struct Page<A: Referable> {
-    slots: Box<[OnceCell<hyperactor_reference::ActorRef<A>>]>,
+    slots: Box<[OnceCell<ActorRef<A>>]>,
 }
 
 impl<A: Referable> Page<A> {
@@ -390,14 +386,14 @@ fn into_watch<M: Send + Sync + Clone + Default + 'static>(
 /// A reference to a stable snapshot of an [`ActorMesh`].
 pub struct ActorMeshRef<A: Referable> {
     proc_mesh: ProcMeshRef,
-    name: Name,
+    id: ActorMeshId,
     /// Reference to a remote controller actor living on the proc that spawned
     /// the actors in this ref. If None, the actor mesh was already stopped, or
     /// this is a mesh ref to a "system actor" which has no controller and should
     /// not be stopped. If Some, the actor mesh may still be stopped, and the
     /// next_supervision_event function can be used to alert that the mesh has
     /// stopped.
-    controller: Option<hyperactor_reference::ActorRef<ActorMeshController<A>>>,
+    controller: Option<ActorRef<ActorMeshController<A>>>,
 
     /// Recorded health issues with the mesh, to quickly consult before sending
     /// out any casted messages. This is a locally updated copy of the authoritative
@@ -410,7 +406,7 @@ pub struct ActorMeshRef<A: Referable> {
     receiver: ActorLocal<
         Arc<
             tokio::sync::Mutex<(
-                hyperactor_reference::PortRef<Option<MeshFailure>>,
+                PortRef<Option<MeshFailure>>,
                 watch::Receiver<MessageOrFailure<Option<MeshFailure>>>,
             )>,
         >,
@@ -421,7 +417,7 @@ pub struct ActorMeshRef<A: Referable> {
     /// - The `Vec` holds slots for multiple pages.
     /// - Each slot is itself a `OnceCell<Box<Page<A>>>`, so that each
     ///   page can be initialized on demand.
-    /// - A `Page<A>` is a boxed slice of `OnceCell<hyperactor_reference::ActorRef<A>>`,
+    /// - A `Page<A>` is a boxed slice of `OnceCell<ActorRef<A>>`,
     ///   i.e. the actual storage for actor references within that
     ///   page.
     pages: OnceCell<Vec<OnceCell<Box<Page<A>>>>>,
@@ -444,7 +440,27 @@ impl<A: Referable> ActorMeshRef<A> {
         A: RemoteHandles<M> + RemoteHandles<IndexedErasedUnbound<M>>,
         M: Castable + RemoteMessage + Clone, // Clone is required until we are fully onto comm actor
     {
-        self.cast_with_selection(cx, sel!(*), message)
+        self.cast_with_selection(cx, sel!(*), message, &Flattrs::new())
+    }
+
+    /// Cast a message to all the actors in this mesh, merging
+    /// caller-supplied `caller_headers` into the per-rank envelope
+    /// headers before send. Used to propagate caller-known context
+    /// (e.g. operation-context keys marked with `OPERATION_CONTEXT_HEADER`)
+    /// onto the outgoing request so receivers can project it back
+    /// onto replies.
+    #[allow(clippy::result_large_err)]
+    pub fn cast_with_headers<M>(
+        &self,
+        cx: &impl context::Actor,
+        caller_headers: &Flattrs,
+        message: M,
+    ) -> crate::Result<()>
+    where
+        A: RemoteHandles<M> + RemoteHandles<IndexedErasedUnbound<M>>,
+        M: Castable + RemoteMessage + Clone,
+    {
+        self.cast_with_selection(cx, sel!(*), message, caller_headers)
     }
 
     /// Cast a message to the actors in this mesh according to the provided selection.
@@ -462,7 +478,7 @@ impl<A: Referable> ActorMeshRef<A> {
         A: RemoteHandles<M> + RemoteHandles<IndexedErasedUnbound<M>>,
         M: Castable + RemoteMessage + Clone, // Clone is required until we are fully onto comm actor
     {
-        self.cast_with_selection(cx, sel, message)
+        self.cast_with_selection(cx, sel, message, &Flattrs::new())
     }
 
     #[allow(clippy::result_large_err)]
@@ -471,6 +487,7 @@ impl<A: Referable> ActorMeshRef<A> {
         cx: &impl context::Actor,
         sel: Selection,
         message: M,
+        caller_headers: &Flattrs,
     ) -> crate::Result<()>
     where
         A: RemoteHandles<M> + RemoteHandles<IndexedErasedUnbound<M>>,
@@ -480,7 +497,7 @@ impl<A: Referable> ActorMeshRef<A> {
         // to a possibly undeliverable actor.
         if let Some(failure) = self.cached_failure(cx) {
             tracing::debug!(
-                actor_mesh = %self.name,
+                actor_mesh = %self.id,
                 crashed_ranks = ?failure.crashed_ranks,
                 "rejecting cast due to cached supervision failure"
             );
@@ -490,7 +507,7 @@ impl<A: Referable> ActorMeshRef<A> {
         hyperactor_telemetry::notify_sent_message(hyperactor_telemetry::SentMessageEvent {
             timestamp: std::time::SystemTime::now(),
             sender_actor_id: hyperactor_telemetry::hash_to_u64(cx.mailbox().actor_id()),
-            actor_mesh_id: hyperactor_telemetry::hash_to_u64(&self.name.to_string()),
+            actor_mesh_id: hyperactor_telemetry::hash_to_u64(&self.id.to_string()),
             view_json: serde_json::to_string(view::Ranked::region(self)).unwrap_or_default(),
             shape_json: {
                 let shape: ndslice::Shape = view::Ranked::region(self).into();
@@ -500,30 +517,33 @@ impl<A: Referable> ActorMeshRef<A> {
 
         // Now that we know these ranks are active, send out the actual messages.
         if let Some(root_comm_actor) = self.proc_mesh.root_comm_actor() {
-            self.cast_v0(cx, message, sel, root_comm_actor)
+            self.cast_v0(cx, message, sel, root_comm_actor, caller_headers)
         } else {
             for (point, actor) in self.iter() {
                 let create_rank = point.rank();
-                let mut headers = Flattrs::new();
+                // Caller-known headers ride first; cast-info is
+                // stamped afterward and wins on collision because
+                // those keys are owned by this layer.
+                let mut headers = caller_headers.clone();
                 multicast::set_cast_info_on_headers(
                     &mut headers,
                     point,
-                    cx.instance().self_id().clone(),
+                    cx.instance().self_id().clone().into(),
                 );
 
                 // Make sure that we re-bind ranks, as these may be used for
                 // bootstrapping comm actors.
                 let mut unbound = Unbound::try_from_message(message.clone())
-                    .map_err(|e| Error::CastingError(self.name.clone(), e))?;
+                    .map_err(|e| Error::CastingError(self.id.clone(), e))?;
                 unbound
                     .visit_mut::<resource::Rank>(|resource::Rank(rank)| {
                         *rank = Some(create_rank);
                         Ok(())
                     })
-                    .map_err(|e| Error::CastingError(self.name.clone(), e))?;
+                    .map_err(|e| Error::CastingError(self.id.clone(), e))?;
                 let rebound_message = unbound
                     .bind()
-                    .map_err(|e| Error::CastingError(self.name.clone(), e))?;
+                    .map_err(|e| Error::CastingError(self.id.clone(), e))?;
                 actor
                     .send_with_headers(cx, headers, rebound_message)
                     .map_err(|e| Error::SendingError(actor.actor_id().clone(), Box::new(e)))?;
@@ -538,14 +558,15 @@ impl<A: Referable> ActorMeshRef<A> {
         cx: &impl context::Actor,
         message: M,
         sel: Selection,
-        root_comm_actor: &hyperactor_reference::ActorRef<CommActor>,
+        root_comm_actor: &ActorRef<CommActor>,
+        caller_headers: &Flattrs,
     ) -> crate::Result<()>
     where
         A: RemoteHandles<IndexedErasedUnbound<M>>,
         M: Castable + RemoteMessage + Clone, // Clone is required until we are fully onto comm actor
     {
         let cast_mesh_shape = view::Ranked::region(self).into();
-        let actor_mesh_id = ActorMeshId(self.name.clone());
+        let actor_mesh_id = self.id.clone();
         match &self.proc_mesh.root_region {
             Some(root_region) => {
                 let root_mesh_shape = root_region.into();
@@ -557,8 +578,9 @@ impl<A: Referable> ActorMeshRef<A> {
                     message,
                     &cast_mesh_shape,
                     &root_mesh_shape,
+                    caller_headers,
                 )
-                .map_err(|e| Error::CastingError(self.name.clone(), e.into()))
+                .map_err(|e| Error::CastingError(self.id.clone(), e.into()))
             }
             None => casting::actor_mesh_cast::<A, M>(
                 cx,
@@ -568,8 +590,9 @@ impl<A: Referable> ActorMeshRef<A> {
                 &cast_mesh_shape,
                 &cast_mesh_shape,
                 message,
+                caller_headers,
             )
-            .map_err(|e| Error::CastingError(self.name.clone(), e.into())),
+            .map_err(|e| Error::CastingError(self.id.clone(), e.into())),
         }
     }
 
@@ -593,31 +616,31 @@ impl<A: Referable> ActorMeshRef<A> {
         keepalive: Option<std::time::SystemTime>,
     ) -> crate::Result<ValueMesh<resource::State<ActorState>>> {
         self.proc_mesh
-            .actor_states_with_keepalive(cx, self.name.clone(), keepalive)
+            .actor_states_with_keepalive(cx, self.id.clone(), keepalive)
             .await
     }
 
     pub(crate) fn new(
-        name: Name,
+        id: ActorMeshId,
         proc_mesh: ProcMeshRef,
-        controller: Option<hyperactor_reference::ActorRef<ActorMeshController<A>>>,
+        controller: Option<ActorRef<ActorMeshController<A>>>,
     ) -> Self {
-        Self::with_page_size(name, proc_mesh, DEFAULT_PAGE, controller)
+        Self::with_page_size(id, proc_mesh, DEFAULT_PAGE, controller)
     }
 
-    pub fn name(&self) -> &Name {
-        &self.name
+    pub fn id(&self) -> &ActorMeshId {
+        &self.id
     }
 
     pub(crate) fn with_page_size(
-        name: Name,
+        id: ActorMeshId,
         proc_mesh: ProcMeshRef,
         page_size: usize,
-        controller: Option<hyperactor_reference::ActorRef<ActorMeshController<A>>>,
+        controller: Option<ActorRef<ActorMeshController<A>>>,
     ) -> Self {
         Self {
             proc_mesh,
-            name,
+            id,
             controller,
             health_state: ActorLocal::new(),
             receiver: ActorLocal::new(),
@@ -635,14 +658,11 @@ impl<A: Referable> ActorMeshRef<A> {
         view::Ranked::region(&self.proc_mesh).num_ranks()
     }
 
-    pub fn controller(&self) -> &Option<hyperactor_reference::ActorRef<ActorMeshController<A>>> {
+    pub fn controller(&self) -> &Option<ActorRef<ActorMeshController<A>>> {
         &self.controller
     }
 
-    fn set_controller(
-        &mut self,
-        controller: Option<hyperactor_reference::ActorRef<ActorMeshController<A>>>,
-    ) {
+    fn set_controller(&mut self, controller: Option<ActorRef<ActorMeshController<A>>>) {
         self.controller = controller;
     }
 
@@ -652,7 +672,7 @@ impl<A: Referable> ActorMeshRef<A> {
             .get_or_init(|| (0..n).map(|_| OnceCell::new()).collect())
     }
 
-    fn materialize(&self, rank: usize) -> Option<&hyperactor_reference::ActorRef<A>> {
+    fn materialize(&self, rank: usize) -> Option<&ActorRef<A>> {
         let len = self.len();
         if rank >= len {
             return None;
@@ -684,15 +704,15 @@ impl<A: Referable> ActorMeshRef<A> {
             );
             let proc_ref =
                 ndslice::view::Ranked::get(&self.proc_mesh, rank).expect("rank in-bounds");
-            proc_ref.attest(&self.name)
+            proc_ref.attest(&self.id)
         }))
     }
 
     fn init_supervision_receiver(
-        controller: &hyperactor_reference::ActorRef<ActorMeshController<A>>,
+        controller: &ActorRef<ActorMeshController<A>>,
         cx: &impl context::Actor,
     ) -> (
-        hyperactor_reference::PortRef<Option<MeshFailure>>,
+        PortRef<Option<MeshFailure>>,
         watch::Receiver<MessageOrFailure<Option<MeshFailure>>>,
     ) {
         let (tx, rx) = cx.mailbox().open_port();
@@ -715,7 +735,7 @@ impl<A: Referable> ActorMeshRef<A> {
     ) -> Result<MeshFailure, anyhow::Error> {
         if let Some(failure) = self.cached_failure(cx) {
             tracing::debug!(
-                actor_mesh = %self.name,
+                actor_mesh = %self.id,
                 crashed_ranks = ?failure.crashed_ranks,
                 "returning cached supervision failure"
             );
@@ -797,14 +817,14 @@ impl<A: Referable> ActorMeshRef<A> {
                     // Treat timeout from controller as a supervision failure,
                     // the controller is unreachable.
                     Ok(MeshFailure {
-                        actor_mesh_name: Some(self.name().to_string()),
+                        actor_mesh_name: Some(self.id().to_string()),
                         event: ActorSupervisionEvent::new(
                             controller.actor_id().clone(),
                             None,
                             ActorStatus::generic_failure(format!(
                                 "timed out reaching controller {} for mesh {}. Assuming controller's proc is dead",
                                 controller.actor_id(),
-                                self.name()
+                                self.id()
                             )),
                             None,
                         ),
@@ -837,7 +857,7 @@ impl<A: Referable> ActorMeshRef<A> {
     pub fn clone_with_supervision_receiver(&self) -> Self {
         Self {
             proc_mesh: self.proc_mesh.clone(),
-            name: self.name.clone(),
+            id: self.id.clone(),
             controller: self.controller.clone(),
             health_state: self.health_state.clone(),
             receiver: self.receiver.clone(),
@@ -852,7 +872,7 @@ impl<A: Referable> Clone for ActorMeshRef<A> {
     fn clone(&self) -> Self {
         Self {
             proc_mesh: self.proc_mesh.clone(),
-            name: self.name.clone(),
+            id: self.id.clone(),
             controller: self.controller.clone(),
             // Cloning should not use the same health state or receiver, because
             // it should make a new subscriber.
@@ -866,13 +886,13 @@ impl<A: Referable> Clone for ActorMeshRef<A> {
 
 impl<A: Referable> fmt::Display for ActorMeshRef<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}@{}", self.name, A::typename(), self.proc_mesh)
+        write!(f, "{}:{}@{}", self.id, A::typename(), self.proc_mesh)
     }
 }
 
 impl<A: Referable> PartialEq for ActorMeshRef<A> {
     fn eq(&self, other: &Self) -> bool {
-        self.proc_mesh == other.proc_mesh && self.name == other.name
+        self.proc_mesh == other.proc_mesh && self.id == other.id
     }
 }
 impl<A: Referable> Eq for ActorMeshRef<A> {}
@@ -880,7 +900,7 @@ impl<A: Referable> Eq for ActorMeshRef<A> {}
 impl<A: Referable> Hash for ActorMeshRef<A> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.proc_mesh.hash(state);
-        self.name.hash(state);
+        self.id.hash(state);
     }
 }
 
@@ -888,7 +908,7 @@ impl<A: Referable> fmt::Debug for ActorMeshRef<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ActorMeshRef")
             .field("proc_mesh", &self.proc_mesh)
-            .field("name", &self.name)
+            .field("id", &self.id)
             .field("page_size", &self.page_size)
             .finish_non_exhaustive() // No print cache.
     }
@@ -900,8 +920,7 @@ impl<A: Referable> Serialize for ActorMeshRef<A> {
     where
         S: Serializer,
     {
-        // Serialize only the fields that don't depend on A
-        (&self.proc_mesh, &self.name, &self.controller).serialize(serializer)
+        (&self.proc_mesh, &self.id, &self.controller).serialize(serializer)
     }
 }
 
@@ -911,13 +930,13 @@ impl<'de, A: Referable> Deserialize<'de> for ActorMeshRef<A> {
     where
         D: Deserializer<'de>,
     {
-        let (proc_mesh, name, controller) = <(
+        let (proc_mesh, id, controller) = <(
             ProcMeshRef,
-            Name,
-            Option<hyperactor_reference::ActorRef<ActorMeshController<A>>>,
+            ActorMeshId,
+            Option<ActorRef<ActorMeshController<A>>>,
         )>::deserialize(deserializer)?;
         Ok(ActorMeshRef::with_page_size(
-            name,
+            id,
             proc_mesh,
             DEFAULT_PAGE,
             controller,
@@ -926,7 +945,7 @@ impl<'de, A: Referable> Deserialize<'de> for ActorMeshRef<A> {
 }
 
 impl<A: Referable> view::Ranked for ActorMeshRef<A> {
-    type Item = hyperactor_reference::ActorRef<A>;
+    type Item = ActorRef<A>;
 
     #[inline]
     fn region(&self) -> &Region {
@@ -949,7 +968,7 @@ impl<A: Referable> view::RankedSliceable for ActorMeshRef<A> {
         let proc_mesh = self.proc_mesh.subset(region).unwrap();
         Self {
             proc_mesh,
-            name: self.name.clone(),
+            id: self.id.clone(),
             controller: self.controller.clone(),
             health_state: self.health_state.clone(),
             receiver: ActorLocal::new(),
@@ -968,18 +987,22 @@ mod tests {
     use hyperactor::actor::ActorErrorKind;
     use hyperactor::actor::ActorStatus;
     use hyperactor::context::Mailbox as _;
+    use hyperactor::id::Label;
     use hyperactor::mailbox;
     use ndslice::Extent;
     use ndslice::ViewExt;
     use ndslice::extent;
     use ndslice::view::Ranked;
+    use timed_test::assert_no_process_leak;
     use timed_test::async_timed_test;
     use tokio::time::Duration;
 
     use super::ActorMesh;
     use crate::ActorMeshRef;
-    use crate::Name;
     use crate::ProcMesh;
+    use crate::host_mesh::GET_PROC_STATE_MAX_IDLE;
+    use crate::mesh_controller::SUPERVISION_POLL_FREQUENCY;
+    use crate::mesh_id::ActorMeshId;
     use crate::proc_mesh::ACTOR_SPAWN_MAX_IDLE;
     use crate::proc_mesh::GET_ACTOR_STATE_MAX_IDLE;
     use crate::supervision::MeshFailure;
@@ -1011,7 +1034,7 @@ mod tests {
         // page 0: ranks [0,1], page 1: [2,3], page 2: [4,5]
         let page_size = 2;
         let amr: ActorMeshRef<testactor::TestActor> =
-            ActorMeshRef::with_page_size(am.name.clone(), pm.clone(), page_size, None);
+            ActorMeshRef::with_page_size(am.id.clone(), pm.clone(), page_size, None);
         assert_eq!(amr.extent(), extent!(hosts = 3, gpus = 2));
         assert_eq!(amr.region().num_ranks(), 6);
 
@@ -1106,7 +1129,7 @@ mod tests {
             .spawn(instance, "test", Extent::unity(), None)
             .await
             .unwrap();
-        let child_name = Name::new("child").unwrap();
+        let child_name = ActorMeshId::unique(Label::new("child").unwrap());
 
         // Need to use a wrapper as there's no way to customize the handler for MeshFailure
         // on the client instance. The client would just panic with the message.
@@ -1153,9 +1176,14 @@ mod tests {
             .expect("no supervision event found on ref from wrapper actor");
         let check_failure = move |failure: MeshFailure| {
             assert_eq!(failure.actor_mesh_name, Some(child_name.to_string()));
-            assert_eq!(
-                failure.event.actor_id.name(),
-                child_name.clone().to_string()
+            assert!(
+                failure
+                    .event
+                    .actor_id
+                    .label()
+                    .unwrap()
+                    .as_str()
+                    .starts_with(child_name.label().unwrap().as_str())
             );
             if let ActorStatus::Failed(ActorErrorKind::Generic(msg)) = &failure.event.actor_status {
                 assert!(msg.contains("panic"), "{}", msg);
@@ -1181,13 +1209,16 @@ mod tests {
         let _ = hm.shutdown(instance).await;
     }
 
-    #[async_timed_test(timeout_secs = 30)]
     #[cfg(fbcode_build)]
+    #[assert_no_process_leak]
+    #[async_timed_test(timeout_secs = 30)]
     async fn test_actor_states_with_process_exit() {
         hyperactor_telemetry::initialize_logging_for_test();
 
         let config = hyperactor_config::global::lock();
+        let _poll = config.override_key(SUPERVISION_POLL_FREQUENCY, Duration::from_secs(1));
         let _guard = config.override_key(GET_ACTOR_STATE_MAX_IDLE, Duration::from_secs(1));
+        let _proc_guard = config.override_key(GET_PROC_STATE_MAX_IDLE, Duration::from_secs(1));
 
         let instance = testing::instance();
         // Listen for supervision events sent to the parent instance.
@@ -1204,7 +1235,7 @@ mod tests {
             .spawn(instance, "test2", Extent::unity(), None)
             .await
             .unwrap();
-        let child_name = Name::new("child").unwrap();
+        let child_name = ActorMeshId::unique(Label::new("child").unwrap());
 
         // Need to use a wrapper as there's no way to customize the handler for MeshFailure
         // on the client instance. The client would just panic with the message.
@@ -1249,7 +1280,15 @@ mod tests {
 
         let check_failure = move |failure: MeshFailure| {
             assert_eq!(failure.actor_mesh_name, Some(child_name.to_string()));
-            assert_eq!(failure.event.actor_id.name(), child_name.to_string());
+            assert!(
+                failure
+                    .event
+                    .actor_id
+                    .label()
+                    .unwrap()
+                    .as_str()
+                    .starts_with(child_name.label().unwrap().as_str())
+            );
             if let ActorStatus::Failed(ActorErrorKind::Generic(msg)) = &failure.event.actor_status {
                 assert!(msg.contains("exited with non-zero code 1"), "{}", msg);
             } else {
@@ -1287,7 +1326,7 @@ mod tests {
             .spawn(instance, "test", Extent::unity(), None)
             .await
             .unwrap();
-        let child_name = Name::new("child").unwrap();
+        let child_name = ActorMeshId::unique(Label::new("child").unwrap());
 
         // Need to use a wrapper as there's no way to customize the handler for MeshFailure
         // on the client instance. The client would just panic with the message.
@@ -1322,7 +1361,14 @@ mod tests {
                     .expect("timeout")
                     .unwrap();
             let event = supervision_message.event;
-            assert_eq!(event.actor_id.name(), format!("{}", child_name.clone()));
+            assert!(
+                event
+                    .actor_id
+                    .label()
+                    .unwrap()
+                    .as_str()
+                    .starts_with(child_name.label().unwrap().as_str())
+            );
             if let ActorStatus::Failed(ActorErrorKind::Generic(msg)) = &event.actor_status {
                 assert!(msg.contains("panic"));
                 assert!(msg.contains("for testing"));
@@ -1379,8 +1425,9 @@ mod tests {
     ///
     /// This is the V1 version of the test from
     /// hyperactor_multiprocess/src/proc_actor.rs::test_undeliverable_message_return.
-    #[async_timed_test(timeout_secs = 60)]
     #[cfg(fbcode_build)]
+    #[assert_no_process_leak]
+    #[async_timed_test(timeout_secs = 60)]
     async fn test_undeliverable_message_return() {
         use hyperactor::mailbox::MessageEnvelope;
         use hyperactor::mailbox::Undeliverable;
@@ -1654,10 +1701,7 @@ mod tests {
         // Each owned mesh has an implicit ref mesh though, so that is what we
         // test here.
         let next_event = actor_mesh.next_supervision_event(instance).await.unwrap();
-        assert_eq!(
-            next_event.actor_mesh_name,
-            Some(mesh_ref.name().to_string())
-        );
+        assert_eq!(next_event.actor_mesh_name, Some(mesh_ref.id().to_string()));
         assert!(matches!(
             next_event.event.actor_status,
             ActorStatus::Stopped(_)
@@ -1665,10 +1709,7 @@ mod tests {
         // Check that a cloned Ref from earlier gets the same event. Every clone
         // should get the same event, even if it's not a subscriber.
         let next_event = mesh_ref.next_supervision_event(instance).await.unwrap();
-        assert_eq!(
-            next_event.actor_mesh_name,
-            Some(mesh_ref.name().to_string())
-        );
+        assert_eq!(next_event.actor_mesh_name, Some(mesh_ref.id().to_string()));
         assert!(matches!(
             next_event.event.actor_status,
             ActorStatus::Stopped(_)

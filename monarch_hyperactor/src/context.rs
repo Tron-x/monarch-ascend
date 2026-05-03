@@ -17,7 +17,7 @@ use pyo3::prelude::*;
 use crate::actor::PythonActor;
 use crate::actor::root_client_actor;
 use crate::mailbox::PyMailbox;
-use crate::proc::PyActorId;
+use crate::proc::PyActorAddr;
 use crate::runtime;
 use crate::shape::PyPoint;
 
@@ -78,8 +78,9 @@ impl PyInstance {
     }
 
     #[getter]
-    pub fn actor_id(&self) -> PyActorId {
-        self.inner.self_id().clone().into()
+    pub fn actor_id(&self) -> PyActorAddr {
+        let actor_id: hyperactor::ActorAddr = self.inner.self_id().clone();
+        actor_id.into()
     }
 
     #[pyo3(signature = (reason = None))]

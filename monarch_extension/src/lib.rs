@@ -131,7 +131,7 @@ pub fn mod_init(module: &Bound<'_, PyModule>) -> PyResult<()> {
             "monarch_extension.mesh_controller",
         )?)?;
     }
-    #[cfg(any(feature = "tensor_engine", feature = "ascend_engine"))]
+    #[cfg(any(feature = "tensor_engine_gpu", feature = "ascend_engine"))]
     {
         monarch_rdma_extension::register_python_bindings(&get_or_add_new_module(module, "rdma")?)?;
     }

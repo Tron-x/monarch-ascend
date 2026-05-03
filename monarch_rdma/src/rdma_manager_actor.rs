@@ -35,6 +35,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use hyperactor as reference;
 use hyperactor::Actor;
 use hyperactor::ActorHandle;
 use hyperactor::Context;
@@ -45,7 +46,6 @@ use hyperactor::OncePortHandle;
 use hyperactor::RefClient;
 use hyperactor::RemoteSpawn;
 use hyperactor::context;
-use hyperactor::reference;
 use hyperactor::supervision::ActorSupervisionEvent;
 use hyperactor_config::Flattrs;
 use serde::Deserialize;
@@ -188,13 +188,13 @@ impl<A: Actor> RdmaBackendActor<A> {
 #[cfg(not(feature = "hixl"))]
 #[derive(Debug)]
 #[hyperactor::export(
-    spawn = true,
     handlers = [
         GetIbvActorRef,
         GetTcpActorRef,
         ReleaseBuffer,
     ],
 )]
+#[hyperactor::spawnable]
 pub struct RdmaManagerActor {
     next_remote_buf_id: usize,
     buffers: HashMap<usize, Arc<dyn RdmaLocalMemory>>,
@@ -205,9 +205,13 @@ pub struct RdmaManagerActor {
 #[cfg(not(feature = "hixl"))]
 impl RdmaManagerActor {
     pub fn local_handle(client: &impl context::Actor) -> ActorHandle<Self> {
-        let proc_id = client.mailbox().actor_id().proc_id().clone();
-        let actor_ref =
-            reference::ActorRef::attest(reference::ActorId::new(proc_id, "rdma_manager", 0));
+        let actor_ref = reference::ActorRef::attest(
+            client
+                .mailbox()
+                .actor_id()
+                .proc_ref()
+                .actor_id("rdma_manager"),
+        );
         actor_ref
             .downcast_handle(client)
             .expect("RdmaManagerActor is not in the local process")
@@ -371,12 +375,12 @@ impl RdmaManagerMessageHandler for RdmaManagerActor {
 #[cfg(feature = "hixl")]
 #[derive(Debug)]
 #[hyperactor::export(
-    spawn = true,
     handlers = [
         ReleaseBuffer,
         EnsurePeerConnected,
     ],
 )]
+#[hyperactor::spawnable]
 pub struct RdmaManagerActor {
     next_remote_buf_id: usize,
     buffers: HashMap<usize, Arc<dyn RdmaLocalMemory>>,
@@ -386,9 +390,13 @@ pub struct RdmaManagerActor {
 #[cfg(feature = "hixl")]
 impl RdmaManagerActor {
     pub fn local_handle(client: &impl context::Actor) -> ActorHandle<Self> {
-        let proc_id = client.mailbox().actor_id().proc_id().clone();
-        let actor_ref =
-            reference::ActorRef::attest(reference::ActorId::new(proc_id, "rdma_manager", 0));
+        let actor_ref = reference::ActorRef::attest(
+            client
+                .mailbox()
+                .actor_id()
+                .proc_ref()
+                .actor_id("rdma_manager"),
+        );
         actor_ref
             .downcast_handle(client)
             .expect("RdmaManagerActor is not in the local process")

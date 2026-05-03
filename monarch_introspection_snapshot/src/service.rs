@@ -124,11 +124,11 @@ use std::time::Duration;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use hyperactor as hyperactor_reference;
 use hyperactor::Actor;
 use hyperactor::Context;
 use hyperactor::Handler;
 use hyperactor::Instance;
-use hyperactor::reference as hyperactor_reference;
 use hyperactor_mesh::introspect::NodePayload;
 use hyperactor_mesh::introspect::NodeRef;
 use hyperactor_mesh::mesh_admin::MeshAdminAgent;
@@ -428,8 +428,8 @@ mod tests {
     use std::collections::HashMap;
     use std::time::SystemTime;
 
+    use hyperactor::ProcAddr;
     use hyperactor::channel::ChannelAddr;
-    use hyperactor::reference::ProcId;
     use hyperactor_mesh::host_mesh::host_agent::HOST_MESH_AGENT_ACTOR_NAME;
     use hyperactor_mesh::introspect::NodeProperties;
     use hyperactor_mesh::introspect::NodeRef;
@@ -444,8 +444,8 @@ mod tests {
     /// and as the `actor_type` string in test fixtures.
     const ACTOR_TYPE: &str = "test_actor";
 
-    fn test_proc_id() -> ProcId {
-        ProcId::with_name(ChannelAddr::Local(0), PROC_NAME)
+    fn test_proc_id() -> ProcAddr {
+        ProcAddr::from_resource_name(ChannelAddr::Local(0), PROC_NAME)
     }
 
     /// Build a stub resolver backed by a `HashMap`.
@@ -467,8 +467,8 @@ mod tests {
     /// Build a minimal mesh topology: root → host → proc → actor.
     fn minimal_mesh_payloads() -> HashMap<NodeRef, NodePayload> {
         let proc_id = test_proc_id();
-        let host_actor_id = proc_id.actor_id(HOST_MESH_AGENT_ACTOR_NAME, 0);
-        let actor_id = proc_id.actor_id(ACTOR_TYPE, 0);
+        let host_actor_id = proc_id.actor_id(HOST_MESH_AGENT_ACTOR_NAME);
+        let actor_id = proc_id.actor_id(ACTOR_TYPE);
 
         let host_ref = NodeRef::Host(host_actor_id.clone());
         let proc_ref = NodeRef::Proc(proc_id.clone());

@@ -18,6 +18,9 @@
 
 use std::fmt;
 
+use crate::ActorAddr;
+use crate::ProcAddr;
+
 /// Identifies the entity a log message pertains to.
 ///
 /// Used as a tracing span field via `%actor_id.subject()`.
@@ -52,13 +55,13 @@ pub trait AsSubject: fmt::Display {
     fn subject(&self) -> Subject<'_>;
 }
 
-impl AsSubject for crate::reference::ActorId {
+impl AsSubject for ActorAddr {
     fn subject(&self) -> Subject<'_> {
         Subject::actor(self)
     }
 }
 
-impl AsSubject for crate::reference::ProcId {
+impl AsSubject for ProcAddr {
     fn subject(&self) -> Subject<'_> {
         Subject::proc(self)
     }
