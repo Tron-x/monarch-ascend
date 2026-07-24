@@ -65,18 +65,30 @@ pub struct HixlEngineState {
     pub registered_addrs: Mutex<HashMap<usize, (usize, usize)>>,
     /// Sub-range aliases: `aliased_addr → (owner_addr, refcount)`.
     ///
-    /// When a new `register_mem_if_needed(addr, size)` call falls fully
-    /// inside an already-registered range `[owner, owner+owner_size)`,
-    /// we skip the HiXL call entirely (HiXL in CANN 9.x rejects more
-    /// than one registered region per engine pair with ret=503900) and
-    /// record the request here instead.  The owner's refcount is also
-    /// bumped so the underlying HiXL registration can't be released
-    /// while aliases are still alive.  This lets an upper layer
-    /// (torchstore, forge) pre-register one large staging buffer and
-    /// then freely reuse sub-slices of it for arbitrary transfers.
+    /// **Historical workaround for CANN 9.0.0-beta.1**.  That version of
+    /// HiXL rejected more than one registered memory region per engine
+    /// pair: a second `hixl_register_mem` would succeed but every
+    /// subsequent `TransferSync` returned `503900` on that pair.  The
+    /// workaround was to detect when a new `register_mem_if_needed(addr,
+    /// size)` call fell fully inside an already-registered range and
+    /// silently alias it back to the owner — keeping HiXL's view of the
+    /// world at "one region per pair".
+    ///
+    /// **CANN 9.0.0 release fixes this on the old P2P API**, so the
+    /// aliasing path is disabled by default starting with this build.
+    /// The field, populator branch, and `deregister_mem` cleanup are
+    /// retained for backward compatibility: set
+    /// `MONARCH_HIXL_ENABLE_ALIAS=1` (see [`HixlEngineState::alias_enabled`])
+    /// to re-enable the old behaviour when running against
+    /// CANN 9.0.0-beta or earlier.
     pub aliased_addrs: Mutex<HashMap<usize, (usize, usize)>>,
     /// `true` when running over RoCE instead of HCCS.
     pub force_roce: bool,
+    /// `true` if the range-containment alias workaround should be
+    /// active.  Default `false` (CANN 9.0.0 release no longer needs it);
+    /// set the env var `MONARCH_HIXL_ENABLE_ALIAS=1` to force it on for
+    /// older CANN builds.
+    pub alias_enabled: bool,
 }
 
 impl std::fmt::Debug for HixlEngineState {
@@ -202,6 +214,11 @@ pub fn register_mem_if_needed(addr: usize, size: usize) -> Result<()> {
         // Case 2: exact match on a known alias -> bump both alias and
         // the real owner's refcount (so the real HiXL registration
         // can't be torn down while any alias is in flight).
+        //
+        // Reachable only when `alias_enabled` (legacy CANN 9.0.0-beta).
+        // On CANN 9.0.0 release the alias table is never populated, so
+        // this branch is effectively dead code but kept for backward
+        // compatibility with older CANN builds.
         if let Some((owner, arefcnt)) = aliases.get_mut(&addr) {
             *arefcnt += 1;
             let owner_key = *owner;
@@ -211,49 +228,52 @@ pub fn register_mem_if_needed(addr: usize, size: usize) -> Result<()> {
             return Ok(());
         }
 
-        // Case 3: new addr but fully contained in an existing real
-        // registration's range -> record as alias, skip HiXL call.
+        // Case 3 (legacy): new addr but fully contained in an existing
+        // real registration's range -> record as alias, skip HiXL call.
         //
-        // HiXL (CANN 9.x) allows at most one registered memory region
-        // per engine pair; issuing a second `register_mem` on the same
-        // pair makes every subsequent `TransferSync` return 503900 on
-        // that pair.  The protocol still works across *all* addresses
-        // that physically live inside an already-registered region —
-        // so once an upper layer has reserved a large backing buffer,
-        // we can freely reuse sub-slices of it without ever asking
-        // HiXL to register a second region.  This branch implements
-        // that "range containment" check.
+        // **Disabled by default.**  This workaround was required for
+        // CANN 9.0.0-beta.1 where HiXL rejected more than one
+        // registered memory region per engine pair (every subsequent
+        // `TransferSync` returned 503900).  CANN 9.0.0 release fixes
+        // this on the old P2P API — confirmed by
+        // `tests/hixl/e2e/test_multi_region_per_pair.py` PASS on
+        // both HCCS and RoCE transports — so we now fall through to
+        // Case 4 and let HiXL register each region individually.
         //
-        // We only match containment: the new [addr, addr+size) must be
-        // fully inside some existing [owner, owner+owner_size).
-        let containing_owner = addrs
-            .iter()
-            .find_map(|(&owner_addr, &(owner_size, _))| {
-                if addr >= owner_addr
-                    && size <= owner_size
-                    && addr + size <= owner_addr + owner_size
-                {
-                    Some((owner_addr, owner_size))
-                } else {
-                    None
+        // Set `MONARCH_HIXL_ENABLE_ALIAS=1` to re-enable the
+        // containment check when running against CANN 9.0.0-beta or
+        // earlier.
+        if state.alias_enabled {
+            let containing_owner = addrs
+                .iter()
+                .find_map(|(&owner_addr, &(owner_size, _))| {
+                    if addr >= owner_addr
+                        && size <= owner_size
+                        && addr + size <= owner_addr + owner_size
+                    {
+                        Some((owner_addr, owner_size))
+                    } else {
+                        None
+                    }
+                });
+            if let Some((owner_addr, _owner_size)) = containing_owner {
+                aliases.insert(addr, (owner_addr, 1));
+                if let Some((_sz, orefcnt)) = addrs.get_mut(&owner_addr) {
+                    *orefcnt += 1;
                 }
-            });
-        if let Some((owner_addr, _owner_size)) = containing_owner {
-            aliases.insert(addr, (owner_addr, 1));
-            if let Some((_sz, orefcnt)) = addrs.get_mut(&owner_addr) {
-                *orefcnt += 1;
+                tracing::debug!(
+                    "[hixl] aliasing addr={:#x} size={} to owner={:#x} (skipping hixl_register_mem) [legacy CANN workaround]",
+                    addr,
+                    size,
+                    owner_addr,
+                );
+                return Ok(());
             }
-            tracing::debug!(
-                "[hixl] aliasing addr={:#x} size={} to owner={:#x} (skipping hixl_register_mem)",
-                addr,
-                size,
-                owner_addr,
-            );
-            return Ok(());
         }
 
         // Case 4: fresh registration.  Fall through to the original
         // path: warn on alignment, call HiXL, record as real.
+        // This is the default path on CANN 9.0.0 release and later.
         if !state.force_roce && (addr % HCCS_ALIGNMENT != 0) {
             tracing::warn!(
                 "[hixl] memory addr={:#x} is NOT 2 MB aligned (offset={:#x}). \
@@ -545,6 +565,16 @@ fn do_init_engine(dev: i32, eid: String, force_roce: bool) -> Result<()> {
             let result = hixl_sys::HixlEngine::new(dev, &eid_clone);
             match result {
                 Ok(engine) => {
+                    let alias_enabled = std::env::var("MONARCH_HIXL_ENABLE_ALIAS")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    if alias_enabled {
+                        tracing::warn!(
+                            "[hixl] MONARCH_HIXL_ENABLE_ALIAS=1 — using legacy \
+                             range-containment alias workaround (only needed on \
+                             CANN 9.0.0-beta and earlier)"
+                        );
+                    }
                     let new_state = HixlEngineState {
                         engine,
                         engine_id: eid_clone.clone(),
@@ -552,6 +582,7 @@ fn do_init_engine(dev: i32, eid: String, force_roce: bool) -> Result<()> {
                         registered_addrs: Mutex::new(HashMap::new()),
                         aliased_addrs: Mutex::new(HashMap::new()),
                         force_roce,
+                        alias_enabled,
                     };
                     *HIXL_STATE.lock().unwrap() = Some(new_state);
                     unsafe { std::env::set_var("MONARCH_PYTHON_HIXL_ENGINE_ID", &eid_clone) };

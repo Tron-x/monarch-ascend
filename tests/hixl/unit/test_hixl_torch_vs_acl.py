@@ -12,7 +12,7 @@ import multiprocessing as mp
 
 os.environ["HCCL_INTRA_ROCE_ENABLE"] = "1"
 
-CANN = "/root/hzz/cann-9.0.0-beta.1"
+CANN = "/usr/local/Ascend/ascend-toolkit/latest"
 HIXL_LIB = os.path.join(CANN, "lib64", "libcann_hixl.so")
 ACL_LIB = os.path.join(CANN, "aarch64-linux", "lib64", "libascendcl.so")
 BUF_SIZE = 64

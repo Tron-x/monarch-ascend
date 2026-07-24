@@ -11,7 +11,7 @@ import ctypes
 
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 os.environ.setdefault("HCCL_INTRA_ROCE_ENABLE", "1")
-os.environ.setdefault("ASCEND_HOME_PATH", "/root/hzz/cann-9.0.0-beta.1")
+os.environ.setdefault("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest")
 
 import torch
 try:

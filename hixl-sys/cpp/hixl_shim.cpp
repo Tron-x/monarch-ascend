@@ -15,9 +15,12 @@
 #include <acl/acl_rt.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <strings.h>
 #include <map>
 #include <mutex>
+#include <string>
 #include <unistd.h>
 using namespace hixl;
 
@@ -51,6 +54,59 @@ void set_acl_context(uintptr_t ctx_ptr) {
     fprintf(stderr, "[hixl_test] set_acl_context(%p): %d\n", ctx, ret);
 }
 
+// Build the canonical options map for `hixl::Hixl::Initialize`.
+//
+// HiXL's C++ Initialize accepts four options (libcann_hixl.so error message
+// enumerates them as OPTION_LOCAL_COMM_RES, OPTION_BUFFER_POOL,
+// OPTION_RDMA_TRAFFIC_CLASS, OPTION_RDMA_SERVICE_LEVEL).
+//
+//   BufferPool=0:0
+//      Always set.  Disables the internal staging pool; Monarch manages
+//      NPU memory itself via aclrtMalloc-aligned tensors.
+//
+//   LocalCommRes={"version":"<v>"}
+//      Opt-in via `MONARCH_HIXL_USE_LOCAL_COMM_RES=1`.  Tells HiXL to
+//      auto-generate the endpoint descriptor (net_instance_id,
+//      endpoint_list) from the local device — the new replacement for the
+//      legacy rankTable JSON.  Recommended by the HiXL team to avoid
+//      contending with `torch.distributed`'s HCCL process_group for the
+//      HcclAdapter singleton (the historical `HcclCommPrepare ret=0x13`).
+//
+//      WARNING: enabling LocalCommRes makes HiXL route all transfers
+//      through the AICPU kernel `libcann_hixl_kernel.so` instead of the
+//      legacy device-direct path.  That .so must be present in the NPU
+//      device-side LD_LIBRARY_PATH
+//      (`/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/`); otherwise
+//      `hixl_transfer_*` fails with `ret=507018`
+//      (`ACL_ERROR_RT_AICPU_EXCEPTION`).  See
+//      `tests/hixl/run_cs_smoke.sh` for a deployment readiness check.
+//
+//      Version overridable via `MONARCH_HIXL_LOCAL_COMM_RES_VERSION`
+//      (default "1.3").
+//
+// On the current CANN 9.0.0 release + driver 25.5.0 environment the
+// AICPU kernel SO is not deployed yet, so LocalCommRes is off by default
+// to keep the legacy path working.  Flip the env flag once HiXL team
+// confirms the deployment.
+static void populate_init_opts(std::map<AscendString, AscendString>& opts) {
+    opts["BufferPool"] = "0:0";
+
+    const char* enable = std::getenv("MONARCH_HIXL_USE_LOCAL_COMM_RES");
+    bool use_lcr = (enable && (std::strcmp(enable, "1") == 0 ||
+                               strcasecmp(enable, "true") == 0));
+    if (use_lcr) {
+        const char* ver_env =
+            std::getenv("MONARCH_HIXL_LOCAL_COMM_RES_VERSION");
+        std::string ver = (ver_env && *ver_env) ? ver_env : "1.3";
+        std::string json = std::string("{\"version\":\"") + ver + "\"}";
+        opts["LocalCommRes"] = AscendString(json.c_str());
+        fprintf(stderr,
+                "[hixl_shim] LocalCommRes enabled (version=%s); transfers "
+                "will go through AICPU kernel libcann_hixl_kernel.so\n",
+                ver.c_str());
+    }
+}
+
 void* hixl_init_engine(int dev, const char* engine_id) {
     auto* ctx = new HixlTestCtx();
     ctx->device = dev;
@@ -61,7 +117,7 @@ void* hixl_init_engine(int dev, const char* engine_id) {
     ctx->engine = new Hixl();
     std::string eid(engine_id);
     std::map<AscendString, AscendString> opts;
-    opts["BufferPool"] = "0:0";
+    populate_init_opts(opts);
     auto s = ctx->engine->Initialize(AscendString(eid.c_str()), opts);
     fprintf(stderr, "[hixl_test] Init(%s) dev=%d tid=%ld: %u\n",
             eid.c_str(), dev, (long)pthread_self(), s);
@@ -83,7 +139,7 @@ void* hixl_init_engine_with_ctx(uintptr_t acl_ctx_ptr, const char* engine_id) {
     ctx->engine = new Hixl();
     std::string eid(engine_id);
     std::map<AscendString, AscendString> opts;
-    opts["BufferPool"] = "0:0";
+    populate_init_opts(opts);
     auto s = ctx->engine->Initialize(AscendString(eid.c_str()), opts);
     fprintf(stderr, "[hixl_test] InitWithCtx(%s) ctx=%p tid=%ld: %u\n",
             eid.c_str(), ctx->acl_ctx, (long)pthread_self(), s);

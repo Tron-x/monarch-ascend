@@ -104,7 +104,7 @@ tests/hixl/
 ```bash
 # 环境准备
 conda activate monarch_ascend
-source /root/hzz/cann-9.0.0-beta.1/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
 # ---- 编译 Rust 后端 (Plan B) ----
 PYO3_PYTHON=$(which python) cargo build -p monarch_extension \

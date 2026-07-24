@@ -8,7 +8,7 @@ Two proc meshes on the same host, each bound to a different NPU via
 per_host={"npus": 1} (automatic ASCEND_RT_VISIBLE_DEVICES isolation).
 
 Run:
-    source /root/hzz/cann-9.0.0-beta.1/set_env.sh
+    source /usr/local/Ascend/ascend-toolkit/set_env.sh
     python tests/hixl/e2e/test_xdma_buffer.py
 """
 

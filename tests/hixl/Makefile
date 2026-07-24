@@ -6,7 +6,7 @@ CXX       := g++
 CC        := gcc
 CXXFLAGS  := -std=c++17 -O2 -I$(HIXL_INC)
 CFLAGS    := -std=c11 -O2
-LDFLAGS   := -L$(HIXL_LIB) -lcann_hixl -lascendcl -lpthread -ldl -Wl,-rpath,$(HIXL_LIB)
+LDFLAGS   := -L$(HIXL_LIB) -lcann_hixl -lmetadef -lascendcl -lc_sec -lpthread -ldl -Wl,-rpath,$(HIXL_LIB)
 
 BUILDDIR  := build
 

@@ -17,7 +17,7 @@
 |------|------|------|
 | OS | Huawei Cloud EulerOS 2.0 (aarch64) | 包管理器: yum/dnf |
 | NPU | Ascend 910B1 × 8 | 每卡 64GB HBM |
-| CANN | 9.0.0-beta.1 | 自定义路径 `/root/hzz/cann-9.0.0-beta.1/` |
+| CANN | 9.1.0 (toolkit + 910b-ops + nnal, innerver V100R001C11B063) | 容器默认路径 `/usr/local/Ascend/cann-9.1.0/`，通过 `/usr/local/Ascend/ascend-toolkit/latest` symlink 引用。9.1.0 起 ops 包必须**单独安装**（`Ascend-cann-910b-ops_9.1.0_linux-aarch64.run`），才能携带签了名的 `cann-hixl-compat.tar.gz`，否则 HiXL 新 AICPU kernel 路径会因验签失败而无法在 device 端 deploy `libcann_hixl_kernel.so`。 |
 | Python | 3.11.0 | conda 环境 `monarch_ascend` |
 | PyTorch | 2.8.0 | torch_npu 提供 NPU 后端 |
 | torch_npu | 2.8.0.post2 | 与 CANN 9.0 配套 |
@@ -43,8 +43,9 @@ npu-smi info
 ```bash
 source /path/to/cann/set_env.sh
 
-# 例如：
-source /root/hzz/cann-9.0.0-beta.1/set_env.sh
+# 例如（容器默认安装路径）：
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh   # ATB 加速库
 ```
 
 验证 CANN 库文件存在：
@@ -178,10 +179,12 @@ pip install setuptools setuptools-rust
 conda activate monarch_ascend
 
 # 1. source CANN 环境（每个终端都要）
-source /root/hzz/cann-9.0.0-beta.1/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
 
 # 2. 设置 ASCEND_HOME（指向包含 include/ 和 lib64/ 的架构子目录）
-export ASCEND_HOME=/root/hzz/cann-9.0.0-beta.1/aarch64-linux
+#    用 latest symlink，未来 CANN 升级时不用再改
+export ASCEND_HOME=/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux
 ```
 
 #### 方式一：pip install（推荐）
@@ -248,10 +251,10 @@ PYO3_PYTHON=$(which python) cargo build -p monarch_extension \
 >
 > ```bash
 > # ❌ 错误 — 这是 CANN 根目录，下面没有 include/
-> export ASCEND_HOME=/root/hzz/cann-9.0.0-beta.1
+> export ASCEND_HOME=/usr/local/Ascend/ascend-toolkit/latest
 >
 > # ✅ 正确 — 架构子目录，下面有 include/ 和 lib64/
-> export ASCEND_HOME=/root/hzz/cann-9.0.0-beta.1/aarch64-linux
+> export ASCEND_HOME=/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux
 > ```
 >
 > build.rs 会检查 `$ASCEND_HOME/include` 是否存在，路径不对会报
@@ -289,7 +292,8 @@ python tests/hixl/app/test_grpo_npu.py
 
 ```bash
 conda activate monarch_ascend
-source /root/hzz/cann-9.0.0-beta.1/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
 ```
 
 不 source CANN 环境会导致 `libascendcl.so` / `libcann_hixl.so` 找不到。

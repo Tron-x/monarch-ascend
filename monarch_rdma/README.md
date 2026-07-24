@@ -164,36 +164,45 @@ python monarch/tests/hixl/e2e/test_multinode_rdma.py --size-mb 256
 A healthy run achieves ≈20-24 GB/s for a 256 MB cross-host `RDMABuffer.read_into`
 (≈200 Gb/s RoCE line-rate).
 
-### Known limitation: one registered region per engine pair
+### Legacy limitation: one registered region per engine pair (fixed in CANN 9.0.0)
 
-As of CANN 9.0 / HiXL, `TransferSync` fails with error `503900` when a pair of
-engines has **more than one simultaneously registered memory region**. The
-registration call itself succeeds, but subsequent transfers on any region after
-the first return 503900.
+**CANN 9.0.0-beta.1** had a HiXL bug where `TransferSync` returned `503900`
+when a pair of engines had more than one simultaneously registered memory
+region. The registration call itself succeeded, but subsequent transfers on
+any region after the first would fail.
 
-To keep callers from having to track this invariant manually,
-`register_mem_if_needed` in `monarch_rdma/src/backend/hixl/manager_actor.rs`
-maintains a secondary `aliased_addrs` table on top of the real HiXL
-registrations. When a new `register_mem_if_needed(addr, size)` request falls
-fully inside a range that is *already* registered, we record it as an alias
-(bumping the owner's refcount) and skip the second `hixl_register_mem` call
-entirely. `deregister_mem` uses refcounts so the underlying HiXL registration
-only gets torn down once every alias and every direct reference is released.
+**CANN 9.0.0 release fixes this on the old P2P API.** Validation tests:
 
-In practice, this means upper layers (torchstore, forge, user code) can
-register a single large staging buffer up-front and then hand out any number
-of sub-slices to different transfers without tripping 503900.
+- `tests/hixl/e2e/test_multi_region_per_pair.py` registers two *independent*
+  (non-overlapping, non-containing) 2MB-aligned NPU buffers on the same
+  engine pair, then writes to each via cross-mesh `RDMABuffer.write_from`.
+  PASS on both HCCS and RoCE transports.
+- `tests/hixl/e2e/test_hixl_hccl_coexist.py` initializes
+  `torch.distributed.init_process_group(backend='hccl')` together with HiXL
+  in the same process. HCCL `all_reduce` + HiXL `register_mem` + cross-mesh
+  `write_from` all succeed without `HcclCommPrepare ret=0x13`. This also
+  validates that the historical HCCL-Adapter singleton contention is gone.
 
-Supported patterns:
+In addition, CANN 9.0.0 ships a new **ClientServer one-sided API**
+(`HixlCS*` in `include/cs/hixl_cs.h`) that uses `mem_tag` to support an
+arbitrary number of registered regions natively (without HCCL comm
+dependency). Monarch's HiXL backend continues to use the old P2P API, which
+now also supports multi-region registration.
 
-- **Staging pool** (recommended, enabled by default in torchstore): a single
-  process-global `RDMABuffer` owns a large aligned NPU tensor; per-transfer
-  buffers are sub-slices of it. The aliasing logic above keeps HiXL happy.
-- **One large buffer per actor**: allocate the max working-set size up front
-  and slice it for individual transfers.
-- **Serial registration**: create, transfer, drop, then create the next
-  (avoid overlapping; overlapping regions also trigger `103900` at register
-  time).
+**Backward compatibility**: `register_mem_if_needed` in
+`monarch_rdma/src/backend/hixl/manager_actor.rs` retains the
+range-containment alias path as opt-in legacy behaviour. Set
+`MONARCH_HIXL_ENABLE_ALIAS=1` to re-enable it when running against
+CANN 9.0.0-beta.1 or earlier.
+
+Recommended usage patterns (no longer required, but still good practice
+for memory locality):
+
+- **Staging pool**: a single process-global aligned NPU buffer split into
+  sub-slices for per-transfer use. Reduces NPU allocator pressure.
+- **Per-actor large buffer**: allocate the working-set size up front.
+- **Truly independent buffers**: now also supported — each one gets its
+  own `hixl_register_mem` call.
 
 ## License
 

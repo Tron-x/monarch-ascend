@@ -2,7 +2,7 @@
 """
 NPU backend validation tests for monarch ascend_engine.
 
-Run: source /root/hzz/cann-9.0.0/set_env.sh && python test_npu_backend.py
+Run: source /usr/local/Ascend/ascend-toolkit/set_env.sh && python test_npu_backend.py
 """
 
 import sys
