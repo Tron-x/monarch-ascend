@@ -7,9 +7,9 @@
 """
 NPU single-sided communication buffer — the NPU counterpart of ``rdma.py``.
 
-**Plan B architecture**: all connect/register/transfer operations go through
-Rust (``hixl-sys`` → ``libtest_hixl.so`` → HiXL C++ API).  Python only deals
-with metadata and the ``_RdmaBuffer`` PyO3 wrapper.
+All connect/register/transfer operations go through the authoritative Rust
+backend (``_rust_bindings.rdma`` → ``hixl-sys`` → HiXL C++ API). Python only
+deals with metadata and the ``_RdmaBuffer`` PyO3 wrapper.
 
 This file is **completely independent** from ``rdma.py``, so upstream GPU
 code updates can be merged without any conflict.

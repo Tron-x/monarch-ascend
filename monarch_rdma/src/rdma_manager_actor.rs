@@ -354,9 +354,9 @@ pub(crate) fn local_ip_for_hixl() -> String {
     }
 
     if let Ok(hostname) = hostname::get() {
-        if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(
-            &format!("{}:0", hostname.to_string_lossy()),
-        ) {
+        if let Ok(addrs) =
+            std::net::ToSocketAddrs::to_socket_addrs(&format!("{}:0", hostname.to_string_lossy()))
+        {
             for addr in addrs {
                 if addr.is_ipv4() && !addr.ip().is_loopback() {
                     return addr.ip().to_string();
@@ -365,10 +365,7 @@ pub(crate) fn local_ip_for_hixl() -> String {
         }
     }
 
-    if let Ok(output) = std::process::Command::new("hostname")
-        .arg("-I")
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("hostname").arg("-I").output() {
         if let Ok(ips) = std::str::from_utf8(&output.stdout) {
             if let Some(ip) = ips.split_whitespace().next() {
                 if !ip.starts_with("127.") {
@@ -439,7 +436,16 @@ impl EnsurePeerConnectedHandler for RdmaManagerActor {
         peer_engine_id: String,
     ) -> Result<(), anyhow::Error> {
         tracing::info!("RdmaManager: ensure_peer_connected to {}", peer_engine_id);
-        crate::backend::hixl::manager_actor::do_connect(&peer_engine_id)?;
-        Ok(())
+        let backend = self
+            .backends
+            .get()
+            .expect("backends set in init")
+            .handles()
+            .into_iter()
+            .find_map(|backend| match backend {
+                RdmaBackendHandle::Hixl(backend) => Some(backend),
+            })
+            .ok_or_else(|| anyhow::anyhow!("HiXL backend not available"))?;
+        backend.connect(&peer_engine_id)
     }
 }

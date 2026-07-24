@@ -65,10 +65,11 @@ def use_npu(dev_id: int):
         import torch
         import torch_npu  # noqa: F401
         torch.npu.set_device(dev_id)
-        from monarch._src.rdma.hixl_transfer import compute_engine_id
-        eid = compute_engine_id()
-        os.environ["MONARCH_PYTHON_HIXL_ENGINE_ID"] = eid
-        print(f"[PID={os.getpid()}] NPU {dev_id} ready, HIXL engine_id={eid}", flush=True)
+        print(
+            f"[PID={os.getpid()}] NPU {dev_id} ready; "
+            "Rust RDMA manager will allocate the HIXL engine_id",
+            flush=True,
+        )
         print(f"  HCCL_INTRA_ROCE_ENABLE={os.environ.get('HCCL_INTRA_ROCE_ENABLE', 'NOT SET')}", flush=True)
 
     return _bootstrap

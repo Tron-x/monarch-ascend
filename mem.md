@@ -46,13 +46,13 @@
 | ASCEND_RT_VISIBLE_DEVICES 对 HIXL 不生效 | 只对 torch_npu 有效，HIXL 用物理设备号 | 通过 `aclrtSetDevice(物理设备号)` 直接指定 |
 | 设备绑定时机 | HIXL 构造函数内部已读取设备上下文 | 必须在 `new hixl::Hixl()` 之前调用 `aclrtSetDevice` |
 | fork() 导致 Connect/Transfer 失败 | 子进程继承 HIXL 内部状态 | 用独立进程（exec 方式）启动 |
-| HIXL 双重初始化 503900 | 同一 engine_id 被初始化两次 | 统一入口，由 hixl_transfer.py 统一管理 |
+| HIXL 双重初始化 503900 | 同一 engine_id 被初始化两次 | 统一由 Rust `HixlManagerActor` 创建和管理 engine |
 
 ### 1.5 架构与即插即用
 
-- **Python 路线**：Rust 只传元数据，实际传输在 Python 侧通过 ctypes 调用 libtest_hixl.so
-- **xdma.py**：NPU 专用单边通信模块，与 rdma.py 完全平行，`rdma.py` 零改动，上游合并零冲突
-- **transport.py**：TransportBackend 注册表，新后端只需实现接口并注册
+- **唯一生产路线**：`xdma.py` 薄封装调用 `_rust_bindings.rdma`，注册、建链和传输均由 `monarch_rdma`/`hixl-sys` 完成
+- **Engine 生命周期**：`HixlManagerActor` 与 backend handle 共享受控 state，不使用 Python ctypes engine 或进程级全局 engine
+- **原生诊断**：`tests/hixl/native` 和测试 shim 只用于隔离 CANN/HiXL 问题，不被 Monarch Python 包加载
 
 ---
 

@@ -6,24 +6,18 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! # HIXL Manager Actor (Rust-managed mode — Plan B)
+//! # HIXL Manager Actor
 //!
-//! The HIXL engine is owned by a process-global singleton and initialised
-//! lazily by [`HixlManagerActor::init`].  All connect, register-mem, and
-//! transfer operations go through the C shim exposed by `hixl-sys`.
-//!
-//! The singleton is shared between:
-//! - [`HixlManagerActor`] (metadata & buffer registration via actor messages)
-//! - [`RdmaRemoteBuffer::read_into_local`] / [`RdmaRemoteBuffer::write_from_local`]
-//!   (data-plane transfers, called from `PyPythonTask` context)
-//! - [`RdmaManagerActor::ensure_peer_connected`] (connection requests from
-//!   remote peers)
+//! The manager actor and its backend handles share one [`HixlEngineState`].
+//! Registration metadata remains actor-owned, while backend handles execute
+//! data-plane transfers directly against the shared state.
 //!
 //! The C shim restores ACL context via `aclrtSetCurrentContext` before each
 //! HiXL call, so operations can run from any thread without serialisation.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
@@ -48,20 +42,74 @@ use crate::local_memory::KeepaliveLocalMemory;
 use crate::rdma_manager_actor::EnsurePeerConnectedClient;
 use crate::rdma_manager_actor::RdmaManagerActor;
 
-// ============================================================================
-// Process-global HIXL engine state
-// ============================================================================
+trait HixlEngineOps: Send + Sync {
+    fn connect(&self, remote_engine_id: &str, timeout_ms: i32) -> Result<(), i32>;
+    fn register_mem(&self, addr: usize, size: usize) -> Result<(), i32>;
+    fn deregister_mem(&self, addr: usize) -> Result<(), i32>;
+    fn transfer_read(
+        &self,
+        remote_engine_id: &str,
+        local_addr: usize,
+        remote_addr: usize,
+        len: usize,
+        timeout_ms: i32,
+    ) -> Result<(), i32>;
+    fn transfer_write(
+        &self,
+        remote_engine_id: &str,
+        local_addr: usize,
+        remote_addr: usize,
+        len: usize,
+        timeout_ms: i32,
+    ) -> Result<(), i32>;
+}
 
-pub struct HixlEngineState {
-    pub engine: hixl_sys::HixlEngine,
-    pub engine_id: String,
-    pub connected_peers: Mutex<HashSet<String>>,
+impl HixlEngineOps for hixl_sys::HixlEngine {
+    fn connect(&self, remote_engine_id: &str, timeout_ms: i32) -> Result<(), i32> {
+        self.connect(remote_engine_id, timeout_ms)
+    }
+
+    fn register_mem(&self, addr: usize, size: usize) -> Result<(), i32> {
+        self.register_mem(addr, size)
+    }
+
+    fn deregister_mem(&self, addr: usize) -> Result<(), i32> {
+        self.deregister_mem(addr)
+    }
+
+    fn transfer_read(
+        &self,
+        remote_engine_id: &str,
+        local_addr: usize,
+        remote_addr: usize,
+        len: usize,
+        timeout_ms: i32,
+    ) -> Result<(), i32> {
+        self.transfer_read(remote_engine_id, local_addr, remote_addr, len, timeout_ms)
+    }
+
+    fn transfer_write(
+        &self,
+        remote_engine_id: &str,
+        local_addr: usize,
+        remote_addr: usize,
+        len: usize,
+        timeout_ms: i32,
+    ) -> Result<(), i32> {
+        self.transfer_write(remote_engine_id, local_addr, remote_addr, len, timeout_ms)
+    }
+}
+
+struct HixlEngineState {
+    engine: Box<dyn HixlEngineOps>,
+    engine_id: String,
+    connected_peers: Mutex<HashSet<String>>,
     /// Real HiXL registrations: `addr → (size, refcount)`.  The first
     /// `register_mem_if_needed` call for a given address performs the
     /// actual `hixl_register_mem` and adds an entry here.  The entry is
     /// removed (and `hixl_deregister_mem` called) once refcount drops
     /// back to 0.
-    pub registered_addrs: Mutex<HashMap<usize, (usize, usize)>>,
+    registered_addrs: Mutex<HashMap<usize, (usize, usize)>>,
     /// Sub-range aliases: `aliased_addr → (owner_addr, refcount)`.
     ///
     /// **Historical workaround for CANN 9.0.0-beta.1**.  That version of
@@ -80,14 +128,14 @@ pub struct HixlEngineState {
     /// `MONARCH_HIXL_ENABLE_ALIAS=1` (see [`HixlEngineState::alias_enabled`])
     /// to re-enable the old behaviour when running against
     /// CANN 9.0.0-beta or earlier.
-    pub aliased_addrs: Mutex<HashMap<usize, (usize, usize)>>,
+    aliased_addrs: Mutex<HashMap<usize, (usize, usize)>>,
     /// `true` when running over RoCE instead of HCCS.
-    pub force_roce: bool,
+    force_roce: bool,
     /// `true` if the range-containment alias workaround should be
     /// active.  Default `false` (CANN 9.0.0 release no longer needs it);
     /// set the env var `MONARCH_HIXL_ENABLE_ALIAS=1` to force it on for
     /// older CANN builds.
-    pub alias_enabled: bool,
+    alias_enabled: bool,
 }
 
 impl std::fmt::Debug for HixlEngineState {
@@ -99,110 +147,76 @@ impl std::fmt::Debug for HixlEngineState {
     }
 }
 
-/// Process-global HIXL state.  Uses `Mutex<Option<..>>` instead of `OnceLock`
-/// so the engine can be re-initialised (e.g. HCCS → RoCE fallback).
-static HIXL_STATE: Mutex<Option<HixlEngineState>> = Mutex::new(None);
-
-/// Check if the HIXL state is already initialised (non-blocking).
-fn is_hixl_initialized() -> bool {
-    HIXL_STATE.lock().unwrap().is_some()
-}
-
-/// Returns a guard referencing the process-global HiXL state, waiting up to
-/// ~10 s for the `HixlManagerActor` child actor to finish initialisation.
-pub fn get_hixl_state() -> Result<std::sync::MutexGuard<'static, Option<HixlEngineState>>> {
-    let guard = HIXL_STATE.lock().unwrap();
-    if guard.is_some() {
-        return Ok(guard);
-    }
-    drop(guard);
-    for _ in 0..100 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let guard = HIXL_STATE.lock().unwrap();
-        if guard.is_some() {
-            return Ok(guard);
-        }
-        drop(guard);
-    }
-    Err(anyhow::anyhow!(
-        "HiXL engine not initialised after 10 s (HixlManagerActor not started?)"
-    ))
-}
-
-/// Helper to run a closure with a reference to the HIXL state.
-/// This avoids holding the MutexGuard across await points.
-pub fn with_state<F, R>(f: F) -> Result<R>
-where
-    F: FnOnce(&HixlEngineState) -> Result<R>,
-{
-    let guard = get_hixl_state()?;
-    let state = guard.as_ref().unwrap();
-    f(state)
-}
-
 /// Default connect timeout in milliseconds.
 pub const DEFAULT_CONNECT_TIMEOUT_MS: i32 = 10_000;
 
 const HCCS_CONNECT_ERROR: i32 = 503900;
 
-/// Connect to `peer_eid` if not already connected.
-/// Multiple concurrent Connect() calls are safe — the C shim restores
-/// ACL context per-call, and HiXL supports multi-threaded access.
-pub fn do_connect(peer_eid: &str) -> Result<()> {
-    do_connect_with_timeout(peer_eid, DEFAULT_CONNECT_TIMEOUT_MS)
-}
+const HCCS_ALIGNMENT: usize = 2 * 1024 * 1024; // 2 MB
 
-pub fn do_connect_with_timeout(peer_eid: &str, timeout_ms: i32) -> Result<()> {
-    {
-        let guard = get_hixl_state()?;
-        let state = guard.as_ref().unwrap();
-        if state.connected_peers.lock().unwrap().contains(peer_eid) {
-            return Ok(());
+impl HixlEngineState {
+    fn new(
+        engine: Box<dyn HixlEngineOps>,
+        engine_id: String,
+        force_roce: bool,
+        alias_enabled: bool,
+    ) -> Self {
+        Self {
+            engine,
+            engine_id,
+            connected_peers: Mutex::new(HashSet::new()),
+            registered_addrs: Mutex::new(HashMap::new()),
+            aliased_addrs: Mutex::new(HashMap::new()),
+            force_roce,
+            alias_enabled,
         }
     }
 
-    tracing::info!("[hixl] connecting to peer {} (timeout={}ms)", peer_eid, timeout_ms);
-
-    with_state(|state| {
-        state
-            .engine
-            .connect(peer_eid, timeout_ms)
-            .map_err(|ret| {
-                if ret == HCCS_CONNECT_ERROR && !state.force_roce {
-                    anyhow::anyhow!(
-                        "hixl_connect({}) failed: ret={} — HCCS channel creation failed. \
-                         Ensure all registered memory is 2MB-aligned (use alloc_aligned_tensor()). \
-                         Or set MONARCH_HIXL_TRANSPORT=roce to use RoCE instead.",
-                        peer_eid, ret,
-                    )
-                } else {
-                    anyhow::anyhow!("hixl_connect({}) failed: ret={}", peer_eid, ret)
-                }
-            })
-    })?;
-
-    {
-        let guard = get_hixl_state()?;
-        let state = guard.as_ref().unwrap();
-        state.connected_peers.lock().unwrap().insert(peer_eid.to_string());
+    fn connect(&self, peer_eid: &str) -> Result<()> {
+        self.connect_with_timeout(peer_eid, DEFAULT_CONNECT_TIMEOUT_MS)
     }
-    tracing::info!("[hixl] connected to peer {}", peer_eid);
-    Ok(())
-}
 
-const HCCS_ALIGNMENT: usize = 2 * 1024 * 1024; // 2 MB
+    fn connect_with_timeout(&self, peer_eid: &str, timeout_ms: i32) -> Result<()> {
+        // Keep the set locked through Connect so concurrent first-use calls
+        // cannot race and issue duplicate HiXL connections.
+        let mut connected = self.connected_peers.lock().unwrap();
+        if connected.contains(peer_eid) {
+            return Ok(());
+        }
 
-/// Register a device memory region.  Reference-counted: the first call
-/// for a given address performs the HiXL RegisterMem, subsequent calls
-/// just bump the count.
-///
-/// In HCCS mode (the default), the address **must** be 2 MB aligned.
-/// If it is not, a warning is logged: the RegisterMem call will still
-/// be attempted, but the subsequent `TransferSync` may fail at runtime.
-pub fn register_mem_if_needed(addr: usize, size: usize) -> Result<()> {
-    with_state(|state| {
-        let mut addrs = state.registered_addrs.lock().unwrap();
-        let mut aliases = state.aliased_addrs.lock().unwrap();
+        tracing::info!(
+            "[hixl] connecting to peer {} (timeout={}ms)",
+            peer_eid,
+            timeout_ms
+        );
+        self.engine.connect(peer_eid, timeout_ms).map_err(|ret| {
+            if ret == HCCS_CONNECT_ERROR && !self.force_roce {
+                anyhow::anyhow!(
+                    "hixl_connect({}) failed: ret={} — HCCS channel creation failed. \
+                     Ensure all registered memory is 2MB-aligned (use alloc_aligned_tensor()). \
+                     Or set MONARCH_HIXL_TRANSPORT=roce to use RoCE instead.",
+                    peer_eid,
+                    ret,
+                )
+            } else {
+                anyhow::anyhow!("hixl_connect({}) failed: ret={}", peer_eid, ret)
+            }
+        })?;
+        connected.insert(peer_eid.to_string());
+        tracing::info!("[hixl] connected to peer {}", peer_eid);
+        Ok(())
+    }
+
+    /// Register a device memory region.  Reference-counted: the first call
+    /// for a given address performs the HiXL RegisterMem, subsequent calls
+    /// just bump the count.
+    ///
+    /// In HCCS mode (the default), the address **must** be 2 MB aligned.
+    /// If it is not, a warning is logged: the RegisterMem call will still
+    /// be attempted, but the subsequent `TransferSync` may fail at runtime.
+    fn register_mem_if_needed(&self, addr: usize, size: usize) -> Result<()> {
+        let mut addrs = self.registered_addrs.lock().unwrap();
+        let mut aliases = self.aliased_addrs.lock().unwrap();
 
         // Case 1: exact match on an existing real registration -> bump.
         if let Some((_sz, refcnt)) = addrs.get_mut(&addr) {
@@ -242,19 +256,17 @@ pub fn register_mem_if_needed(addr: usize, size: usize) -> Result<()> {
         // Set `MONARCH_HIXL_ENABLE_ALIAS=1` to re-enable the
         // containment check when running against CANN 9.0.0-beta or
         // earlier.
-        if state.alias_enabled {
-            let containing_owner = addrs
-                .iter()
-                .find_map(|(&owner_addr, &(owner_size, _))| {
-                    if addr >= owner_addr
-                        && size <= owner_size
-                        && addr + size <= owner_addr + owner_size
-                    {
-                        Some((owner_addr, owner_size))
-                    } else {
-                        None
-                    }
-                });
+        if self.alias_enabled {
+            let containing_owner = addrs.iter().find_map(|(&owner_addr, &(owner_size, _))| {
+                if addr >= owner_addr
+                    && size <= owner_size
+                    && addr + size <= owner_addr + owner_size
+                {
+                    Some((owner_addr, owner_size))
+                } else {
+                    None
+                }
+            });
             if let Some((owner_addr, _owner_size)) = containing_owner {
                 aliases.insert(addr, (owner_addr, 1));
                 if let Some((_sz, orefcnt)) = addrs.get_mut(&owner_addr) {
@@ -273,7 +285,7 @@ pub fn register_mem_if_needed(addr: usize, size: usize) -> Result<()> {
         // Case 4: fresh registration.  Fall through to the original
         // path: warn on alignment, call HiXL, record as real.
         // This is the default path on CANN 9.0.0 release and later.
-        if !state.force_roce && (addr % HCCS_ALIGNMENT != 0) {
+        if !self.force_roce && (addr % HCCS_ALIGNMENT != 0) {
             tracing::warn!(
                 "[hixl] memory addr={:#x} is NOT 2 MB aligned (offset={:#x}). \
                  HCCS transfers may fail — consider using alloc_aligned_tensor() \
@@ -283,21 +295,23 @@ pub fn register_mem_if_needed(addr: usize, size: usize) -> Result<()> {
             );
         }
 
-        state
-            .engine
-            .register_mem(addr, size)
-            .map_err(|ret| anyhow::anyhow!("hixl_register_mem(addr={:#x}, size={}) failed: ret={}", addr, size, ret))?;
+        self.engine.register_mem(addr, size).map_err(|ret| {
+            anyhow::anyhow!(
+                "hixl_register_mem(addr={:#x}, size={}) failed: ret={}",
+                addr,
+                size,
+                ret
+            )
+        })?;
         addrs.insert(addr, (size, 1));
         Ok(())
-    })
-}
+    }
 
-/// Decrement the reference count for a registered memory region.
-/// When the count reaches 0, the region is deregistered from HiXL.
-pub fn deregister_mem(addr: usize) -> Result<()> {
-    with_state(|state| {
-        let mut addrs = state.registered_addrs.lock().unwrap();
-        let mut aliases = state.aliased_addrs.lock().unwrap();
+    /// Decrement the reference count for a registered memory region.
+    /// When the count reaches 0, the region is deregistered from HiXL.
+    fn deregister_mem(&self, addr: usize) -> Result<()> {
+        let mut addrs = self.registered_addrs.lock().unwrap();
+        let mut aliases = self.aliased_addrs.lock().unwrap();
 
         // Case 1: alias entry.  Decrement its refcount and also the
         // real owner's refcount.  When either hits 0, propagate the
@@ -323,14 +337,17 @@ pub fn deregister_mem(addr: usize) -> Result<()> {
             drop(aliases);
             drop(addrs);
             if owner_now_zero {
-                match state.engine.deregister_mem(owner_key) {
+                match self.engine.deregister_mem(owner_key) {
                     Ok(()) => tracing::debug!(
                         "[hixl] deregistered owner={:#x} via alias={:#x}",
-                        owner_key, addr,
+                        owner_key,
+                        addr,
                     ),
                     Err(ret) => tracing::warn!(
                         "[hixl] deregister_mem owner={:#x} (via alias={:#x}) ret={} (treating as success)",
-                        owner_key, addr, ret,
+                        owner_key,
+                        addr,
+                        ret,
                     ),
                 }
             }
@@ -347,13 +364,16 @@ pub fn deregister_mem(addr: usize) -> Result<()> {
                 addrs.remove(&addr);
             }
             None => {
-                tracing::warn!("[hixl] deregister_mem: addr={:#x} not registered, ignoring", addr);
+                tracing::warn!(
+                    "[hixl] deregister_mem: addr={:#x} not registered, ignoring",
+                    addr
+                );
                 return Ok(());
             }
         }
         drop(aliases);
         drop(addrs);
-        match state.engine.deregister_mem(addr) {
+        match self.engine.deregister_mem(addr) {
             Ok(()) => {
                 tracing::debug!("[hixl] deregistered mem addr={:#x}", addr);
             }
@@ -365,17 +385,75 @@ pub fn deregister_mem(addr: usize) -> Result<()> {
                 // no further deregistration will be attempted — treat as success.
                 tracing::warn!(
                     "[hixl] deregister_mem: addr={:#x} hixl_deregister_mem ret={} (treating as success)",
-                    addr, ret
+                    addr,
+                    ret
                 );
             }
         }
         Ok(())
-    })
+    }
+
+    fn transfer_write(
+        &self,
+        remote_engine_id: &str,
+        local_addr: usize,
+        remote_addr: usize,
+        len: usize,
+        timeout_ms: i32,
+    ) -> Result<()> {
+        self.engine
+            .transfer_write(remote_engine_id, local_addr, remote_addr, len, timeout_ms)
+            .map_err(|ret| {
+                anyhow::anyhow!(
+                    "hixl_transfer_write failed: local={:#x} remote={:#x}@{} len={} ret={}",
+                    local_addr,
+                    remote_addr,
+                    remote_engine_id,
+                    len,
+                    ret,
+                )
+            })
+    }
+
+    fn transfer_read(
+        &self,
+        remote_engine_id: &str,
+        local_addr: usize,
+        remote_addr: usize,
+        len: usize,
+        timeout_ms: i32,
+    ) -> Result<()> {
+        self.engine
+            .transfer_read(remote_engine_id, local_addr, remote_addr, len, timeout_ms)
+            .map_err(|ret| {
+                anyhow::anyhow!(
+                    "hixl_transfer_read failed: local={:#x} remote={:#x}@{} len={} ret={}",
+                    local_addr,
+                    remote_addr,
+                    remote_engine_id,
+                    len,
+                    ret,
+                )
+            })
+    }
 }
 
-/// Return the engine_id of the local engine.
-pub fn global_engine_id() -> Result<String> {
-    with_state(|s| Ok(s.engine_id.clone()))
+impl Drop for HixlEngineState {
+    fn drop(&mut self) {
+        let addrs = std::mem::take(self.registered_addrs.get_mut().unwrap());
+        self.aliased_addrs.get_mut().unwrap().clear();
+        for addr in addrs.into_keys() {
+            if let Err(ret) = self.engine.deregister_mem(addr) {
+                tracing::warn!(
+                    "[hixl] cleanup deregister_mem addr={:#x} ret={} (continuing)",
+                    addr,
+                    ret
+                );
+            }
+        }
+        // The boxed engine is dropped immediately after this method, which
+        // performs hixl_cleanup once the last actor/backend Arc is gone.
+    }
 }
 
 // ============================================================================
@@ -389,20 +467,17 @@ pub fn global_engine_id() -> Result<String> {
 /// 2. Then does the local `Connect(remote_eid)`.
 ///
 /// Both directions must be connected before TransferSync can succeed.
-pub async fn ensure_connected(
+async fn ensure_connected(
+    state: &HixlEngineState,
     client: &(impl hyperactor::context::Actor + Send + Sync),
     remote_rdma_mgr: &ActorRef<RdmaManagerActor>,
     remote_eid: &str,
 ) -> Result<()> {
-    {
-        let guard = get_hixl_state()?;
-        let state = guard.as_ref().unwrap();
-        if state.connected_peers.lock().unwrap().contains(remote_eid) {
-            return Ok(());
-        }
+    if state.connected_peers.lock().unwrap().contains(remote_eid) {
+        return Ok(());
     }
 
-    let my_eid = with_state(|s| Ok(s.engine_id.clone()))?;
+    let my_eid = state.engine_id.clone();
     tracing::info!(
         "[hixl] ensure_connected: asking remote {} to connect to us ({})",
         remote_eid,
@@ -412,15 +487,13 @@ pub async fn ensure_connected(
     remote_rdma_mgr
         .ensure_peer_connected(client, my_eid)
         .await
-        .map_err(|e| anyhow::anyhow!(
-            "EnsurePeerConnected to {} failed: {}", remote_eid, e
-        ))?;
+        .map_err(|e| anyhow::anyhow!("EnsurePeerConnected to {} failed: {}", remote_eid, e))?;
 
     tracing::info!(
         "[hixl] ensure_connected: remote acked, now local connect to {}",
         remote_eid,
     );
-    do_connect(remote_eid)?;
+    state.connect(remote_eid)?;
 
     Ok(())
 }
@@ -460,20 +533,32 @@ pub enum HixlManagerMessage {
 
 #[derive(Debug)]
 pub struct HixlManagerActor {
-    engine_id: String,
-    device_id: i32,
+    state: Arc<HixlEngineState>,
     owner: OnceLock<ActorHandle<RdmaManagerActor>>,
     /// buf_id → registered device address, for deregistration on release.
     buf_addrs: std::collections::HashMap<usize, usize>,
 }
 
 impl HixlManagerActor {
-    pub fn new(engine_id: String, device_id: i32) -> Self {
+    fn new(state: Arc<HixlEngineState>) -> Self {
         Self {
-            engine_id,
-            device_id,
+            state,
             owner: OnceLock::new(),
             buf_addrs: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl Drop for HixlManagerActor {
+    fn drop(&mut self) {
+        for (_, addr) in self.buf_addrs.drain() {
+            if let Err(error) = self.state.deregister_mem(addr) {
+                tracing::warn!(
+                    "[hixl] failed to release actor-owned registration addr={:#x}: {}",
+                    addr,
+                    error
+                );
+            }
         }
     }
 }
@@ -510,14 +595,7 @@ fn resolve_device_id(hint: i32) -> i32 {
 /// - Default: HCCS (intra-supernode high-speed interconnect).
 /// - Set `MONARCH_HIXL_USE_ROCE=1` to force RoCE (for cross-supernode or
 ///   when device memory is not 2 MB aligned).
-fn init_engine_on_dedicated_thread(
-    dev: i32,
-    eid: String,
-) -> Result<()> {
-    if is_hixl_initialized() {
-        return Ok(());
-    }
-
+fn init_engine_on_dedicated_thread(dev: i32, eid: String) -> Result<Arc<HixlEngineState>> {
     // Transport selection via MONARCH_HIXL_TRANSPORT env var:
     //   "hccs"  → HCCS (intra-supernode, default — requires 2MB-aligned memory)
     //   "roce"  → RoCE (inter-/intra-node, no alignment requirement)
@@ -539,9 +617,7 @@ fn init_engine_on_dedicated_thread(
             if std::env::var("HCCL_NPU_SOCKET_PORT_RANGE").is_err() {
                 unsafe { std::env::set_var("HCCL_NPU_SOCKET_PORT_RANGE", "auto") };
             }
-            tracing::info!(
-                "[hixl] using HCCS (default) — all RDMA buffers must be 2MB-aligned",
-            );
+            tracing::info!("[hixl] using HCCS (default) — all RDMA buffers must be 2MB-aligned",);
             false
         }
     };
@@ -549,8 +625,8 @@ fn init_engine_on_dedicated_thread(
     do_init_engine(dev, eid, force_roce)
 }
 
-fn do_init_engine(dev: i32, eid: String, force_roce: bool) -> Result<()> {
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+fn do_init_engine(dev: i32, eid: String, force_roce: bool) -> Result<Arc<HixlEngineState>> {
+    let (tx, rx) = std::sync::mpsc::channel::<Result<Arc<HixlEngineState>, String>>();
     let eid_clone = eid.clone();
 
     std::thread::Builder::new()
@@ -558,7 +634,10 @@ fn do_init_engine(dev: i32, eid: String, force_roce: bool) -> Result<()> {
         .spawn(move || {
             tracing::info!(
                 "[hixl] dedicated init thread started: dev={} eid={} force_roce={} tid={:?}",
-                dev, eid_clone, force_roce, std::thread::current().id(),
+                dev,
+                eid_clone,
+                force_roce,
+                std::thread::current().id(),
             );
             let result = hixl_sys::HixlEngine::new(dev, &eid_clone);
             match result {
@@ -573,18 +652,14 @@ fn do_init_engine(dev: i32, eid: String, force_roce: bool) -> Result<()> {
                              CANN 9.0.0-beta and earlier)"
                         );
                     }
-                    let new_state = HixlEngineState {
-                        engine,
-                        engine_id: eid_clone.clone(),
-                        connected_peers: Mutex::new(HashSet::new()),
-                        registered_addrs: Mutex::new(HashMap::new()),
-                        aliased_addrs: Mutex::new(HashMap::new()),
+                    let new_state = Arc::new(HixlEngineState::new(
+                        Box::new(engine),
+                        eid_clone.clone(),
                         force_roce,
                         alias_enabled,
-                    };
-                    *HIXL_STATE.lock().unwrap() = Some(new_state);
+                    ));
                     unsafe { std::env::set_var("MONARCH_PYTHON_HIXL_ENGINE_ID", &eid_clone) };
-                    let _ = tx.send(Ok(()));
+                    let _ = tx.send(Ok(new_state));
                 }
                 Err(e) => {
                     let _ = tx.send(Err(e));
@@ -593,15 +668,18 @@ fn do_init_engine(dev: i32, eid: String, force_roce: bool) -> Result<()> {
         })
         .map_err(|e| anyhow::anyhow!("failed to spawn hixl-init thread: {e}"))?;
 
-    rx.recv()
+    let state = rx
+        .recv()
         .map_err(|e| anyhow::anyhow!("hixl-init thread channel closed: {e}"))?
         .map_err(|e| anyhow::anyhow!("hixl_init_engine failed on dedicated thread: {e}"))?;
 
     tracing::info!(
         "[hixl] engine initialised on dedicated thread: dev={} eid={} force_roce={}",
-        dev, eid, force_roce,
+        dev,
+        eid,
+        force_roce,
     );
-    Ok(())
+    Ok(state)
 }
 
 #[async_trait]
@@ -614,32 +692,9 @@ impl Actor for HixlManagerActor {
             .set(owner)
             .expect("owner should only be set once during init");
 
-        let eid = resolve_engine_id(&self.engine_id);
-        let dev = resolve_device_id(self.device_id);
-        self.engine_id = eid.clone();
-        self.device_id = dev;
-
-        if is_hixl_initialized() {
-            let engine_id = with_state(|s| Ok(s.engine_id.clone()))?;
-            tracing::info!(
-                "[hixl] engine already initialised (engine_id={}), reusing",
-                engine_id,
-            );
-            self.engine_id = engine_id;
-        } else {
-            tracing::info!(
-                "[hixl] initialising HiXL engine on dedicated OS thread: dev={} eid={}",
-                dev, eid,
-            );
-            init_engine_on_dedicated_thread(dev, eid)?;
-            if let Ok(eid) = with_state(|s| Ok(s.engine_id.clone())) {
-                self.engine_id = eid;
-            }
-        }
-
         tracing::info!(
             "[hixl] HixlManagerActor ready: engine_id={}",
-            self.engine_id
+            self.state.engine_id
         );
         Ok(())
     }
@@ -662,11 +717,11 @@ impl HixlManagerMessageHandler for HixlManagerActor {
             size,
         );
 
-        register_mem_if_needed(addr, size)?;
+        self.state.register_mem_if_needed(addr, size)?;
         self.buf_addrs.insert(remote_buf_id, addr);
 
         Ok(Some(HixlBuffer {
-            engine_id: self.engine_id.clone(),
+            engine_id: self.state.engine_id.clone(),
             addr,
             size,
         }))
@@ -678,28 +733,38 @@ impl HixlManagerMessageHandler for HixlManagerActor {
         remote_buf_id: usize,
     ) -> Result<(), anyhow::Error> {
         if let Some(addr) = self.buf_addrs.remove(&remote_buf_id) {
-            tracing::debug!("[hixl] release_buffer: id={} addr={:#x}", remote_buf_id, addr);
-            deregister_mem(addr)?;
+            tracing::debug!(
+                "[hixl] release_buffer: id={} addr={:#x}",
+                remote_buf_id,
+                addr
+            );
+            self.state.deregister_mem(addr)?;
         } else {
             tracing::debug!("[hixl] release_buffer: id={} (not tracked)", remote_buf_id);
         }
         Ok(())
     }
 
-    async fn get_engine_id(
-        &mut self,
-        _cx: &Context<Self>,
-    ) -> Result<String, anyhow::Error> {
-        Ok(self.engine_id.clone())
+    async fn get_engine_id(&mut self, _cx: &Context<Self>) -> Result<String, anyhow::Error> {
+        Ok(self.state.engine_id.clone())
     }
 }
 
 /// Handle used by the upstream backend registry.
 ///
-/// The actor owns per-buffer registration bookkeeping while the process-global
-/// [`HixlEngineState`] owns the actual HiXL engine and data plane.
+/// The actor owns per-buffer registration bookkeeping. Backend clones share the
+/// same state and keep the off-actor data plane alive until the last clone exits.
 #[derive(Debug, Clone)]
-pub struct HixlBackend(pub ActorHandle<HixlManagerActor>);
+pub struct HixlBackend {
+    actor: ActorHandle<HixlManagerActor>,
+    state: Arc<HixlEngineState>,
+}
+
+impl HixlBackend {
+    pub(crate) fn connect(&self, peer_engine_id: &str) -> Result<()> {
+        self.state.connect(peer_engine_id)
+    }
+}
 
 #[async_trait]
 impl RdmaBackend for HixlBackend {
@@ -715,10 +780,16 @@ impl RdmaBackend for HixlBackend {
         config: &RdmaConfig,
     ) -> Result<Self> {
         let config = config.hixl.clone().unwrap_or_default();
-        Ok(Self(cx.spawn(HixlManagerActor::new(
-            config.engine_id.unwrap_or_default(),
-            config.device_id.unwrap_or(-1),
-        ))))
+        let engine_id = resolve_engine_id(&config.engine_id.unwrap_or_default());
+        let device_id = resolve_device_id(config.device_id.unwrap_or(-1));
+        tracing::info!(
+            "[hixl] initialising HiXL engine on dedicated OS thread: dev={} eid={}",
+            device_id,
+            engine_id,
+        );
+        let state = init_engine_on_dedicated_thread(device_id, engine_id)?;
+        let actor = cx.spawn(HixlManagerActor::new(state.clone()));
+        Ok(Self { actor, state })
     }
 
     async fn register_remote_buffer(
@@ -727,7 +798,7 @@ impl RdmaBackend for HixlBackend {
         remote_buf_id: usize,
         local: KeepaliveLocalMemory,
     ) -> Result<HixlBuffer> {
-        self.0
+        self.actor
             .request_buffer(cx, remote_buf_id, local.addr(), local.size())
             .await?
             .ok_or_else(|| anyhow::anyhow!("HiXL failed to register buffer {remote_buf_id}"))
@@ -738,7 +809,7 @@ impl RdmaBackend for HixlBackend {
         cx: &(impl hyperactor::context::Actor + Send + Sync),
         remote_buf_id: usize,
     ) -> Result<()> {
-        self.0.release_buffer(cx, remote_buf_id).await
+        self.actor.release_buffer(cx, remote_buf_id).await
     }
 
     async fn submit(
@@ -755,56 +826,31 @@ impl RdmaBackend for HixlBackend {
                 .resolve_hixl()
                 .ok_or_else(|| anyhow::anyhow!("op routed to incompatible HiXL backend"))?;
 
-            register_mem_if_needed(op.local.addr(), op.local.size())?;
-            ensure_connected(cx, &op.remote.owner, &remote.engine_id).await?;
+            // HiXL requires the local region to be registered before either
+            // side connects, and both connections before transfer.
+            self.state
+                .register_mem_if_needed(op.local.addr(), op.local.size())?;
+            ensure_connected(&self.state, cx, &op.remote.owner, &remote.engine_id).await?;
 
             match op.op_type {
                 RdmaOpType::WriteFromLocal => {
-                    with_state(|state| {
-                        state
-                            .engine
-                            .transfer_write(
-                                &remote.engine_id,
-                                op.local.addr(),
-                                remote.addr,
-                                op.local.size(),
-                                timeout_ms,
-                            )
-                            .map_err(|ret| {
-                                anyhow::anyhow!(
-                                    "hixl_transfer_write failed: local={:#x} remote={:#x}@{} len={} ret={}",
-                                    op.local.addr(),
-                                    remote.addr,
-                                    remote.engine_id,
-                                    op.local.size(),
-                                    ret,
-                                )
-                            })
-                    })?;
+                    self.state.transfer_write(
+                        &remote.engine_id,
+                        op.local.addr(),
+                        remote.addr,
+                        op.local.size(),
+                        timeout_ms,
+                    )?;
                 }
                 RdmaOpType::ReadIntoLocal => {
                     for attempt in 0..3u32 {
-                        let result = with_state(|state| {
-                            state
-                                .engine
-                                .transfer_read(
-                                    &remote.engine_id,
-                                    op.local.addr(),
-                                    remote.addr,
-                                    op.remote.size,
-                                    timeout_ms,
-                                )
-                                .map_err(|ret| {
-                                    anyhow::anyhow!(
-                                        "hixl_transfer_read failed: local={:#x} remote={:#x}@{} len={} ret={}",
-                                        op.local.addr(),
-                                        remote.addr,
-                                        remote.engine_id,
-                                        op.remote.size,
-                                        ret,
-                                    )
-                                })
-                        });
+                        let result = self.state.transfer_read(
+                            &remote.engine_id,
+                            op.local.addr(),
+                            remote.addr,
+                            op.remote.size,
+                            timeout_ms,
+                        );
                         match result {
                             Ok(()) => break,
                             Err(_) if attempt < 2 => {
@@ -825,13 +871,176 @@ impl RdmaBackend for HixlBackend {
     }
 
     fn transport_level(&self) -> RdmaTransportLevel {
-        match with_state(|s| Ok(s.force_roce)) {
-            Ok(false) => RdmaTransportLevel::Hccs,
-            _ => RdmaTransportLevel::Nic,
+        if self.state.force_roce {
+            RdmaTransportLevel::Nic
+        } else {
+            RdmaTransportLevel::Hccs
         }
     }
 
     fn transport_info(&self) -> Option<Self::TransportInfo> {
         None
+    }
+}
+
+#[cfg(all(test, feature = "hixl-mock"))]
+mod tests {
+    use hixl_sys::MockCall;
+
+    use super::*;
+
+    type CallLog = Arc<Mutex<Vec<MockCall>>>;
+
+    fn mock_state() -> (Arc<HixlEngineState>, CallLog) {
+        let engine = hixl_sys::HixlEngine::new(0, "local").unwrap();
+        let calls = engine.call_log();
+        let state = Arc::new(HixlEngineState::new(
+            Box::new(engine),
+            "local".to_string(),
+            true,
+            false,
+        ));
+        (state, calls)
+    }
+
+    fn calls(log: &CallLog) -> Vec<MockCall> {
+        log.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn memory_registration_is_reference_counted() {
+        let (state, log) = mock_state();
+        state.register_mem_if_needed(0x1000, 4096).unwrap();
+        state.register_mem_if_needed(0x1000, 4096).unwrap();
+        state.deregister_mem(0x1000).unwrap();
+
+        assert_eq!(
+            calls(&log),
+            vec![MockCall::RegisterMem {
+                addr: 0x1000,
+                size: 4096,
+            }]
+        );
+
+        state.deregister_mem(0x1000).unwrap();
+        assert_eq!(
+            calls(&log),
+            vec![
+                MockCall::RegisterMem {
+                    addr: 0x1000,
+                    size: 4096,
+                },
+                MockCall::DeregisterMem { addr: 0x1000 },
+            ]
+        );
+    }
+
+    #[test]
+    fn concurrent_connect_is_deduplicated() {
+        let (state, log) = mock_state();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let state = state.clone();
+                std::thread::spawn(move || state.connect("remote").unwrap())
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(
+            calls(&log),
+            vec![MockCall::Connect {
+                remote_engine_id: "remote".to_string(),
+                timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
+            }]
+        );
+    }
+
+    #[test]
+    fn read_and_write_route_to_matching_engine_operations() {
+        let (state, log) = mock_state();
+        state
+            .transfer_read("remote", 0x1000, 0x2000, 64, 100)
+            .unwrap();
+        state
+            .transfer_write("remote", 0x3000, 0x4000, 128, 200)
+            .unwrap();
+
+        assert_eq!(
+            calls(&log),
+            vec![
+                MockCall::TransferRead {
+                    remote_engine_id: "remote".to_string(),
+                    local_addr: 0x1000,
+                    remote_addr: 0x2000,
+                    len: 64,
+                    timeout_ms: 100,
+                },
+                MockCall::TransferWrite {
+                    remote_engine_id: "remote".to_string(),
+                    local_addr: 0x3000,
+                    remote_addr: 0x4000,
+                    len: 128,
+                    timeout_ms: 200,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn register_connect_transfer_order_and_final_cleanup() {
+        let (state, log) = mock_state();
+        state.register_mem_if_needed(0x1000, 4096).unwrap();
+        state.connect("remote").unwrap();
+        state
+            .transfer_write("remote", 0x1000, 0x2000, 4096, 500)
+            .unwrap();
+        drop(state);
+
+        assert_eq!(
+            calls(&log),
+            vec![
+                MockCall::RegisterMem {
+                    addr: 0x1000,
+                    size: 4096,
+                },
+                MockCall::Connect {
+                    remote_engine_id: "remote".to_string(),
+                    timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
+                },
+                MockCall::TransferWrite {
+                    remote_engine_id: "remote".to_string(),
+                    local_addr: 0x1000,
+                    remote_addr: 0x2000,
+                    len: 4096,
+                    timeout_ms: 500,
+                },
+                MockCall::DeregisterMem { addr: 0x1000 },
+                MockCall::Cleanup,
+            ]
+        );
+    }
+
+    #[test]
+    fn actor_drop_releases_tracked_registrations() {
+        let (state, log) = mock_state();
+        state.register_mem_if_needed(0x1000, 4096).unwrap();
+        state.register_mem_if_needed(0x1000, 4096).unwrap();
+        let mut actor = HixlManagerActor::new(state.clone());
+        actor.buf_addrs.insert(1, 0x1000);
+        actor.buf_addrs.insert(2, 0x1000);
+        drop(actor);
+
+        assert_eq!(
+            calls(&log),
+            vec![
+                MockCall::RegisterMem {
+                    addr: 0x1000,
+                    size: 4096,
+                },
+                MockCall::DeregisterMem { addr: 0x1000 },
+            ]
+        );
     }
 }

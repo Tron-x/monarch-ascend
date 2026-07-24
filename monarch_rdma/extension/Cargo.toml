@@ -30,6 +30,7 @@ build_utils = { path = "../../build_utils" }
 [features]
 cuda = ["monarch_rdma/cuda"]
 hixl = ["monarch_rdma/hixl"]
+hixl-mock = ["hixl", "monarch_rdma/hixl-mock"]
 # Ascend consumers disable defaults and opt into `hixl`; normal upstream
 # consumers retain the CUDA/rdmaxcel backend.
 default = ["cuda"]

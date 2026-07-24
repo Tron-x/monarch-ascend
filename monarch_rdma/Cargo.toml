@@ -41,5 +41,6 @@ timed_test = { version = "0.0.0", path = "../timed_test" }
 [features]
 cuda = ["dep:rdmaxcel-sys"]
 hixl = ["dep:hixl-sys", "dep:hostname", "dep:libc"]
+hixl-mock = ["hixl", "hixl-sys/mock"]
 default = ["cuda"]
 test-utils = []

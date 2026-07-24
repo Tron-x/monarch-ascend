@@ -1,6 +1,8 @@
 # HiXL Tests
 
-Ascend NPU 单边通信 (HiXL) 集成测试集，覆盖从底层原生 API 到上层 Monarch E2E 的完整链路。
+Ascend NPU 单边通信 (HiXL) 集成测试集。Monarch 的唯一生产数据路径是
+`_rust_bindings.rdma → monarch_rdma → hixl-sys`；`native/`、`debug/` 和部分
+底层脚本仅用于独立验证 CANN/HiXL，不会被 Python 生产代码加载。
 
 ## 前置条件
 
@@ -48,7 +50,6 @@ tests/hixl/
 | 文件 | 说明 |
 |------|------|
 | `test_hixl_bridge_minimal.py` | **核心验收用例**。两卡两 mesh，Producer(NPU0) 创建 RDMABuffer/XDMABuffer，Consumer(NPU1) 通过 write_from/read_into 跨卡读写 |
-| `test_hixl_python_transfer.py` | Python ctypes 路径的完整 RDMABuffer 流程验证（旧路径，Plan B 已替代）|
 | `test_hixl_rdma_e2e.py` | HIXL RDMA 端到端：Producer 建 buffer，Consumer 通过 HIXL 写入 |
 
 ### unit/ — 单元测试
@@ -57,7 +58,7 @@ tests/hixl/
 |------|------|
 | `test_npu_backend.py` | NPU 后端基础验证（环境、torch_npu、设备状态）|
 | `test_hixl_rdma_minimal.py` | 最小 RDMABuffer 创建测试 |
-| `test_hixl_actor_ctypes.py` | 从 Monarch actor 中直接 ctypes 调用 HIXL（旧路径）|
+| `test_hixl_actor_ctypes.py` | 独立 ctypes 厂商诊断，不属于 Monarch 数据路径 |
 | `test_hixl_direct.py` | torch_npu vs aclrtMalloc 内存对比传输 |
 | `test_hixl_rdma_manager_effect.py` | RdmaManagerActor 对 HIXL 的影响隔离 |
 | `test_hixl_buffer_effect.py` | RDMABuffer 创建与 HIXL 引擎共存验证 |
@@ -67,6 +68,9 @@ tests/hixl/
 | `test_hixl_dynamic_ports.py` | 动态端口分配场景下的 HIXL 连接测试 |
 
 ### native/ — 原生 C/C++ 测试
+
+该目录用于隔离 CANN/HiXL 本身的问题。其二进制和共享库不得被
+`python/monarch` 导入，也不代表 Monarch 运行时存在第二个 HiXL engine。
 
 | 文件 | 说明 |
 |------|------|
@@ -79,6 +83,8 @@ tests/hixl/
 | `test_hixl_pthread.c` | dlopen + pthread 隔离调用 HIXL |
 
 ### debug/ — 调试脚本
+
+调试脚本允许直接调用测试 shim，但只用于人工诊断，不纳入生产回归入口。
 
 | 文件 | 说明 |
 |------|------|
@@ -96,7 +102,7 @@ tests/hixl/
 
 | 文件 | 说明 |
 |------|------|
-| `test_hixl_from_python.cpp` | 供 Python ctypes 调用的 HIXL 共享库（旧路径，Plan B 已替代）|
+| `test_hixl_from_python.cpp` | 独立 ctypes 诊断 shim；生产路径不加载 |
 | `hixl_trampoline.c` | 信号掩码重置 trampoline，解决 HIXL 修改信号处理的问题 |
 
 ## 快速运行

@@ -787,21 +787,9 @@ impl PyRdmaBuffer {
     /// Return the local engine_id assigned by the external transport, or None.
     #[staticmethod]
     fn local_external_engine_id() -> Option<String> {
-        std::env::var("MONARCH_PYTHON_HIXL_ENGINE_ID").ok()
+        std::env::var("MONARCH_PYTHON_HIXL_ENGINE_ID")
+            .ok()
             .or_else(|| std::env::var("MONARCH_TRANSPORT_ENGINE_ID").ok())
-    }
-
-    /// Return (engine_ptr, engine_id) of the Rust-managed HiXL engine, for diagnostics.
-    #[staticmethod]
-    fn hixl_engine_diag() -> Option<(usize, String)> {
-        #[cfg(feature = "hixl")]
-        {
-            monarch_rdma::backend::hixl::manager_actor::with_state(|s| {
-                Ok((s.engine.ptr() as usize, s.engine_id.clone()))
-            }).ok()
-        }
-        #[cfg(not(feature = "hixl"))]
-        { None }
     }
 
     fn __reduce__(&self) -> PyResult<(Py<PyAny>, Py<PyAny>)> {

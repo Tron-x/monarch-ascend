@@ -9,6 +9,9 @@ links = "hixl_shim"
 
 [dependencies]
 
+[features]
+mock = []
+
 [build-dependencies]
 cc = "1.0"
 build_utils = { path = "../build_utils" }

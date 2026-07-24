@@ -12,6 +12,10 @@
 //! together with the CANN runtime libraries (libcann_hixl, libascendcl).
 
 fn main() {
+    if std::env::var_os("CARGO_FEATURE_MOCK").is_some() {
+        return;
+    }
+
     let config = build_utils::ascend::discover_ascend_config()
         .expect("Ascend CANN installation not found — see build_utils::ascend for details");
 

@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![cfg(not(feature = "hixl"))]
+
 //! Integration test for per-PD segment registration with two GPU buffers
 //! on different RDMA NICs. Requires 8 GPUs and a multi-NIC RoCEv2 fabric;
 //! skips at runtime when these are unavailable.

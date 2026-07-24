@@ -80,6 +80,21 @@ jobs:
           --exclude monarch_bench \
           --exclude monarch_conda || rc=$?
 
+        # Compile and test the Ascend HiXL backend without a CANN installation
+        # or NPU. The mock feature substitutes only the vendor FFI boundary;
+        # manager ownership, registration ordering, connection deduplication,
+        # action routing, and PyO3 feature wiring remain the production code.
+        echo "Running dependency-free HiXL backend tests..."
+        CARGO_BUILD_JOBS=${{ matrix.cargo-jobs }} \
+          cargo test --locked -p hixl-sys --features mock || rc=$?
+        CARGO_BUILD_JOBS=${{ matrix.cargo-jobs }} \
+          cargo test --locked -p monarch_rdma \
+          --no-default-features --features hixl-mock \
+          --lib backend::hixl::manager_actor::tests || rc=$?
+        CARGO_BUILD_JOBS=${{ matrix.cargo-jobs }} \
+          cargo check --locked -p monarch_rdma_extension \
+          --no-default-features --features hixl-mock || rc=$?
+
         echo "=== sccache stats ==="
         sccache --show-stats || true
         echo "=== end sccache stats ==="

@@ -815,7 +815,7 @@ impl Handler<Option<MeshFailure>> for RdmaManagerOwnerActor {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "hixl")))]
 mod tests {
     use std::time::Duration;
 
