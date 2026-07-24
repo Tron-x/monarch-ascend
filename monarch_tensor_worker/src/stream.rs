@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use hyperactor as reference;
 use hyperactor::Actor;
 use hyperactor::Context;
+use hyperactor::Endpoint as _;
 use hyperactor::HandleClient;
 use hyperactor::Handler;
 use hyperactor::Instance;
@@ -34,6 +35,10 @@ use hyperactor::id::Label;
 use hyperactor::mailbox::OncePortHandle;
 use hyperactor::mailbox::PortReceiver;
 use hyperactor::proc::Proc;
+use hyperactor::runtime_identity::RuntimeKind;
+use hyperactor::runtime_identity::tag_current_thread;
+use monarch_gil::GilSite;
+use monarch_gil::monarch_with_gil_blocking;
 use monarch_hyperactor::actor::PythonMessage;
 use monarch_hyperactor::actor::PythonMessageKind;
 use monarch_hyperactor::local_state_broker::BrokerId;
@@ -80,6 +85,58 @@ use crate::WireValue;
 use crate::comm::CommMessage;
 use crate::comm::CommMessageClient;
 use crate::comm::NcclCommActor;
+
+#[cfg(feature = "cuda_backend")]
+fn set_current_stream(stream: &Stream) -> Result<()> {
+    Ok(Stream::set_current_stream(stream)?)
+}
+
+#[cfg(feature = "ascend_backend")]
+fn set_current_stream(stream: &Stream) -> Result<()> {
+    Stream::set_current_stream(stream);
+    Ok(())
+}
+
+#[cfg(feature = "cuda_backend")]
+fn get_current_stream_on_device(device: AccelDevice) -> Result<Stream> {
+    Ok(Stream::get_current_stream_on_device(device)?)
+}
+
+#[cfg(feature = "ascend_backend")]
+fn get_current_stream_on_device(device: AccelDevice) -> Result<Stream> {
+    Ok(Stream::get_current_stream_on_device(device))
+}
+
+#[cfg(feature = "cuda_backend")]
+fn new_stream_with_device(device: AccelDevice) -> Result<Stream> {
+    Ok(Stream::new_with_device(device)?)
+}
+
+#[cfg(feature = "ascend_backend")]
+fn new_stream_with_device(device: AccelDevice) -> Result<Stream> {
+    Ok(Stream::new_with_device(device))
+}
+
+#[cfg(feature = "cuda_backend")]
+fn record_event(stream: &Stream) -> Result<Event> {
+    Ok(stream.record_event(None)?)
+}
+
+#[cfg(feature = "ascend_backend")]
+fn record_event(stream: &Stream) -> Result<Event> {
+    Ok(stream.record_event(None))
+}
+
+#[cfg(feature = "cuda_backend")]
+fn wait_event(stream: &Stream, event: &mut Event) -> Result<()> {
+    Ok(stream.wait_event(event)?)
+}
+
+#[cfg(feature = "ascend_backend")]
+fn wait_event(stream: &Stream, event: &mut Event) -> Result<()> {
+    stream.wait_event(event);
+    Ok(())
+}
 
 pub type TensorCellResult = Result<TensorCell, Arc<SeqError>>;
 
@@ -331,7 +388,7 @@ impl StreamMessage {
                 reduction: reduction.clone(),
                 scatter: *scatter,
                 in_place: *in_place,
-                out: out.clone(),
+                out: *out,
             },
             StreamMessage::SendTensor {
                 result,
@@ -500,20 +557,20 @@ impl Actor for StreamActor {
         PROC.with(|proc| proc.set(cx.proc().clone()).ok());
         ROOT_ACTOR_ID.with(|root_actor_id: &OnceCell<reference::ActorId>| {
             let root_label = cx
-                .self_id()
+                .self_addr()
                 .label()
                 .cloned()
                 .unwrap_or_else(|| Label::new("stream").unwrap());
             root_actor_id
                 .set(reference::ActorId::singleton(
                     root_label,
-                    cx.self_id().proc_ref().id().clone(),
+                    cx.self_addr().proc_addr().id().clone(),
                 ))
                 .ok()
         });
         // Set the current stream for this actor thread.
-        if let Some(stream) = self.cuda_stream() {
-            Stream::set_current_stream(stream);
+        if let Some(stream) = self.cuda_stream()? {
+            set_current_stream(stream)?;
         }
         Ok(())
     }
@@ -538,14 +595,28 @@ impl Actor for StreamActor {
         // hang forever.
         let builder = std::thread::Builder::new().name("worker-stream".to_string());
         let _thread_handle = builder.spawn(move || {
+            // Data-plane worker. The stream actor loop runs on THIS thread (via
+            // `rt.block_on` below, which drives its future on the calling thread,
+            // not a runtime worker), so tag this thread directly. The
+            // `on_thread_start` below additionally tags the runtime's own
+            // worker/blocking threads. Either way the Torch/CUDA GIL use here
+            // reads `DataPlane("stream")`, not the control plane. See
+            // `hyperactor::runtime_identity` (RI-6).
+            tag_current_thread(RuntimeKind::DataPlane("stream"));
             // Spawn a new thread with a single-threaded tokio runtime to run the
             // actor loop.  We avoid the current-threaded runtime, so that we can
             // use `block_in_place` for nested async-to-sync-to-async flows.
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
+                .on_thread_start(|| tag_current_thread(RuntimeKind::DataPlane("stream")))
                 .enable_all()
                 .build()
                 .unwrap();
+            // Raw `Python::attach` (not `monarch_with_gil_blocking`): this is the
+            // stream actor-loop body, which attaches only to immediately `py.detach`
+            // and run the loop, so a wrapper's reentrancy guard would span the whole
+            // detached loop. Runs on the `DataPlane("stream")` thread, off the control plane.
+            #[allow(clippy::disallowed_methods)]
             let result = rt.block_on(async {
                 tokio::task::block_in_place(|| {
                     // Allow e.g. destructing py objects on this thread, which
@@ -589,7 +660,7 @@ impl<'py> TryIntoPyObjectUnsafe<'py, PyAny> for &PyArg {
 
 impl StreamActor {
     fn tensor_to_pyobject(tensor_cell: TensorCell) -> Py<PyAny> {
-        Python::attach(|py| {
+        monarch_with_gil_blocking(GilSite::StreamCompute, |py| {
             // SAFETY: Cloning a tensor was unsafe because we were tracking their references like
             // Rust objects (single mutable reference or many immutable references). We are
             // removing this functionality in upcoming patches, so we use the unsafe version here
@@ -612,17 +683,25 @@ impl StreamActor {
         Ok(TensorCell::new(tensor))
     }
 
-    fn cuda_stream(&self) -> Option<&Stream> {
-        self.cuda_stream
-            .get_or_init(|| {
-                self.device.map(|device| match self.creation_mode {
+    fn cuda_stream(&self) -> Result<Option<&Stream>> {
+        if self.cuda_stream.get().is_none() {
+            let stream = match self.device {
+                Some(device) => Some(match self.creation_mode {
                     StreamCreationMode::UseDefaultStream => {
-                        Stream::get_current_stream_on_device(device)
+                        get_current_stream_on_device(device)?
                     }
-                    StreamCreationMode::CreateNewStream => Stream::new_with_device(device),
-                })
-            })
-            .as_ref()
+                    StreamCreationMode::CreateNewStream => new_stream_with_device(device)?,
+                }),
+                None => None,
+            };
+            // Another thread may have won the initialization race; keep whichever value is stored.
+            let _ = self.cuda_stream.set(stream);
+        }
+        Ok(self
+            .cuda_stream
+            .get()
+            .expect("stream initialized above")
+            .as_ref())
     }
 
     fn ref_to_pyobject(&self, ref_: &Ref) -> Result<Py<PyAny>, CallFunctionError> {
@@ -648,7 +727,7 @@ impl StreamActor {
                 if self.active_recording.is_none() {
                     let worker_error = WorkerError {
                         backtrace: format!("{e}"),
-                        worker_actor_id: cx.self_id().clone(),
+                        worker_actor_id: cx.self_addr().clone(),
                     };
                     tracing::info!("Propagating remote function error to client: {worker_error}");
                     self.controller_actor
@@ -843,7 +922,7 @@ impl StreamActor {
             (DeviceMesh, Vec<String>, Arc<ActorHandle<NcclCommActor>>),
         >,
     ) -> Result<PyTree<Py<PyAny>>, CallFunctionError> {
-        Python::attach(|py| {
+        monarch_with_gil_blocking(GilSite::StreamCompute, |py| {
             let result = self.call_python_fn(
                 py,
                 cx,
@@ -871,7 +950,7 @@ impl StreamActor {
             .ok_or_else(|| anyhow!("tensor not found in stream: {ref_:#?}"))?;
 
         match pyobject {
-            Ok(val) => Python::attach(|py| {
+            Ok(val) => monarch_with_gil_blocking(GilSite::StreamCompute, |py| {
                 Self::pyobject_to_tensor(py, val)
                     .map_err(|pyerr| anyhow::Error::from(SerializablePyErr::from(py, &pyerr)))
             }),
@@ -923,8 +1002,9 @@ impl StreamActor {
     ) -> Result<()> {
         let rank = self.rank;
         self.try_define(cx, seq, vec![], &vec![], async |self_| {
-            let python_message =
-                Python::attach(|py| -> Result<PythonMessage, CallFunctionError> {
+            let python_message = monarch_with_gil_blocking(
+                GilSite::StreamCompute,
+                |py| -> Result<PythonMessage, CallFunctionError> {
                     let python_result = tokio::task::block_in_place(|| {
                         self_.call_python_fn(
                             py,
@@ -937,7 +1017,8 @@ impl StreamActor {
                         )
                     })?;
                     pickle_python_result(py, python_result, rank).map_err(CallFunctionError::Error)
-                })?;
+                },
+            )?;
             let ser = wirevalue::Any::serialize(&python_message).unwrap();
             self_
                 .controller_actor
@@ -952,7 +1033,10 @@ impl StreamActor {
             .env
             .get(&src)
             .ok_or_else(|| CallFunctionError::RefNotFound(src))?;
-        self.env.insert(dest, Python::attach(|_py| rvalue.clone()));
+        self.env.insert(
+            dest,
+            monarch_with_gil_blocking(GilSite::StreamCompute, |_py| rvalue.clone()),
+        );
         Ok(())
     }
     async fn call_actor(
@@ -960,16 +1044,17 @@ impl StreamActor {
         cx: &Context<'_, Self>,
         params: ActorCallParams,
     ) -> Result<Py<PyAny>, CallFunctionError> {
-        let local_state: Result<Vec<Py<PyAny>>> = Python::attach(|_py| {
-            params
-                .local_state
-                .into_iter()
-                .map(|elem| {
-                    let pyobj = self.ref_to_pyobject(&elem)?;
-                    Ok(pyobj.into_any())
-                })
-                .collect()
-        });
+        let local_state: Result<Vec<Py<PyAny>>> =
+            monarch_with_gil_blocking(GilSite::StreamCompute, |_py| {
+                params
+                    .local_state
+                    .into_iter()
+                    .map(|elem| {
+                        let pyobj = self.ref_to_pyobject(&elem)?;
+                        Ok(pyobj.into_any())
+                    })
+                    .collect()
+            });
 
         let (send, recv) = cx.open_once_port();
         let state = LocalState {
@@ -980,9 +1065,7 @@ impl StreamActor {
         let message = LocalStateBrokerMessage::Set(x as usize, state);
 
         let broker = BrokerId::new(params.broker_id).resolve(cx).await;
-        broker
-            .send(cx, message)
-            .map_err(|e| CallFunctionError::Error(e.into()))?;
+        broker.post(cx, message);
         let result = recv
             .recv()
             .await
@@ -1064,18 +1147,18 @@ impl StreamMessageHandler for StreamActor {
             .ok_or_else(|| anyhow!("invalid reference for borrow_create: {:#?}", tensor))?;
 
         let result = match pyobj_result {
-            Ok(pyobj) => Python::attach(|py| Ok(Self::pyobject_to_tensor(py, pyobj).unwrap())),
+            Ok(pyobj) => monarch_with_gil_blocking(GilSite::StreamCompute, |py| {
+                Ok(Self::pyobject_to_tensor(py, pyobj).unwrap())
+            }),
             Err(e) => Err(e.clone()),
         };
 
-        let event = self.cuda_stream().map(|stream| stream.record_event(None));
-        first_use_sender.send(cx, (event, result)).map_err(|err| {
-            anyhow!(
-                "failed sending first use event for borrow {:?}: {:?}",
-                borrow,
-                err
-            )
-        })
+        let event = self
+            .cuda_stream()?
+            .map(record_event)
+            .transpose()?;
+        first_use_sender.post(cx, (event, result));
+        Ok(())
     }
 
     async fn borrow_first_use(
@@ -1108,10 +1191,11 @@ impl StreamMessageHandler for StreamActor {
                     )
                 })?;
 
-        if let Some(stream) = self.cuda_stream() {
-            stream.wait_event(
+        if let Some(stream) = self.cuda_stream()? {
+            wait_event(
+                stream,
                 &mut first_use_event.expect("sent borrow to CUDA stream, expected a CUDA event"),
-            );
+            )?;
         }
         match cell {
             Ok(cell) => {
@@ -1141,24 +1225,22 @@ impl StreamMessageHandler for StreamActor {
             return Ok(());
         }
 
-        let event = self.cuda_stream().map(|stream| stream.record_event(None));
+        let event = self
+            .cuda_stream()?
+            .map(record_event)
+            .transpose()?;
         let pyobj_or_err = self.env.remove(&result).ok_or(anyhow!(
             "Invalid reference for borrow_last_use: {result:#?}"
         ))?;
         let tensor = match pyobj_or_err {
-            Ok(pyobj) => Ok(Python::attach(|py| {
+            Ok(pyobj) => Ok(monarch_with_gil_blocking(GilSite::StreamCompute, |py| {
                 Self::pyobject_to_tensor(py, &pyobj).unwrap()
             })),
             Err(e) => Err(e),
         };
 
-        last_use_sender.send(cx, (event, tensor)).map_err(|err| {
-            anyhow!(
-                "failed sending last use event for borrow {:?}: {:?}",
-                borrow,
-                err
-            )
-        })
+        last_use_sender.post(cx, (event, tensor));
+        Ok(())
     }
 
     async fn borrow_drop(
@@ -1191,10 +1273,11 @@ impl StreamMessageHandler for StreamActor {
                 )
             })?;
 
-        if let Some(stream) = self.cuda_stream() {
-            stream.wait_event(
+        if let Some(stream) = self.cuda_stream()? {
+            wait_event(
+                stream,
                 &mut last_use_event.expect("sent borrow to CUDA stream, expected a CUDA event"),
-            );
+            )?;
         }
         // let the cell drop.
         Ok(())
@@ -1262,7 +1345,7 @@ impl StreamMessageHandler for StreamActor {
         }
 
         let stream = self
-            .cuda_stream()
+            .cuda_stream()?
             .expect("reductions not yet supported for non-CUDA workers")
             .clone();
         let input_cell = self.get_or_fake_on_err(local_tensor, &factory)?;
@@ -1387,17 +1470,20 @@ impl StreamMessageHandler for StreamActor {
                 .ok_or_else(|| anyhow!("tensor not found in stream: {tensor:#?}"))?;
             let output_cell: Result<Py<PyAny>, Arc<SeqError>> = match input_cell {
                 Ok(pyobj) => {
-                    Python::attach(|py| -> Result<Py<PyAny>, Arc<SeqError>> {
-                        let input_tensor = Self::pyobject_to_tensor(py, pyobj).unwrap();
-                        // We create a defensive copy here to prevent mutations on
-                        // the input tensor from affecting output tensor.
-                        // Should we copy if input ref == output ref?
-                        // Should we support copy-on-write to avoid unnecessary copy?
-                        let borrow = input_tensor.try_borrow().unwrap();
-                        let cloned = deep_clone(&borrow);
-                        let cloned_cell = TensorCell::new(cloned);
-                        Ok(Self::tensor_to_pyobject(cloned_cell))
-                    })
+                    monarch_with_gil_blocking(
+                        GilSite::StreamCompute,
+                        |py| -> Result<Py<PyAny>, Arc<SeqError>> {
+                            let input_tensor = Self::pyobject_to_tensor(py, pyobj).unwrap();
+                            // We create a defensive copy here to prevent mutations on
+                            // the input tensor from affecting output tensor.
+                            // Should we copy if input ref == output ref?
+                            // Should we support copy-on-write to avoid unnecessary copy?
+                            let borrow = input_tensor.try_borrow().unwrap();
+                            let cloned = deep_clone(&borrow);
+                            let cloned_cell = TensorCell::new(cloned);
+                            Ok(Self::tensor_to_pyobject(cloned_cell))
+                        },
+                    )
                 }
                 Err(err) => Err(err.clone()),
             };
@@ -1414,7 +1500,7 @@ impl StreamMessageHandler for StreamActor {
             messages.push(CommMessage::Send(
                 input_cell,
                 to_rank.try_into().unwrap(),
-                self.cuda_stream()
+                self.cuda_stream()?
                     .expect("tried to send_tensor on non-cuda stream")
                     .clone(),
                 cx.open_once_port().0,
@@ -1431,7 +1517,7 @@ impl StreamMessageHandler for StreamActor {
             messages.push(CommMessage::Recv(
                 output_cell.clone(),
                 from_rank.try_into().unwrap(),
-                self.cuda_stream()
+                self.cuda_stream()?
                     .expect("tried to send_tensor on non-cuda stream")
                     .clone(),
                 cx.open_once_port().0,
@@ -1443,7 +1529,7 @@ impl StreamMessageHandler for StreamActor {
         comm.group(
             cx,
             messages,
-            self.cuda_stream()
+            self.cuda_stream()?
                 .expect("tried to send_tensor on non-cuda stream")
                 .clone(),
         )
@@ -1482,7 +1568,7 @@ impl StreamMessageHandler for StreamActor {
         } else {
             // If there's no function provided, there should be exactly one arg
             // and no kwargs.
-            Python::attach(|py| {
+            monarch_with_gil_blocking(GilSite::StreamCompute, |py| {
                 let (args, kwargs) = args_kwargs
                     .to_python(py)
                     .map_err(|e| CallFunctionError::Error(e.into()))?;
@@ -1548,8 +1634,9 @@ impl StreamMessageHandler for StreamActor {
         let mutates = params.mutates.clone();
         self.try_define(cx, seq, vec![], &mutates, async |self| {
             let value = self.call_actor(cx, params).await?;
-            let result =
-                Python::attach(|py| pickle_python_result(py, value.into_bound(py), self.rank))?;
+            let result = monarch_with_gil_blocking(GilSite::StreamCompute, |py| {
+                pickle_python_result(py, value.into_bound(py), self.rank)
+            })?;
             let result = wirevalue::Any::serialize(&result).unwrap();
             self.controller_actor
                 .fetch_result(cx, seq, Ok(result))
@@ -1568,7 +1655,7 @@ impl StreamMessageHandler for StreamActor {
         let mutates = params.call.mutates.clone();
         self.try_define(cx, seq, params.results, &mutates, async |self| {
             let result = self.call_actor(cx, params.call).await?;
-            let result = Python::attach(|py| {
+            let result = monarch_with_gil_blocking(GilSite::StreamCompute, |py| {
                 PyTree::<Py<PyAny>>::extract_bound(&result.into_bound(py))
                     .map_err(SerializablePyErr::from_fn(py))
             })?;
@@ -1755,7 +1842,7 @@ impl StreamMessageHandler for StreamActor {
                     // to check for existing errors on the input tensors and set the
                     // recording's error if necessary.
                     if error.is_none() {
-                        let inputs_to_check = [Some(local_tensor), out.clone()]
+                        let inputs_to_check = [Some(local_tensor), *out]
                             .iter()
                             .filter_map(|r| *r)
                             .collect::<Vec<_>>();
@@ -1798,7 +1885,7 @@ impl StreamMessageHandler for StreamActor {
                             seq,
                             WorkerError {
                                 backtrace: format!("recording failed: {}", &seq_err),
-                                worker_actor_id: cx.self_id().clone(),
+                                worker_actor_id: cx.self_addr().clone(),
                             },
                         )
                         .await?;
@@ -1841,7 +1928,9 @@ impl StreamMessageHandler for StreamActor {
         value: WireValue,
     ) -> Result<()> {
         let pyobj =
-            Python::attach(|py| -> PyResult<Py<PyAny>> { Ok(value.into_pyobject(py)?.unbind()) })?;
+            monarch_with_gil_blocking(GilSite::StreamCompute, |py| -> PyResult<Py<PyAny>> {
+                Ok(value.into_pyobject(py)?.unbind())
+            })?;
         self.env.insert(reference, Ok(pyobj));
         Ok(())
     }
@@ -1880,7 +1969,7 @@ impl StreamMessageHandler for StreamActor {
             value: Result<Py<PyAny>, Arc<SeqError>>,
         ) -> Result<WireValue, Arc<SeqError>> {
             let pyobj = value?;
-            Python::attach(|py| {
+            monarch_with_gil_blocking(GilSite::StreamCompute, |py| {
                 let bound = pyobj.bind(py);
                 // Check bool before int since Python's bool is a subclass of int
                 if bound.is_instance_of::<PyBool>() {
@@ -1911,7 +2000,10 @@ impl StreamMessageHandler for StreamActor {
             })
         }
         Ok(self.env.get(&reference).map(|pyobj| {
-            pyobject_to_wire(Python::attach(|_py| pyobj.clone())).map_err(|err| err.to_string())
+            pyobject_to_wire(monarch_with_gil_blocking(GilSite::StreamCompute, |_py| {
+                pyobj.clone()
+            }))
+            .map_err(|err| err.to_string())
         }))
     }
 
@@ -1921,9 +2013,11 @@ impl StreamMessageHandler for StreamActor {
         reference: Ref,
     ) -> Result<Option<TensorCellResult>> {
         match self.env.get(&reference) {
-            Some(Ok(pyobj)) => Python::attach(|py| match Self::pyobject_to_tensor(py, pyobj) {
-                Ok(tensor) => Ok(Some(Ok(tensor.try_cpu().unwrap()))),
-                Err(e) => bail!("expected tensor, got extraction error: {:?}", e),
+            Some(Ok(pyobj)) => monarch_with_gil_blocking(GilSite::StreamCompute, |py| {
+                match Self::pyobject_to_tensor(py, pyobj) {
+                    Ok(tensor) => Ok(Some(Ok(tensor.try_cpu().unwrap()))),
+                    Err(e) => bail!("expected tensor, got extraction error: {:?}", e),
+                }
             }),
             Some(Err(err)) => Ok(Some(Err(err.clone()))),
             None => Ok(None),
@@ -1963,7 +2057,7 @@ mod tests {
     struct TestSetup {
         proc: Proc,
         stream_actor: ActorHandle<StreamActor>,
-        client: Instance<()>,
+        client: reference::Client,
         // Unused, but necessary, because proc needs a supervision
         // port -- otherwise an actor failure will cause a crash.
         #[allow(dead_code)]
@@ -1983,24 +2077,21 @@ mod tests {
         async fn new_with_world_size(world_size: usize) -> Result<Self> {
             test_util::test_setup()?;
 
-            let proc = Proc::local();
+            let proc = Proc::isolated();
             let (_, controller_actor, controller_rx) =
                 proc.attach_actor::<ControllerActor, ControllerMessage>("controller")?;
-            let (client, _handle) = proc.instance("client")?;
+            let client = proc.client("client");
             let (supervision_tx, supervision_rx) = client.open_port();
-            proc.set_supervision_coordinator(supervision_tx)?;
-            let stream_actor = proc.spawn(
-                "stream",
-                StreamActor::new(StreamParams {
-                    world_size,
-                    rank: 0,
-                    creation_mode: StreamCreationMode::UseDefaultStream,
-                    id: 0.into(),
-                    device: Some(AccelDevice::new(0.into())),
-                    controller_actor: controller_actor.clone(),
-                    respond_with_python_message: false,
-                }),
-            )?;
+            proc.set_supervision_coordinator(supervision_tx.bind())?;
+            let stream_actor = proc.spawn(StreamActor::new(StreamParams {
+                world_size,
+                rank: 0,
+                creation_mode: StreamCreationMode::UseDefaultStream,
+                id: 0.into(),
+                device: Some(AccelDevice::new(0.into())),
+                controller_actor: controller_actor.clone(),
+                respond_with_python_message: false,
+            }));
 
             Ok(Self {
                 proc,
@@ -2095,7 +2186,7 @@ mod tests {
         seq: Seq,
         reference: Ref,
     ) {
-        let ref_to_send = Python::attach(|py| {
+        let ref_to_send = monarch_with_gil_blocking(GilSite::Test, |py| {
             PickledPyObject::pickle(&reference.into_bound_py_any(py).unwrap()).unwrap()
         });
 
@@ -2103,7 +2194,7 @@ mod tests {
             .send_value(
                 cx,
                 seq,
-                stream_actor.actor_id().clone(),
+                stream_actor.actor_addr().clone(),
                 Vec::new(),
                 None,
                 ArgsKwargs::from_wire_values(
@@ -2461,7 +2552,6 @@ mod tests {
             .await?;
 
         let dummy_comm = test_setup.proc.spawn(
-            "comm",
             NcclCommActor::new(CommParams::New {
                 device: AccelDevice::new(0.into()),
                 unique_id: CommId::new()?,
@@ -2470,7 +2560,7 @@ mod tests {
             })
             .await
             .unwrap(),
-        )?;
+        );
 
         test_setup
             .stream_actor

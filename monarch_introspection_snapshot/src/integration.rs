@@ -18,7 +18,7 @@
 //! # Snapshot integration invariants (SI-*)
 //!
 //! - **SI-1 (snapshot tables discoverable):** After
-//!   `register_snapshot_schemas`, the 9 snapshot table names appear
+//!   `register_snapshot_schemas`, the 13 snapshot table names appear
 //!   in `DatabaseScanner.table_names()` and are discoverable by
 //!   `QueryEngine.setup_tables()`.
 //! - **SI-2 (snapshot tables queryable):** After periodic capture
@@ -48,23 +48,31 @@
 
 use std::time::Duration;
 
+use hyperactor::Endpoint as _;
+use hyperactor::Label;
+use hyperactor::Uid;
 use hyperactor_mesh::mesh_admin::MeshAdminAgent;
 use monarch_distributed_telemetry::database_scanner::TableStore;
 use monarch_record_batch::RecordBatchBuffer;
 
+use crate::schema::ActiveHandlerRowBuffer;
+use crate::schema::ActorExecutionRowBuffer;
 use crate::schema::ActorFailureRowBuffer;
+use crate::schema::ActorInboundOrderingRowBuffer;
 use crate::schema::ActorNodeRowBuffer;
 use crate::schema::ChildRowBuffer;
 use crate::schema::HostNodeRowBuffer;
 use crate::schema::NodeRowBuffer;
+use crate::schema::OrderingSessionRowBuffer;
 use crate::schema::ProcNodeRowBuffer;
 use crate::schema::ResolutionErrorRowBuffer;
 use crate::schema::RootNodeRowBuffer;
 use crate::schema::SnapshotRowBuffer;
 use crate::service::CaptureSnapshot;
+use crate::service::HttpPublisher;
 use crate::service::SnapshotCaptureActor;
 
-/// Pre-register the 9 snapshot table schemas into `table_store`.
+/// Pre-register the 13 snapshot table schemas into `table_store`.
 ///
 /// Each table is registered with a zero-row `RecordBatch` carrying
 /// the correct Arrow schema. This must be called before the
@@ -77,8 +85,20 @@ pub async fn register_snapshot_schemas(table_store: &TableStore) -> anyhow::Resu
     // Order matches SNAPSHOT_TABLE_NAMES (sorted).
     let batches = [
         (
+            "active_handlers",
+            ActiveHandlerRowBuffer::default().drain_to_record_batch()?,
+        ),
+        (
+            "actor_executions",
+            ActorExecutionRowBuffer::default().drain_to_record_batch()?,
+        ),
+        (
             "actor_failures",
             ActorFailureRowBuffer::default().drain_to_record_batch()?,
+        ),
+        (
+            "actor_inbound_orderings",
+            ActorInboundOrderingRowBuffer::default().drain_to_record_batch()?,
         ),
         (
             "actor_nodes",
@@ -93,6 +113,10 @@ pub async fn register_snapshot_schemas(table_store: &TableStore) -> anyhow::Resu
             HostNodeRowBuffer::default().drain_to_record_batch()?,
         ),
         ("nodes", NodeRowBuffer::default().drain_to_record_batch()?),
+        (
+            "ordering_sessions",
+            OrderingSessionRowBuffer::default().drain_to_record_batch()?,
+        ),
         (
             "proc_nodes",
             ProcNodeRowBuffer::default().drain_to_record_batch()?,
@@ -128,8 +152,17 @@ pub async fn register_snapshot_schemas(table_store: &TableStore) -> anyhow::Resu
 /// `CaptureSnapshot` message to the spawned actor.
 pub fn start_periodic_snapshots(
     cx: &impl hyperactor::context::Actor,
-    table_store: TableStore,
+    publisher: HttpPublisher,
     admin_ref: hyperactor::ActorRef<MeshAdminAgent>,
+    interval: Duration,
+) -> anyhow::Result<()> {
+    let actor = SnapshotCaptureActor::new(publisher, admin_ref, interval);
+    start_periodic_snapshot_actor(cx, actor, interval)
+}
+
+fn start_periodic_snapshot_actor(
+    cx: &impl hyperactor::context::Actor,
+    actor: SnapshotCaptureActor,
     interval: Duration,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -137,10 +170,9 @@ pub fn start_periodic_snapshots(
         "periodic capture interval must be non-zero"
     );
     let proc = cx.instance().proc();
-    let actor = SnapshotCaptureActor::new(table_store, admin_ref, interval);
-    let handle = proc.spawn("snapshot_capture", actor)?;
+    let handle = proc.spawn_with_uid(Uid::singleton(Label::strip("snapshot_capture")), actor)?;
     // PT-3: first capture fires at spawn time.
-    handle.send(cx, CaptureSnapshot)?;
+    handle.post(cx, CaptureSnapshot);
     Ok(())
 }
 
@@ -149,7 +181,7 @@ mod tests {
     use super::*;
     use crate::push::SNAPSHOT_TABLE_NAMES;
 
-    // SI-1: register_snapshot_schemas populates a TableStore with 9
+    // SI-1: register_snapshot_schemas populates a TableStore with 13
     // table names matching SNAPSHOT_TABLE_NAMES.
     #[tokio::test]
     async fn test_register_snapshot_schemas() {
@@ -157,7 +189,7 @@ mod tests {
         register_snapshot_schemas(&store).await.unwrap();
 
         let names = store.table_names().unwrap();
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 13);
 
         let expected: Vec<String> = SNAPSHOT_TABLE_NAMES.iter().map(|s| s.to_string()).collect();
         assert_eq!(names, expected);

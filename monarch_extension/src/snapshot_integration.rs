@@ -19,9 +19,18 @@ use monarch_hyperactor::context::PyInstance;
 use monarch_hyperactor::host_mesh::PyMeshAdminRef;
 use monarch_introspection_snapshot::integration::register_snapshot_schemas;
 use monarch_introspection_snapshot::integration::start_periodic_snapshots;
+use monarch_introspection_snapshot::push::SNAPSHOT_TABLE_NAMES;
+use monarch_introspection_snapshot::service::HttpPublisher;
 use pyo3::prelude::*;
 
-/// Pre-register the 9 snapshot table schemas in a `DatabaseScanner`.
+/// Return the canonical snapshot table names in ingestion order.
+#[pyfunction]
+#[pyo3(name = "_snapshot_table_names")]
+fn snapshot_table_names_py() -> Vec<&'static str> {
+    SNAPSHOT_TABLE_NAMES.to_vec()
+}
+
+/// Pre-register the 13 snapshot table schemas in a `DatabaseScanner`.
 ///
 /// Must be called after `DatabaseScanner` creation and before
 /// `QueryEngine` construction, because table discovery is static.
@@ -30,6 +39,13 @@ use pyo3::prelude::*;
 #[pyo3(name = "_pre_register_snapshot_schemas")]
 fn pre_register_snapshot_schemas_py(py: Python<'_>, scanner: &DatabaseScanner) -> PyResult<()> {
     let table_store = scanner.table_store();
+    // This is the pyo3-async-runtimes library's own tokio runtime, not monarch's
+    // control-plane runtime (`get_tokio_runtime()`); monarch does not tag it with
+    // a `RuntimeKind` (see `hyperactor::runtime_identity`), so it is classified
+    // as `None`. Safe today only because this
+    // work is GIL-free: the GIL is released (`py.detach`) before `block_on` and
+    // `register_snapshot_schemas` is pure Arrow. If GIL work is ever needed here,
+    // route it through `get_tokio_runtime()` (or another tagged runtime).
     py.detach(|| {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(async { register_snapshot_schemas(&table_store).await })
@@ -37,20 +53,15 @@ fn pre_register_snapshot_schemas_py(py: Python<'_>, scanner: &DatabaseScanner) -
     })
 }
 
-/// Spawn periodic snapshot capture as a `SnapshotCaptureActor`.
-///
-/// Fire-and-forget: the actor is spawned on the same proc as the
-/// mesh admin. Framework lifecycle (proc teardown) stops it.
-/// Returns nothing (SI-5).
+/// Spawn periodic snapshot capture that publishes to the telemetry HTTP API.
 #[pyfunction]
-#[pyo3(name = "_start_periodic_snapshots")]
-fn start_periodic_snapshots_py(
-    scanner: &DatabaseScanner,
+#[pyo3(name = "_start_periodic_snapshots_http")]
+fn start_periodic_snapshots_http_py(
+    base_url: &str,
     admin_ref: &PyMeshAdminRef,
     instance: &PyInstance,
     interval_secs: f64,
 ) -> PyResult<()> {
-    let table_store = scanner.table_store();
     let admin_ref = admin_ref.actor_ref();
 
     if interval_secs <= 0.0 || !interval_secs.is_finite() {
@@ -62,12 +73,18 @@ fn start_periodic_snapshots_py(
     let interval = Duration::from_secs_f64(interval_secs);
 
     let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
-    start_periodic_snapshots(&**instance, table_store, admin_ref, interval)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:#}", e)))
+    start_periodic_snapshots(
+        &**instance,
+        HttpPublisher::new(base_url),
+        admin_ref,
+        interval,
+    )
+    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:#}", e)))
 }
 
 pub fn register_python_bindings(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(snapshot_table_names_py, module)?)?;
     module.add_function(wrap_pyfunction!(pre_register_snapshot_schemas_py, module)?)?;
-    module.add_function(wrap_pyfunction!(start_periodic_snapshots_py, module)?)?;
+    module.add_function(wrap_pyfunction!(start_periodic_snapshots_http_py, module)?)?;
     Ok(())
 }

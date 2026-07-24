@@ -6,11 +6,11 @@ full mesh topology — hosts, processes, actor meshes, and individual actors —
 interactive views with live-updating metrics, message traffic analysis, and a
 full DAG visualization.
 
-> **Beta** — The Monarch Dashboard is in early development. Features may
-> change and rough edges are expected. Feedback is welcome!
+> **Note** — The Monarch Dashboard is in early development and may change
+> significantly between releases.
 
-The dashboard is included in the `torchmonarch` PyPI package. When you call
-`start_telemetry(include_dashboard=True)`, it starts a local web server that
+The dashboard is included in the `torchmonarch` PyPI package. When a job enables
+`TelemetryConfig(include_dashboard=True)`, Monarch starts a local web server that
 serves the dashboard UI.
 
 ## Quick Start
@@ -27,7 +27,7 @@ python python/examples/dining_philosophers.py --dashboard
 
 The example prints the dashboard URL on startup:
 
-```
+```text
 Monarch Dashboard: http://localhost:8265
 ```
 
@@ -70,7 +70,7 @@ the top to jump back to a parent level.
 
 The navigation levels are:
 
-```
+```text
 Host Meshes
   └─ Host Units (individual hosts)
        └─ Proc Meshes
@@ -97,7 +97,7 @@ Selecting an individual actor opens its detail page with three sections:
 
 The DAG view renders the entire job as an interactive directed graph, helping you to understand your job better.  It also shows message flows between your user actors.
 
-```
+```text
 Host → Proc → Actor
 ```
 
@@ -124,8 +124,7 @@ from monarch.job import LocalJob, ProcessJob, KubernetesJob, SlurmJob, Telemetry
 # job = ...
 dashboard_port = 8265
 
-# Enable admin API and telemetry/dashboard as they work together.
-job.enable_admin()
+# Enable telemetry, mesh admin, snapshots, and the dashboard together.
 job.enable_telemetry(
     TelemetryConfig(include_dashboard=True, dashboard_port=dashboard_port)
 )

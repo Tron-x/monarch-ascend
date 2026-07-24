@@ -170,12 +170,33 @@ impl PyValueMesh {
 }
 
 impl PyValueMesh {
-    /// Create a lazy ValueMesh from an extent and raw pickled parts.
-    /// Values are unpickled on demand when accessed via `get()` or `values()`.
+    /// Create a lazy ValueMesh from raw pickled parts, unpickled on demand at
+    /// `get()`/`values()`: the no-refs decode path for the `.call()` collector.
+    /// See the out-of-band mesh-reference invariants in [`crate::pickle`] for
+    /// why the collector gates on refs and why this lazy decode is sound.
     pub fn build_from_parts(extent: &Extent, parts: Vec<Part>) -> PyResult<Self> {
         let lazy_values: Vec<LazyCell> = parts
             .into_iter()
             .map(|p| Mutex::new(LazyPyObject::Pickled(p)))
+            .collect();
+        let mut inner = <ValueMesh<LazyCell> as BuildFromRegion<LazyCell>>::build_dense(
+            ndslice::View::region(extent),
+            lazy_values,
+        )
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        compress(&mut inner);
+
+        Ok(Self { inner })
+    }
+
+    /// Create a ValueMesh from already-unpickled objects: the eager, ref-aware
+    /// decode path for the `.call()` collector when responses carry refs. See
+    /// the out-of-band mesh-reference invariants in [`crate::pickle`]; the
+    /// no-ref case uses `build_from_parts`.
+    pub fn build_from_objects(extent: &Extent, objects: Vec<Py<PyAny>>) -> PyResult<Self> {
+        let lazy_values: Vec<LazyCell> = objects
+            .into_iter()
+            .map(|o| Mutex::new(LazyPyObject::Unpickled(o)))
             .collect();
         let mut inner = <ValueMesh<LazyCell> as BuildFromRegion<LazyCell>>::build_dense(
             ndslice::View::region(extent),

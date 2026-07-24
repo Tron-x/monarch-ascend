@@ -6,55 +6,125 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+//! PyO3 bindings for `monarch_rdma`.
+//!
+//! Most of this module wraps RDMA buffers, local-memory handles, and batched
+//! actions. `PyRdmaManager::ensure_init_rdma_manager_nonblocking` is the manager
+//! initialization boundary; its invariants (`RMB-*`) live at the boundary, not in
+//! the owner's `RMO-*` state machine:
+//!
+//! - **RMB-1** (one readiness surface): the method eagerly returns exactly one
+//!   observe-only `Handle[None]`; it creates no `PythonTask`, `Shared`, or other
+//!   readiness signal.
+//! - **RMB-2** (explicit mesh): the exact `Shared[ProcMesh]` argument is retained
+//!   and resolved; the Shared keepalive is released immediately after resolution,
+//!   then the resolved mesh is downcast to `PyProcMesh` and cloned to a
+//!   `ProcMeshRef`. No ambient/default proc mesh participates.
+//! - **RMB-3** (stable-root ownership): the owner is obtained only through the
+//!   supplied instance's inherited `ClientRootRef` and the statically declared
+//!   `ClientRootService<RdmaManagerOwnerActor>`; the passed instance supplies the
+//!   request/reply endpoint, not the owner's lifetime.
+//! - **RMB-4** (full-barrier flattening): success requires shared resolution, mesh
+//!   extraction, client-root lookup, service ensure, request post, reply
+//!   reception, and the owner's inner `Ok(())`.
+//! - **RMB-5** (typed failure boundary): an owner `RdmaInitError` becomes the
+//!   catchable native `RdmaInitError` with its cause text preserved. A wrong-typed
+//!   `Shared` surfaces the native PyO3 `TypeError` from the downcast (preserved,
+//!   not remapped); missing-capability, service-ensure, and reply-channel failures
+//!   stay `PyRuntimeError`.
+//! - **RMB-6** (observation does not control init): dropping or cancelling the
+//!   returned `Handle` does not abort the producer or the owner request, and the
+//!   binding adds no timeout or local capability gate.
+//! - **RMB-7** (non-returning owner request): `EnsureRdmaManager` is posted through
+//!   the owner's typed port with `return_undeliverable(false)`, so an invalid owner
+//!   reference cannot bounce back and fail the caller; with no reply the `Handle`
+//!   stays pending (RMO-9).
+//! - **RMB-8** (producer retained state): RMB-8 governs only the *producer's*
+//!   retained state — the `PyInstance` is consumed to its native `Instance` before
+//!   the producer spawns and the `PyShared` is released after mesh resolution, so
+//!   an unbounded owner wait retains native actor/mesh references, not the caller's
+//!   Python object graph.
+//!
+//! Accepted cost: a *cancelled* awaiter of the returned `Handle` keeps its
+//! `asyncio` observer — and thus its `Future` and event loop — alive until the
+//! producer resolves; under the no-timeout boundary (RMO-9) a never-resolving
+//! owner can retain those indefinitely. This is inherited `Handle` observer
+//! behavior, not specific to this binding, and is left unaddressed here rather
+//! than expanding scope to generic observer cancellation.
+
 #![allow(unsafe_op_in_unsafe_fn)]
 use std::ops::Deref;
 use std::sync::Arc;
+use std::time::Duration;
 
+use hyperactor::Endpoint;
 use hyperactor_mesh::ActorMesh;
+use hyperactor_mesh::ProcMeshRef;
+use hyperactor_mesh::client_root::ClientRootRef;
+use hyperactor_mesh::client_root::ClientRootService;
 use monarch_hyperactor::context::PyInstance;
+use monarch_hyperactor::handle::PyHandle;
 use monarch_hyperactor::proc_mesh::PyProcMesh;
 use monarch_hyperactor::pytokio::PyPythonTask;
+use monarch_hyperactor::pytokio::PyShared;
+use monarch_hyperactor::runtime::GilSite;
+use monarch_hyperactor::runtime::monarch_with_gil;
 use monarch_hyperactor::runtime::monarch_with_gil_blocking;
 use monarch_hyperactor::runtime::signal_safe_block_on;
+use monarch_rdma::EnsureRdmaManager;
+use monarch_rdma::RDMA_MANAGER_OWNER_ACTOR_NAME;
+use monarch_rdma::RdmaAction;
+use monarch_rdma::RdmaInitError as RdmaInitWireError;
 use monarch_rdma::RdmaManagerActor;
 use monarch_rdma::RdmaManagerMessageClient;
+use monarch_rdma::RdmaManagerOwnerActor;
 use monarch_rdma::RdmaRemoteBuffer;
+#[cfg(not(feature = "hixl"))]
+use monarch_rdma::ScannedSegment;
+#[cfg(not(feature = "hixl"))]
+use monarch_rdma::ibverbs_supported;
 use monarch_rdma::local_memory::Keepalive;
 use monarch_rdma::local_memory::KeepaliveLocalMemory;
-use monarch_rdma::local_memory::RdmaLocalMemory;
-use monarch_rdma::register_segment_scanner;
+use monarch_rdma::local_memory::WeakKeepalive;
+use monarch_rdma::local_memory::WeakLocalMemory;
+#[cfg(not(feature = "hixl"))]
+use monarch_rdma::rdma_supported;
+#[cfg(not(feature = "hixl"))]
+use monarch_rdma::register_cuda_segment_scanner;
+use monarch_types::py_global;
 use monarch_types::py_module_add_function;
 use pyo3::IntoPyObjectExt;
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyException;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
+use pyo3::types::PyMemoryView;
 use pyo3::types::PyTuple;
 use pyo3::types::PyType;
 use typeuri::Named;
 
-// ---- GPU: ibverbs-specific imports and functions ----
+const RDMA_MANAGER_OWNER_SERVICE: ClientRootService<RdmaManagerOwnerActor> =
+    ClientRootService::declare(RDMA_MANAGER_OWNER_ACTOR_NAME);
 
+/// CUDA segment scanner backed by PyTorch's memory snapshot API.
+///
+/// Enumerates the live CUDA caching-allocator segments via
+/// `torch.cuda.memory._snapshot()`. Returns an empty list when torch is not
+/// imported, CUDA is unavailable, or the snapshot fails — so the mlx5dv
+/// segment binder simply falls back to per-buffer dmabuf MRs rather than
+/// erroring.
 #[cfg(not(feature = "hixl"))]
-use monarch_rdma::ibverbs_supported;
-#[cfg(not(feature = "hixl"))]
-use monarch_rdma::rdma_supported;
-
-#[cfg(not(feature = "hixl"))]
-unsafe extern "C" fn pytorch_segment_scanner(
-    segments_out: *mut monarch_rdma::rdmaxcel_sys::rdmaxcel_scanned_segment_t,
-    max_segments: usize,
-) -> usize {
-    let result = Python::attach(|py| -> PyResult<usize> {
+fn pytorch_cuda_segments() -> Vec<ScannedSegment> {
+    // Acquire the GIL to call Python code.
+    let result = monarch_with_gil_blocking(GilSite::Rdma, |py| -> PyResult<Vec<ScannedSegment>> {
+        // Check if torch is already imported - don't import it ourselves.
         let sys = py.import("sys")?;
         let modules = sys.getattr("modules")?;
-
         let torch = match modules.get_item("torch") {
             Ok(torch_module) => torch_module,
-            Err(_) => {
-                return Ok(0);
-            }
+            Err(_) => return Ok(Vec::new()),
         };
 
         let cuda_available: bool = torch
@@ -62,9 +132,8 @@ unsafe extern "C" fn pytorch_segment_scanner(
             .getattr("is_available")?
             .call0()?
             .extract()?;
-
         if !cuda_available {
-            return Ok(0);
+            return Ok(Vec::new());
         }
 
         let snapshot = torch
@@ -72,63 +141,287 @@ unsafe extern "C" fn pytorch_segment_scanner(
             .getattr("memory")?
             .getattr("_snapshot")?
             .call0()?;
-
         let segments = snapshot.get_item("segments")?;
         let segments_list: Vec<Bound<'_, PyAny>> = segments.extract()?;
 
-        let num_segments = segments_list.len();
-        let segments_to_write = num_segments.min(max_segments);
-
-        for (i, segment) in segments_list.iter().take(segments_to_write).enumerate() {
-            let address: u64 = segment.get_item("address")?.extract()?;
-            let total_size: usize = segment.get_item("total_size")?.extract()?;
-            let device: i32 = segment.get_item("device")?.extract()?;
-            let is_expandable: bool = segment.get_item("is_expandable")?.extract()?;
-
-            let seg_info = &mut *segments_out.add(i);
-            seg_info.address = address as usize;
-            seg_info.size = total_size;
-            seg_info.device = device;
-            seg_info.is_expandable = if is_expandable { 1 } else { 0 };
-        }
-
-        Ok(num_segments)
+        segments_list
+            .iter()
+            .map(|segment| {
+                Ok(ScannedSegment {
+                    address: segment.get_item("address")?.extract::<u64>()? as usize,
+                    size: segment.get_item("total_size")?.extract()?,
+                    cuda_ordinal: segment.get_item("device")?.extract()?,
+                    is_expandable: segment.get_item("is_expandable")?.extract()?,
+                })
+            })
+            .collect()
     });
 
-    match result {
-        Ok(count) => count,
-        Err(e) => {
-            eprintln!("[monarch_rdma] pytorch_segment_scanner failed: {}", e);
-            0
+    result.unwrap_or_else(|e| {
+        tracing::error!("pytorch_cuda_segments failed: {}", e);
+        Vec::new()
+    })
+}
+
+/// Resolve a Python `weakref.ref` to a strong [`Py<PyAny>`], or
+/// `None` if the referent has gone away. Caller must hold the GIL.
+fn upgrade_weakref(py: Python<'_>, weak: &Py<PyAny>) -> Option<Py<PyAny>> {
+    let obj = weak.call0(py).ok()?;
+    if obj.bind(py).is_none() {
+        return None;
+    }
+    Some(obj)
+}
+
+py_global!(weakref_ref, "weakref", "ref");
+
+/// Build a `weakref.ref(obj)`. Returns `None` for objects that
+/// don't carry a `__weakref__` slot (`bytes`, `bytearray`, ...).
+fn make_weakref(py: Python<'_>, obj: &Py<PyAny>) -> Option<Py<PyAny>> {
+    let weak_ref = weakref_ref(py).call1((obj.bind(py),)).ok()?;
+    Some(weak_ref.unbind())
+}
+
+/// Read the current `(addr, size)` of a `memoryview` via the buffer
+/// protocol. Returns `None` if the buffer can't be acquired.
+fn memoryview_addr_size(py: Python<'_>, mv: &Py<PyAny>) -> Option<(usize, usize)> {
+    let buffer = PyBuffer::<u8>::get(mv.bind(py)).ok()?;
+    Some((buffer.buf_ptr() as usize, buffer.len_bytes()))
+}
+
+/// Whether `obj` is a torch tensor, without importing torch: if torch
+/// has not been imported, no object can be a tensor.
+fn is_torch_tensor(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let torch = py
+        .import("sys")?
+        .getattr("modules")?
+        .call_method1("get", ("torch",))?;
+    if torch.is_none() {
+        return Ok(false);
+    }
+    obj.is_instance(&torch.getattr("Tensor")?)
+}
+
+/// `ValueError` describing the supported-input contract, mirroring the
+/// message the Python wrapper historically raised.
+fn unsupported_buffer_error(buf: &Bound<'_, PyAny>) -> PyErr {
+    let repr = buf
+        .str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|_| "<unrepresentable>".to_string());
+    PyValueError::new_err(format!(
+        "RDMABuffer only supports 1d contiguous torch.Tensor or 1d c-contiguous memoryview. Got: {}",
+        repr
+    ))
+}
+
+/// Validate that `buf` is a 1d contiguous torch tensor or a 1d
+/// c-contiguous memoryview, raising `ValueError` otherwise. The
+/// local-memory handle constructors derive `(addr, size)` assuming this
+/// layout, so a non-contiguous or multi-dimensional input would yield a
+/// region that misrepresents the data.
+#[pyfunction]
+fn _assert_1d_contiguous(py: Python<'_>, buf: &Bound<'_, PyAny>) -> PyResult<()> {
+    if is_torch_tensor(py, buf)? {
+        let dim: usize = buf.call_method0("dim")?.extract()?;
+        let contiguous: bool = buf.call_method0("is_contiguous")?.extract()?;
+        if dim != 1 || !contiguous {
+            return Err(unsupported_buffer_error(buf));
         }
+    } else if buf.is_instance_of::<PyMemoryView>() {
+        let ndim: usize = buf.getattr("ndim")?.extract()?;
+        let c_contiguous: bool = buf.getattr("c_contiguous")?.extract()?;
+        if ndim != 1 || !c_contiguous {
+            return Err(unsupported_buffer_error(buf));
+        }
+    } else {
+        return Err(unsupported_buffer_error(buf));
+    }
+    Ok(())
+}
+
+/// Compute the `(addr, size)` of a torch tensor's data: the storage
+/// pointer offset by `storage_offset`, and `element_size * numel`.
+/// Assumes a 1d contiguous tensor (see [`_assert_1d_contiguous`]).
+#[pyfunction]
+fn _get_tensor_addr_and_size(tensor: &Bound<'_, PyAny>) -> PyResult<(usize, usize)> {
+    let base_addr: usize = tensor
+        .call_method0("untyped_storage")?
+        .call_method0("data_ptr")?
+        .extract()?;
+    let storage_offset: usize = tensor.call_method0("storage_offset")?.extract()?;
+    let element_size: usize = tensor.call_method0("element_size")?.extract()?;
+    let numel: usize = tensor.call_method0("numel")?.extract()?;
+    Ok((
+        base_addr + storage_offset * element_size,
+        element_size * numel,
+    ))
+}
+
+/// Compute the `(addr, size)` of a `memoryview` via the buffer protocol.
+#[pyfunction]
+fn _get_memoryview_addr_and_size(
+    py: Python<'_>,
+    mv: &Bound<'_, PyAny>,
+) -> PyResult<(usize, usize)> {
+    memoryview_addr_size(py, &mv.clone().unbind())
+        .ok_or_else(|| PyRuntimeError::new_err("failed to acquire memoryview buffer"))
+}
+
+/// [`Keepalive`] for a Python `memoryview`. Holding the memoryview
+/// keeps its buffer exporter pinned for the lifetime of this value.
+/// Caches the `(addr, size)` read at construction so the
+/// [`Keepalive::addr`] / [`Keepalive::size`]
+/// implementations don't re-enter the buffer protocol.
+struct PyMemoryViewKeepalive {
+    mv: Py<PyAny>,
+    addr: usize,
+    size: usize,
+}
+
+impl Keepalive for PyMemoryViewKeepalive {
+    fn addr(&self) -> usize {
+        self.addr
+    }
+
+    fn size(&self) -> usize {
+        self.size
+    }
+
+    fn downgrade(&self) -> Option<Arc<dyn WeakKeepalive>> {
+        monarch_with_gil_blocking(GilSite::Rdma, |py| {
+            let weak = make_weakref(py, &self.mv)?;
+            Some(Arc::new(PyMemoryViewWeakKeepalive { weak }) as Arc<dyn WeakKeepalive>)
+        })
     }
 }
 
-#[cfg(feature = "hixl")]
-fn hixl_rdma_supported() -> bool {
-    true
+/// [`WeakKeepalive`] for a `memoryview`. Upgrades by re-acquiring the
+/// memoryview via the weakref and re-reading `(addr, size)` from the
+/// buffer protocol; a retargeted memoryview will produce a strong
+/// keepalive whose cached values no longer match the paired
+/// [`WeakLocalMemory`], so [`WeakLocalMemory::upgrade`] fails.
+struct PyMemoryViewWeakKeepalive {
+    weak: Py<PyAny>,
 }
 
-/// Wrapper implementing [`Keepalive`] for a Python object reference.
-///
-/// Prevents garbage collection of the backing Python object while RDMA
-/// operations are in flight.
-struct PyKeepalive(#[allow(dead_code)] Py<PyAny>);
+impl WeakKeepalive for PyMemoryViewWeakKeepalive {
+    fn upgrade(&self) -> Option<Arc<dyn Keepalive>> {
+        monarch_with_gil_blocking(GilSite::Rdma, |py| {
+            let mv = upgrade_weakref(py, &self.weak)?;
+            let (addr, size) = memoryview_addr_size(py, &mv)?;
+            Some(Arc::new(PyMemoryViewKeepalive { mv, addr, size }) as Arc<dyn Keepalive>)
+        })
+    }
+}
 
-impl Keepalive for PyKeepalive {}
+/// [`Keepalive`] for a torch tensor's `UntypedStorage`. Pinning the
+/// storage (rather than any specific tensor view onto it) keeps the
+/// backing allocation alive across temporary views like
+/// `tensor.view(...).flatten()` — those views can be dropped while
+/// the storage outlives them. `(addr, size)` are recomputed from the
+/// cached shape components so they remain correct on upgrade.
+struct PyTorchUntypedStorageKeepalive {
+    storage: Py<PyAny>,
+    base_addr: usize,
+    storage_offset: usize,
+    element_size: usize,
+    numel: usize,
+}
+
+impl Keepalive for PyTorchUntypedStorageKeepalive {
+    fn addr(&self) -> usize {
+        self.base_addr + self.storage_offset * self.element_size
+    }
+
+    fn size(&self) -> usize {
+        self.element_size * self.numel
+    }
+
+    fn downgrade(&self) -> Option<Arc<dyn WeakKeepalive>> {
+        monarch_with_gil_blocking(GilSite::Rdma, |py| {
+            let weak = make_weakref(py, &self.storage)?;
+            Some(Arc::new(PyTorchUntypedStorageWeakKeepalive {
+                weak,
+                storage_offset: self.storage_offset,
+                element_size: self.element_size,
+                numel: self.numel,
+            }) as Arc<dyn WeakKeepalive>)
+        })
+    }
+}
+
+/// [`WeakKeepalive`] for a `UntypedStorage`. Upgrades by re-acquiring
+/// the storage via the weakref and re-reading its `data_ptr()`; a
+/// fresh `base_addr` combined with the cached shape components
+/// reproduces the original `(addr, size)`.
+struct PyTorchUntypedStorageWeakKeepalive {
+    weak: Py<PyAny>,
+    storage_offset: usize,
+    element_size: usize,
+    numel: usize,
+}
+
+impl WeakKeepalive for PyTorchUntypedStorageWeakKeepalive {
+    fn upgrade(&self) -> Option<Arc<dyn Keepalive>> {
+        monarch_with_gil_blocking(GilSite::Rdma, |py| {
+            let storage = upgrade_weakref(py, &self.weak)?;
+            let base_addr: usize = storage
+                .bind(py)
+                .call_method0("data_ptr")
+                .ok()?
+                .extract()
+                .ok()?;
+            Some(Arc::new(PyTorchUntypedStorageKeepalive {
+                storage,
+                base_addr,
+                storage_offset: self.storage_offset,
+                element_size: self.element_size,
+                numel: self.numel,
+            }) as Arc<dyn Keepalive>)
+        })
+    }
+}
+
+/// Local memory handle exposed to Python.
+///
+/// Wraps a [`KeepaliveLocalMemory`] whose keepalive guard is a Python
+/// object reference, preventing the backing allocation from being
+/// garbage-collected.
 #[pyclass(name = "_LocalMemoryHandle", module = "monarch._rust_bindings.rdma")]
 #[derive(Clone)]
 pub struct PyLocalMemoryHandle {
     inner: KeepaliveLocalMemory,
 }
 
+/// Catch-all [`Keepalive`] for a Python object the caller has
+/// already inspected to obtain `(addr, size)`. Holds the object
+/// strongly to pin the underlying allocation while the
+/// [`KeepaliveLocalMemory`] is in use.
+struct PyKeepalive {
+    #[expect(dead_code, reason = "held only to pin the Python object alive")]
+    obj: Py<PyAny>,
+    addr: usize,
+    size: usize,
+}
+
+impl Keepalive for PyKeepalive {
+    fn addr(&self) -> usize {
+        self.addr
+    }
+
+    fn size(&self) -> usize {
+        self.size
+    }
+}
+
 #[pymethods]
 impl PyLocalMemoryHandle {
     #[new]
     fn new(obj: Py<PyAny>, addr: usize, size: usize) -> Self {
-        let keepalive: Arc<dyn Keepalive> = Arc::new(PyKeepalive(obj));
+        let keepalive: Arc<dyn Keepalive> = Arc::new(PyKeepalive { obj, addr, size });
         Self {
-            inner: KeepaliveLocalMemory::new(addr, size, keepalive),
+            inner: KeepaliveLocalMemory::new(keepalive),
         }
     }
 
@@ -144,14 +437,33 @@ impl PyLocalMemoryHandle {
 
     fn read_at(&self, offset: usize, size: usize) -> PyResult<Vec<u8>> {
         let mut buf = vec![0u8; size];
-        RdmaLocalMemory::read_at(&self.inner, offset, &mut buf)
+        // SAFETY: `self.inner`'s `AccessLock` is shared with every
+        // clone derived from it (including any held by an
+        // `RdmaManagerActor` after `create_rdma_buffer`), so intra-
+        // handle races are already excluded. The Python caller is
+        // responsible for ensuring no *external* view of the same
+        // allocation (e.g., a torch tensor whose data pointer was
+        // wrapped, or a C extension running with the GIL released)
+        // mutates the byte range while this call runs.
+        unsafe { self.inner.read_at(offset, &mut buf) }
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(buf)
     }
 
     fn write_at(&self, offset: usize, data: &[u8]) -> PyResult<()> {
-        RdmaLocalMemory::write_at(&self.inner, offset, data)
+        // SAFETY: see `read_at`.
+        unsafe { self.inner.write_at(offset, data) }
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Pair off a [`PyWeakLocalMemoryHandle`] sharing this handle's
+    /// MR slot and access lock. Returns `None` when the backing
+    /// keepalive (e.g. a memoryview over a non-weak-referenceable
+    /// object like `bytes` or `bytearray`) has no weak form.
+    fn downgrade(&self) -> Option<PyWeakLocalMemoryHandle> {
+        self.inner
+            .downgrade()
+            .map(|inner| PyWeakLocalMemoryHandle { inner })
     }
 
     #[pyo3(name = "__repr__")]
@@ -164,10 +476,175 @@ impl PyLocalMemoryHandle {
     }
 }
 
+/// Weak counterpart of [`PyLocalMemoryHandle`]. Holds the shared
+/// MR slot but only a weak reference to the backing Python object,
+/// so caching this handle does not pin the allocation. `upgrade()`
+/// returns a fresh strong handle if the referent is still alive.
+#[pyclass(
+    name = "_WeakLocalMemoryHandle",
+    module = "monarch._rust_bindings.rdma"
+)]
+#[derive(Clone)]
+pub struct PyWeakLocalMemoryHandle {
+    inner: WeakLocalMemory,
+}
+
+#[pymethods]
+impl PyWeakLocalMemoryHandle {
+    #[getter]
+    fn addr(&self) -> usize {
+        self.inner.addr()
+    }
+
+    #[getter]
+    fn size(&self) -> usize {
+        self.inner.size()
+    }
+
+    /// Try to re-acquire a strong [`PyLocalMemoryHandle`] for the
+    /// same allocation. Returns `None` if the backing object has
+    /// been garbage-collected.
+    fn upgrade(&self) -> Option<PyLocalMemoryHandle> {
+        self.inner
+            .upgrade()
+            .map(|inner| PyLocalMemoryHandle { inner })
+    }
+
+    #[pyo3(name = "__repr__")]
+    fn repr(&self) -> String {
+        format!(
+            "<WeakLocalMemoryHandle addr={:#x} size={}>",
+            self.inner.addr(),
+            self.inner.size()
+        )
+    }
+}
+
+/// Construct a [`PyLocalMemoryHandle`] from a Python `memoryview`.
+/// The strong keepalive holds the memoryview (pinning the buffer
+/// export); `(addr, size)` come from the buffer protocol and are
+/// cached on the keepalive.
+#[pyfunction]
+fn _make_local_memory_handle_from_memoryview(
+    py: Python<'_>,
+    mv: &Bound<'_, PyAny>,
+) -> PyResult<PyLocalMemoryHandle> {
+    _assert_1d_contiguous(py, mv)?;
+    let mv_owned = mv.clone().unbind();
+    let (addr, size) = memoryview_addr_size(py, &mv_owned)
+        .ok_or_else(|| PyRuntimeError::new_err("failed to acquire memoryview buffer"))?;
+    let keepalive: Arc<dyn Keepalive> = Arc::new(PyMemoryViewKeepalive {
+        mv: mv_owned,
+        addr,
+        size,
+    });
+    Ok(PyLocalMemoryHandle {
+        inner: KeepaliveLocalMemory::new(keepalive),
+    })
+}
+
+/// Construct a [`PyLocalMemoryHandle`] from a torch tensor. Extracts
+/// the tensor's underlying `UntypedStorage` and the shape components
+/// needed to compute `(addr, size)`; the keepalive pins the storage
+/// (not the input tensor view), so a transient view like
+/// `t.view(...).flatten()` can be dropped without invalidating
+/// cached weak handles.
+#[pyfunction]
+fn _make_local_memory_handle_from_tensor(
+    py: Python<'_>,
+    tensor: &Bound<'_, PyAny>,
+) -> PyResult<PyLocalMemoryHandle> {
+    _assert_1d_contiguous(py, tensor)?;
+    let storage = tensor.call_method0("untyped_storage")?;
+    let base_addr: usize = storage.call_method0("data_ptr")?.extract()?;
+    let storage_offset: usize = tensor.call_method0("storage_offset")?.extract()?;
+    let element_size: usize = tensor.call_method0("element_size")?.extract()?;
+    let numel: usize = tensor.call_method0("numel")?.extract()?;
+    let keepalive: Arc<dyn Keepalive> = Arc::new(PyTorchUntypedStorageKeepalive {
+        storage: storage.unbind(),
+        base_addr,
+        storage_offset,
+        element_size,
+        numel,
+    });
+    Ok(PyLocalMemoryHandle {
+        inner: KeepaliveLocalMemory::new(keepalive),
+    })
+}
+
 #[pyclass(name = "_RdmaBuffer", module = "monarch._rust_bindings.rdma")]
 #[derive(Clone, Named)]
 struct PyRdmaBuffer {
     buffer: RdmaRemoteBuffer,
+}
+
+/// Batched RDMA action exposed to Python. Wraps a [`RdmaAction`] behind
+/// an async mutex so concurrent `submit` calls from Python serialize
+/// (preserving the local-range overlap guarantee), and mutations via
+/// `add_*` while a submit is in flight are rejected.
+#[pyclass(name = "_RdmaAction", module = "monarch._rust_bindings.rdma")]
+pub struct PyRdmaAction {
+    inner: Arc<tokio::sync::Mutex<RdmaAction>>,
+}
+
+impl PyRdmaAction {
+    fn try_lock_sync(&self) -> PyResult<tokio::sync::MutexGuard<'_, RdmaAction>> {
+        self.inner.try_lock().map_err(|_| {
+            PyRuntimeError::new_err(
+                "RdmaAction is currently being submitted; await the in-flight \
+                 submit before mutating it",
+            )
+        })
+    }
+}
+
+#[pymethods]
+impl PyRdmaAction {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(RdmaAction::new())),
+        }
+    }
+
+    fn add_read_into_local(
+        &self,
+        remote: PyRdmaBuffer,
+        local: PyLocalMemoryHandle,
+    ) -> PyResult<()> {
+        self.try_lock_sync()?
+            .add_read_into_local(remote.buffer, local.inner)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(())
+    }
+
+    fn add_write_from_local(
+        &self,
+        remote: PyRdmaBuffer,
+        local: PyLocalMemoryHandle,
+    ) -> PyResult<()> {
+        self.try_lock_sync()?
+            .add_write_from_local(remote.buffer, local.inner)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Submit the queued ops. Returns a [`PyPythonTask`] that resolves
+    /// when every op completes (or the first error). Concurrent submits
+    /// queue on the inner async mutex and run one at a time, so the
+    /// local-range overlap checks performed at `add_*` time remain
+    /// meaningful.
+    fn submit(&self, _py: Python<'_>, client: PyInstance, timeout: u64) -> PyResult<PyPythonTask> {
+        let inner = self.inner.clone();
+        PyPythonTask::new(async move {
+            let mut action = inner.lock().await;
+            action
+                .submit(client.deref(), Duration::from_secs(timeout))
+                .await
+                .map_err(|e| PyException::new_err(format!("RdmaAction.submit failed: {}", e)))?;
+            Ok(())
+        })
+    }
 }
 
 async fn create_rdma_buffer(
@@ -176,9 +653,8 @@ async fn create_rdma_buffer(
 ) -> PyResult<PyRdmaBuffer> {
     let owner_handle = RdmaManagerActor::local_handle(client.deref());
 
-    let local: Arc<dyn RdmaLocalMemory> = Arc::new(local.inner);
     let buffer = owner_handle
-        .request_buffer(client.deref(), local)
+        .request_buffer(client.deref(), local.inner)
         .await
         .map_err(|e| PyException::new_err(format!("failed to request buffer: {}", e)))?;
 
@@ -187,21 +663,17 @@ async fn create_rdma_buffer(
 
 fn is_rdma_supported() -> bool {
     #[cfg(not(feature = "hixl"))]
-    {
-        rdma_supported()
-    }
+    return rdma_supported();
     #[cfg(feature = "hixl")]
-    {
-        hixl_rdma_supported()
-    }
+    return true;
 }
 
 #[pymethods]
 impl PyRdmaBuffer {
     #[classmethod]
-    fn create_rdma_buffer_nonblocking<'py>(
+    fn create_rdma_buffer_nonblocking(
         _cls: &Bound<'_, PyType>,
-        _py: Python<'py>,
+        _py: Python<'_>,
         local: PyLocalMemoryHandle,
         client: PyInstance,
     ) -> PyResult<PyPythonTask> {
@@ -212,9 +684,9 @@ impl PyRdmaBuffer {
     }
 
     #[classmethod]
-    fn create_rdma_buffer_blocking<'py>(
+    fn create_rdma_buffer_blocking(
         _cls: &Bound<'_, PyType>,
-        py: Python<'py>,
+        py: Python<'_>,
         local: PyLocalMemoryHandle,
         client: PyInstance,
     ) -> PyResult<PyRdmaBuffer> {
@@ -234,9 +706,15 @@ impl PyRdmaBuffer {
         format!("<RdmaBuffer'{:?}'>", self.buffer)
     }
 
-    fn read_into<'py>(
+    /// Reads from this remote RDMA buffer into a local memory region.
+    ///
+    /// # Arguments
+    /// * `dst` - Local memory region to read into
+    /// * `client` - The actor performing the read
+    /// * `timeout` - Maximum time in seconds to wait for the operation
+    fn read_into(
         &self,
-        _py: Python<'py>,
+        _py: Python<'_>,
         dst: PyLocalMemoryHandle,
         client: PyInstance,
         timeout: u64,
@@ -244,20 +722,29 @@ impl PyRdmaBuffer {
         let buffer = self.buffer.clone();
 
         PyPythonTask::new(async move {
-            let local_memory: Arc<dyn RdmaLocalMemory> = Arc::new(dst.inner);
-
             buffer
-                .read_into_local(client.deref(), local_memory, timeout)
+                .read_into_local(client.deref(), dst.inner, timeout)
                 .await
-                .map_err(|e| PyException::new_err(format!("failed to read into buffer: {}", e)))?;
+                .map_err(|e| {
+                    PyException::new_err(format!(
+                        "failed to read from remote buffer into local buffer: {}",
+                        e
+                    ))
+                })?;
 
             Ok(())
         })
     }
 
-    fn write_from<'py>(
+    /// Writes from a local memory region into this remote RDMA buffer.
+    ///
+    /// # Arguments
+    /// * `src` - Local memory region to write from
+    /// * `client` - The actor performing the write
+    /// * `timeout` - Maximum time in seconds to wait for the operation
+    fn write_from(
         &self,
-        _py: Python<'py>,
+        _py: Python<'_>,
         src: PyLocalMemoryHandle,
         client: PyInstance,
         timeout: u64,
@@ -265,12 +752,15 @@ impl PyRdmaBuffer {
         let buffer = self.buffer.clone();
 
         PyPythonTask::new(async move {
-            let local_memory: Arc<dyn RdmaLocalMemory> = Arc::new(src.inner);
-
             buffer
-                .write_from_local(client.deref(), local_memory, timeout)
+                .write_from_local(client.deref(), src.inner, timeout)
                 .await
-                .map_err(|e| PyException::new_err(format!("failed to write from buffer: {}", e)))?;
+                .map_err(|e| {
+                    PyException::new_err(format!(
+                        "failed to write from local buffer into remote buffer: {}",
+                        e
+                    ))
+                })?;
 
             Ok(())
         })
@@ -283,17 +773,15 @@ impl PyRdmaBuffer {
     /// Return HIXL backend info ``(engine_id, addr)`` if present,
     /// or ``None`` when the buffer uses a native ibverbs backend.
     fn external_backend_info(&self) -> Option<(String, usize)> {
-        for ctx in &self.buffer.backends {
-            match ctx {
-                #[cfg(feature = "hixl")]
-                monarch_rdma::backend::RdmaRemoteBackendContext::Hixl(buf) => {
-                    return Some((buf.engine_id.clone(), buf.addr));
-                }
-                #[allow(unreachable_patterns)]
-                _ => {}
-            }
+        #[cfg(feature = "hixl")]
+        {
+            return self
+                .buffer
+                .resolve_hixl()
+                .map(|buf| (buf.engine_id, buf.addr));
         }
-        None
+        #[cfg(not(feature = "hixl"))]
+        return None;
     }
 
     /// Return the local engine_id assigned by the external transport, or None.
@@ -317,7 +805,7 @@ impl PyRdmaBuffer {
     }
 
     fn __reduce__(&self) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
-        monarch_with_gil_blocking(|py| {
+        monarch_with_gil_blocking(GilSite::Rdma, |py| {
             let ctor = py.get_type::<PyRdmaBuffer>().into_py_any(py)?;
             let json = serde_json::to_string(&self.buffer).map_err(|e| {
                 PyErr::new::<PyValueError, _>(format!("Serialization failed: {}", e))
@@ -335,7 +823,7 @@ impl PyRdmaBuffer {
         Ok(PyRdmaBuffer { buffer })
     }
 
-    fn drop<'py>(&self, _py: Python<'py>, client: PyInstance) -> PyResult<PyPythonTask> {
+    fn drop(&self, _py: Python<'_>, client: PyInstance) -> PyResult<PyPythonTask> {
         let buffer = self.buffer.clone();
         PyPythonTask::new(async move {
             buffer
@@ -347,8 +835,34 @@ impl PyRdmaBuffer {
     }
 
     fn owner_actor_id(&self) -> String {
-        self.buffer.owner.actor_id().to_string()
+        self.buffer.owner.actor_addr().to_string()
     }
+}
+
+// Catchable Python exception for a typed RDMA manager initialization failure.
+//
+// The wire enum `monarch_rdma::RdmaInitError` (imported as `RdmaInitWireError`)
+// is a serialization payload, not a Python exception; this is the native
+// exception the binding raises so Python callers have one stable category to
+// `except`. Exposed as `monarch._rust_bindings.rdma.RdmaInitError`.
+pyo3::create_exception!(
+    rdma,
+    RdmaInitError,
+    PyException,
+    "Raised when the RDMA manager owner reports a typed initialization failure"
+);
+
+/// Map the owner's typed wire error to the catchable native `RdmaInitError`,
+/// preserving the exact cause string (RMB-5). Other failures are handled at their
+/// own sites, not here: each either retains its native PyO3 error (e.g. the
+/// wrong-typed `Shared` downcast's `TypeError`) or is mapped to `PyRuntimeError`.
+fn map_rdma_init_error(err: RdmaInitWireError) -> PyErr {
+    let cause = match err {
+        RdmaInitWireError::InitFailed(cause)
+        | RdmaInitWireError::SpawnFailed(cause)
+        | RdmaInitWireError::Supervision(cause) => cause,
+    };
+    RdmaInitError::new_err(cause)
 }
 
 #[pyclass(name = "_RdmaManager", module = "monarch._rust_bindings.rdma")]
@@ -381,6 +895,9 @@ impl PyRdmaManager {
         let proc_mesh = proc_mesh.downcast::<PyProcMesh>()?.borrow().mesh_ref()?;
         PyPythonTask::new(async move {
             let actor_mesh: ActorMesh<RdmaManagerActor> = proc_mesh
+                // Python supplies no per-manager config. `IbvManagerActor::new`
+                // fills an absent `IbvConfig::target` from `RDMA_IBVERBS_TARGET`
+                // (`rdma_ibverbs_target` in Python).
                 .spawn_service(client.deref(), "rdma_manager", &None)
                 .await
                 .map_err(|err| PyException::new_err(err.to_string()))?;
@@ -396,6 +913,89 @@ impl PyRdmaManager {
                 device: device_name.to_string(),
             }))
         })
+    }
+
+    /// Ensure a proc mesh's per-proc RDMA managers are initialized through the
+    /// Rust owner, returning an observe-only `Handle[None]`.
+    ///
+    /// Takes the `Shared[ProcMesh]` a Python `ProcMesh` already holds (not a
+    /// resolved mesh) plus the caller instance. It resolves the mesh, routes one
+    /// `EnsureRdmaManager` request to the root-owned `RdmaManagerOwnerActor`, and
+    /// resolves the handle when the owner's full post-`init()` barrier completes.
+    /// A typed owner failure surfaces as the catchable native `RdmaInitError`
+    /// (RMB-5); a wrong-typed `Shared` surfaces the native `TypeError` from the
+    /// downcast; missing-capability, service-ensure, and reply-channel failures
+    /// stay `PyRuntimeError`.
+    #[classmethod]
+    fn ensure_init_rdma_manager_nonblocking(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        proc_mesh_shared: Py<PyShared>,
+        caller: PyInstance,
+    ) -> PyResult<PyHandle> {
+        // Observe the supplied Shared's completion (Send + 'static; borrows
+        // nothing across the await). RMB-2: the exact argument is observed.
+        let shared_observer = proc_mesh_shared.borrow(py).wait_future();
+        // RMB-8: consume the PyInstance to its native Instance so an unbounded
+        // owner wait does not pin the caller's Python object graph.
+        let caller = caller.into_instance();
+        Ok(PyHandle::spawn(async move {
+            // Resolve the proc mesh, then release the Shared keepalive (RMB-2).
+            let mesh_obj = shared_observer.await?;
+            drop(proc_mesh_shared);
+            // Downcast to the native proc mesh and clone its ref under the GIL.
+            let proc_mesh: ProcMeshRef = monarch_with_gil(GilSite::Convert, move |py| {
+                mesh_obj
+                    .bind(py)
+                    .downcast::<PyProcMesh>()?
+                    .borrow()
+                    .mesh_ref()
+            })
+            .await?;
+            // RMB-3: the inherited capability routes this request to the program
+            // root; the caller supplies the mailbox, not owner lifetime.
+            let client_root = ClientRootRef::from_env(caller.actor_environment()).map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "failed to read the client-root capability from the caller: {e}"
+                ))
+            })?;
+            let owner = RDMA_MANAGER_OWNER_SERVICE
+                .ensure(&caller, &client_root, ())
+                .await
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!(
+                        "failed to create or reuse the root-owned RDMA manager owner: {e}"
+                    ))
+                })?;
+            // Post one EnsureRdmaManager through the owner's typed port. RMB-7: the
+            // request is non-returning, so an invalid owner reference cannot bounce
+            // back and fail this caller.
+            let (reply, rx) = caller.open_once_port::<Result<(), RdmaInitWireError>>();
+            let mut request = owner.port::<EnsureRdmaManager>();
+            request.return_undeliverable(false);
+            request.post(
+                &caller,
+                EnsureRdmaManager {
+                    proc_mesh,
+                    reply: reply.bind(),
+                },
+            );
+            // RMB-4: readiness requires the inner Ok(()). A closed reply channel is
+            // a distinct infrastructure failure; a typed owner error becomes the
+            // catchable native RdmaInitError (RMB-5).
+            rx.recv()
+                .await
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!(
+                        "the RDMA manager owner reply channel closed before readiness: {e}"
+                    ))
+                })?
+                .map_err(map_rdma_init_error)?;
+            // Resolve to Python `None`. `Ok(())` would convert to an empty tuple,
+            // not `None` (pyo3 maps the unit type to an empty `PyTuple`);
+            // `Option::None` converts to `None`, matching the `Handle[None]` contract.
+            Ok(None::<()>)
+        }))
     }
 }
 
@@ -432,21 +1032,45 @@ fn rdma_supported_py() -> bool {
 pub fn register_python_bindings(module: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(not(feature = "hixl"))]
     {
-        register_segment_scanner(Some(pytorch_segment_scanner));
-    }
-    #[cfg(feature = "hixl")]
-    {
-        register_segment_scanner(None);
+        // Install the process-wide CUDA segment scanner only in the
+        // ibverbs build. HiXL builds must not link or initialize rdmaxcel.
+        register_cuda_segment_scanner(Arc::new(pytorch_cuda_segments));
     }
 
     module.add_class::<PyLocalMemoryHandle>()?;
+    module.add_class::<PyWeakLocalMemoryHandle>()?;
     module.add_class::<PyRdmaBuffer>()?;
+    module.add_class::<PyRdmaAction>()?;
     module.add_class::<PyRdmaManager>()?;
+    let rdma_init_error = module.py().get_type::<RdmaInitError>();
+    rdma_init_error.setattr("__module__", "monarch._rust_bindings.rdma")?;
+    module.add("RdmaInitError", rdma_init_error)?;
     py_module_add_function!(
         module,
         "monarch._rust_bindings.rdma",
         is_ibverbs_available_py
     );
     py_module_add_function!(module, "monarch._rust_bindings.rdma", rdma_supported_py);
+    py_module_add_function!(
+        module,
+        "monarch._rust_bindings.rdma",
+        _make_local_memory_handle_from_memoryview
+    );
+    py_module_add_function!(
+        module,
+        "monarch._rust_bindings.rdma",
+        _make_local_memory_handle_from_tensor
+    );
+    py_module_add_function!(module, "monarch._rust_bindings.rdma", _assert_1d_contiguous);
+    py_module_add_function!(
+        module,
+        "monarch._rust_bindings.rdma",
+        _get_tensor_addr_and_size
+    );
+    py_module_add_function!(
+        module,
+        "monarch._rust_bindings.rdma",
+        _get_memoryview_addr_and_size
+    );
     Ok(())
 }

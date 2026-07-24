@@ -6,6 +6,7 @@
 
 # pyre-strict
 
+import asyncio
 from typing import (
     Any,
     Awaitable,
@@ -38,6 +39,13 @@ class PythonTask(Generic[T], Awaitable[T]):
         Schedule this task to run on concurrently on the tokio runtime.
         Returns a handle that can be awaited on multiple times so the
         result can be shared among users.
+        """
+        ...
+
+    def spawn_handle(self) -> "Handle[T]":
+        """
+        Spawn this task on the tokio runtime and return an observe-only Handle
+        (get/poll/as_asyncio/await). Consumes the PythonTask.
         """
         ...
 
@@ -109,6 +117,53 @@ class Shared(Generic[T]):
         value the first time poll is called.
         """
         ...
+
+class Handle(Generic[T]):
+    """
+    An observe-only handle to a background task. It resolves once and stays
+    observable by any number of later observers. Unlike Shared, a Handle never
+    drives a Python coroutine.
+    """
+
+    def get(self, timeout: Optional[float] = None) -> T:
+        """
+        Block the calling thread until the handle resolves and return its value.
+        Behavior is keyed to the calling context, not to whether the value is
+        ready: in a tokio runtime context it always raises WouldBlockRuntime, even
+        for a ready value (blocking there would panic the runtime) -- use poll() or
+        as_asyncio(); on a running asyncio loop it warns, since get() can freeze
+        the loop; on a sync thread it blocks until resolved. On timeout it raises
+        TimeoutError without cancelling the handle, so a later get()/poll()/await
+        still observes completion.
+        """
+        ...
+
+    def poll(self) -> Optional[T]:
+        """
+        If the handle has resolved, return the value; otherwise return None.
+        Non-consuming: the value stays observable by later observers.
+        """
+        ...
+
+    def as_asyncio(self) -> "asyncio.Future[T]":
+        """
+        Return a standard asyncio.Future that resolves when the handle does.
+        Requires a running event loop; off a loop it raises RuntimeError.
+        """
+        ...
+
+    def __await__(self) -> Generator[Any, Any, T]:
+        """
+        Await the handle on a running asyncio loop, delegating to as_asyncio().
+        """
+        ...
+
+class WouldBlockRuntime(RuntimeError):
+    """
+    Raised when Handle.get() is called from a Tokio runtime context.
+    """
+
+    ...
 
 def is_tokio_thread() -> bool:
     """

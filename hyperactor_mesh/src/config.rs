@@ -17,6 +17,7 @@ use std::time::Duration;
 use hyperactor_config::AttrValue;
 use hyperactor_config::CONFIG;
 use hyperactor_config::ConfigAttr;
+use hyperactor_config::NonZeroUsize;
 use hyperactor_config::attrs::declare_attrs;
 use serde::Deserialize;
 use serde::Serialize;
@@ -160,14 +161,13 @@ declare_attrs! {
     ///
     /// When attaching to pre-existing workers (simple bootstrap), the
     /// client pushes its propagatable config to each host agent and
-    /// waits for confirmation. If the barrier does not complete within
-    /// this duration, a warning is logged and attach continues without
-    /// blocking — config push is best-effort.
+    /// waits for confirmation. If the barrier does not complete
+    /// within this duration, attach fails closed.
     @meta(CONFIG = ConfigAttr::new(
         Some("HYPERACTOR_MESH_ATTACH_CONFIG_TIMEOUT".to_string()),
         Some("mesh_attach_config_timeout".to_string()),
     ))
-    pub attr MESH_ATTACH_CONFIG_TIMEOUT: Duration = Duration::from_secs(10);
+    pub attr MESH_ATTACH_CONFIG_TIMEOUT: Duration = Duration::from_secs(60);
 
     /// Timeout for targeted introspection queries that hit a single,
     /// specific host. Kept short so a slow or dying actor cannot block
@@ -265,4 +265,21 @@ declare_attrs! {
         Some("pyspy_bin".to_string()),
     ))
     pub attr PYSPY_BIN: String = String::new();
+
+    /// When the cast domain has fewer ranks than this threshold,
+    /// v1 casting sends messages point-to-point instead of through the
+    /// comm actor tree. 0 disables the optimization.
+    @meta(CONFIG = ConfigAttr::new(
+        Some("HYPERACTOR_MESH_V1_CAST_POINT_TO_POINT_THRESHOLD".to_string()),
+        Some("v1_cast_point_to_point_threshold".to_string()),
+    ))
+    pub attr V1_CAST_POINT_TO_POINT_THRESHOLD: usize = 0;
+
+
+    @meta(CONFIG = ConfigAttr::new(
+        Some("HYPERACTOR_MESH_MAX_CAST_FANOUT".to_string()),
+        Some("max_cast_fanout".to_string()),
+    ))
+    pub attr MAX_CAST_FANOUT: NonZeroUsize =
+        NonZeroUsize::new(16).expect("16 is non-zero");
 }

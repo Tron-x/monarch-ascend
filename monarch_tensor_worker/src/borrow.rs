@@ -74,9 +74,9 @@ impl Borrow {
         to_stream: Arc<ActorHandle<StreamActor>>,
     ) -> Result<Borrow> {
         let (first_use_sender, first_use_receiver) =
-            Mailbox::new_detached(to_stream.actor_id().clone()).open_port();
+            Mailbox::new(to_stream.actor_addr().clone()).open_port();
         let (last_use_sender, last_use_receiver) =
-            Mailbox::new_detached(from_stream.actor_id().clone()).open_port();
+            Mailbox::new(from_stream.actor_addr().clone()).open_port();
 
         from_stream
             .borrow_create(cx, borrow_id, tensor_ref, first_use_sender)
@@ -196,24 +196,21 @@ mod tests {
     async fn basic_borrow_test_impl(device: Device) -> Result<()> {
         test_setup()?;
 
-        let proc = Proc::local();
+        let proc = Proc::isolated();
         let (client, controller_ref, mut controller_rx) = proc.attach_actor("controller").unwrap();
 
-        let worker_handle = proc
-            .spawn::<WorkerActor>(
-                "worker",
-                WorkerActor::new(
-                    WorkerParams {
-                        world_size: 1,
-                        rank: 0,
-                        device_index: None,
-                        controller_actor: controller_ref,
-                    },
-                    Flattrs::default(),
-                )
-                .await?,
+        let worker_handle = proc.spawn(
+            WorkerActor::new(
+                WorkerParams {
+                    world_size: 1,
+                    rank: 0,
+                    device_index: None,
+                    controller_actor: controller_ref,
+                },
+                Flattrs::default(),
             )
-            .unwrap();
+            .await?,
+        );
 
         worker_handle
             .command_group(
@@ -351,25 +348,22 @@ mod tests {
     async fn borrow_errored_value() -> Result<()> {
         test_setup()?;
 
-        let proc = Proc::local();
+        let proc = Proc::isolated();
         let (client, controller_ref, mut controller_rx) = proc.attach_actor("controller").unwrap();
 
-        let worker_handle = proc
-            .spawn::<WorkerActor>(
-                "worker",
-                WorkerActor::new(
-                    WorkerParams {
-                        world_size: 1,
-                        rank: 0,
-                        device_index: None,
-                        controller_actor: controller_ref,
-                    },
-                    Flattrs::default(),
-                )
-                .await
-                .unwrap(),
+        let worker_handle = proc.spawn(
+            WorkerActor::new(
+                WorkerParams {
+                    world_size: 1,
+                    rank: 0,
+                    device_index: None,
+                    controller_actor: controller_ref,
+                },
+                Flattrs::default(),
             )
-            .unwrap();
+            .await
+            .unwrap(),
+        );
 
         worker_handle
             .command_group(

@@ -63,7 +63,6 @@ def configure(
     mesh_bootstrap_enable_pdeathsig: bool = ...,
     mesh_terminate_concurrency: int = ...,
     mesh_terminate_timeout: str = ...,
-    shared_asyncio_runtime: bool = ...,
     small_write_threshold: int = ...,
     max_cast_dimension_size: int = ...,
     remote_alloc_bind_to_inaddr_any: bool = ...,
@@ -84,6 +83,7 @@ def configure(
     rdma_allow_tcp_fallback: bool = ...,
     rdma_disable_ibverbs: bool = ...,
     rdma_max_chunk_size_mb: int = ...,
+    rdma_ibverbs_target: str = ...,
     **kwargs: object,
 ) -> None:
     """Configure Hyperactor runtime defaults for this process.
@@ -97,7 +97,7 @@ def configure(
 
     For complete parameter documentation, see the Python wrapper
     `monarch.config.configure()` which provides the same interface
-    with detailed descriptions of all 37 configuration parameters
+    with detailed descriptions of the configuration parameters
     organized into logical categories (transport, logging, message
     handling, mesh bootstrap, allocation, proc/host mesh timeouts,
     etc.).
@@ -142,7 +142,6 @@ def configure(
             during shutdown
         mesh_terminate_timeout: Timeout per child during graceful
             termination (humantime)
-        shared_asyncio_runtime: Share asyncio runtime across actors
         small_write_threshold: Threshold below which writes are copied
             (bytes)
         max_cast_dimension_size: Maximum dimension size for cast
@@ -182,6 +181,11 @@ def configure(
             causing all RDMA operations to use the TCP fallback backend.
         rdma_max_chunk_size_mb: Maximum chunk size in MiB for
             TCP-based RDMA transfers (default: 64)
+        rdma_ibverbs_target: Default ibverbs device target for managers
+            without an explicit target. Accepts "cpu:<numa>",
+            "gpu:<ordinal>", or "nic:<name>". Empty preserves automatic
+            selection. Non-empty value syntax is validated when the RDMA
+            manager starts.
         **kwargs: Reserved for future configuration keys
 
     For historical reasons, this API is named ``configure(...)``;

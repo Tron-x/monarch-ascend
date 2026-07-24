@@ -25,6 +25,12 @@ class Chunker(Actor):
         return len(chunks)
 
 
+class RdmaTargetProbe(Actor):
+    @endpoint
+    def rdma_ibverbs_target(self) -> str:
+        return get_global_config()["rdma_ibverbs_target"]
+
+
 def test_get_set_transport() -> None:
     for transport in (
         ChannelTransport.Unix,
@@ -87,6 +93,21 @@ def test_get_set_multiple() -> None:
     assert not config["enable_file_capture"]
     assert config["tail_log_lines"] == 0
     assert config["default_transport"] == BindSpec(ChannelTransport.Unix)
+
+
+@isolate_in_subprocess
+def test_rdma_ibverbs_target_round_trip_and_propagation() -> None:
+    assert get_global_config()["rdma_ibverbs_target"] == ""
+
+    target = "nic:mlx5_0"
+    with configured(rdma_ibverbs_target=target) as config:
+        assert config["rdma_ibverbs_target"] == target
+
+        proc = this_host().spawn_procs()
+        probe = proc.spawn("rdma_target_probe", RdmaTargetProbe)
+        assert probe.rdma_ibverbs_target.call_one().get() == target
+
+    assert get_global_config()["rdma_ibverbs_target"] == ""
 
 
 @isolate_in_subprocess
@@ -240,7 +261,7 @@ def test_duration_config_multiple() -> None:
         ("proc_stop_max_idle", "45s", "45s", "30s"),
         ("get_proc_state_max_idle", "90s", "1m 30s", "1m"),
         # Mesh attach
-        ("mesh_attach_config_timeout", "20s", "20s", "10s"),
+        ("mesh_attach_config_timeout", "20s", "20s", "1m"),
     ],
 )
 def test_duration_params(param_name, test_value, expected_value, default_value):
@@ -294,16 +315,14 @@ def test_integer_params(param_name, test_value, default_value):
     "param_name,default_value",
     [
         # Hyperactor message handling
-        ("enable_dest_actor_reordering_buffer", False),
+        ("enable_dest_actor_reordering_buffer", True),
         # Mesh bootstrap config
         ("mesh_bootstrap_enable_pdeathsig", True),
-        # Runtime and buffering
-        ("shared_asyncio_runtime", False),
         # Logging config
         ("force_file_log", False),
         ("prefix_with_rank", True),
         # Actor queue dispatch
-        ("actor_queue_dispatch", False),
+        ("actor_queue_dispatch", True),
     ],
 )
 def test_boolean_params(param_name, default_value):
@@ -373,7 +392,7 @@ def test_encoding_param_invalid():
 
 
 def test_all_params_together():
-    """Test setting all 29 config parameters simultaneously."""
+    """Test setting all 28 config parameters simultaneously."""
     from monarch._rust_bindings.monarch_hyperactor.config import Encoding
 
     with configured(
@@ -395,7 +414,6 @@ def test_all_params_together():
         mesh_terminate_concurrency=16,
         mesh_terminate_timeout="20s",
         # Runtime and buffering
-        shared_asyncio_runtime=True,
         small_write_threshold=512,
         # Mesh config
         max_cast_dimension_size=2048,
@@ -411,7 +429,7 @@ def test_all_params_together():
         proc_stop_max_idle="45s",
         get_proc_state_max_idle="90s",
         # Actor queue dispatch
-        actor_queue_dispatch=True,
+        actor_queue_dispatch=False,
         # Mesh attach
         mesh_attach_config_timeout="20s",
         # Mesh admin
@@ -433,7 +451,6 @@ def test_all_params_together():
         assert config["mesh_bootstrap_enable_pdeathsig"] is False
         assert config["mesh_terminate_concurrency"] == 16
         assert config["mesh_terminate_timeout"] == "20s"
-        assert config["shared_asyncio_runtime"] is True
         assert config["small_write_threshold"] == 512
         assert config["max_cast_dimension_size"] == 2048
         assert config["read_log_buffer"] == 16384
@@ -444,7 +461,7 @@ def test_all_params_together():
         assert config["supervision_watchdog_timeout"] == "1m 30s"
         assert config["proc_stop_max_idle"] == "45s"
         assert config["get_proc_state_max_idle"] == "1m 30s"
-        assert config["actor_queue_dispatch"] is True
+        assert config["actor_queue_dispatch"] is False
         assert config["mesh_attach_config_timeout"] == "20s"
         assert config["mesh_admin_addr"] == "[::]:8080"
 
@@ -461,11 +478,10 @@ def test_all_params_together():
     assert config["default_encoding"] == Encoding.Multipart
     assert config["channel_net_rx_buffer_full_check_interval"] == "5s"
     assert config["message_latency_sampling_rate"] == pytest.approx(0.01, rel=1e-5)
-    assert config["enable_dest_actor_reordering_buffer"] is False
+    assert config["enable_dest_actor_reordering_buffer"] is True
     assert config["mesh_bootstrap_enable_pdeathsig"] is True
     assert config["mesh_terminate_concurrency"] == 16
     assert config["mesh_terminate_timeout"] == "10s"
-    assert config["shared_asyncio_runtime"] is False
     assert config["small_write_threshold"] == 256
     assert config["max_cast_dimension_size"] == 16
     assert config["read_log_buffer"] == 100
@@ -476,8 +492,8 @@ def test_all_params_together():
     assert config["supervision_watchdog_timeout"] == "2m"
     assert config["proc_stop_max_idle"] == "30s"
     assert config["get_proc_state_max_idle"] == "1m"
-    assert config["actor_queue_dispatch"] is False
-    assert config["mesh_attach_config_timeout"] == "10s"
+    assert config["actor_queue_dispatch"] is True
+    assert config["mesh_attach_config_timeout"] == "1m"
     assert config["mesh_admin_addr"] == "[::]:1729"
 
 

@@ -19,6 +19,19 @@ from typing import Any, Callable, Iterable, List, Tuple
 
 import cloudpickle
 from monarch._rust_bindings.monarch_hyperactor.buffers import Buffer, FrozenBuffer
+from monarch._rust_bindings.monarch_hyperactor.pickle import pop_mesh_reference
+
+
+class _MeshSlot:
+    """Placeholder whose unpickling pops a reserved mesh-reference slot.
+
+    A pending Proc/Host mesh reserves an out-of-band slot at pickle time and
+    emits this sentinel in its reduce; unpickling pops the resolved mesh that
+    the sender filled into that slot.
+    """
+
+    def __reduce__(self) -> Tuple[Any, Tuple[Any, ...]]:
+        return (pop_mesh_reference, ())
 
 
 def maybe_torch() -> types.ModuleType | None:
@@ -110,8 +123,11 @@ def _ensure_torch_pickle() -> None:
         dispatch[key] = _torch_storage
 
     class TorchPickler(cloudpickle.Pickler):
+        # pyrefly: ignore [bad-override]
         dispatch_table: ChainMap[Any, Any] = ChainMap(
-            dispatch, cloudpickle.Pickler.dispatch_table
+            dispatch,
+            # pyrefly: ignore [bad-argument-type]
+            cloudpickle.Pickler.dispatch_table,
         )
 
     _TorchPickler = TorchPickler
@@ -130,6 +146,7 @@ def torch_loads(data: FrozenBuffer | bytes) -> Any:
 
     # pyre-ignore[16]: dynamic torch attribute
     with torch.utils._python_dispatch._disable_current_modes():
+        # pyrefly: ignore [bad-argument-type]
         return cloudpickle.loads(data)
 
 
@@ -137,8 +154,11 @@ class _Pickler(cloudpickle.Pickler):
     _torch_initialized = False
     _dispatch_table: dict[Any, Any] = {}
 
+    # pyrefly: ignore [bad-override]
     dispatch_table: ChainMap[Any, Any] = ChainMap(
-        _dispatch_table, cloudpickle.Pickler.dispatch_table
+        _dispatch_table,
+        # pyrefly: ignore [bad-argument-type]
+        cloudpickle.Pickler.dispatch_table,
     )
 
     def __init__(self, filter: Callable[[Any], bool], f: Buffer | io.BytesIO) -> None:
@@ -201,26 +221,3 @@ def unflatten(data: FrozenBuffer | bytes, values: Iterable[Any]) -> Any:
             stack.enter_context(torch.utils._python_dispatch._disable_current_modes())
         up = _Unpickler(data, values)
         return up.load()
-
-
-_allow_pending_pickle: ContextVar[bool] = ContextVar("_allow_pending_pickle")
-
-
-@contextmanager
-def allow_pending_pickle_mesh() -> Generator[None, None, None]:
-    """
-    When this context manager is active, pickling a mesh that hasn't finished
-    initializing will return PendingPickle object to be resolved later. When
-    it is not active, pickling a mesh that hasn't finished initializing will
-    block the tokio runtime until the mesh is initialized.
-    """
-    prev = _allow_pending_pickle.get(False)
-    try:
-        _allow_pending_pickle.set(True)
-        yield
-    finally:
-        _allow_pending_pickle.set(prev)
-
-
-def is_pending_pickle_allowed() -> bool:
-    return _allow_pending_pickle.get(False)

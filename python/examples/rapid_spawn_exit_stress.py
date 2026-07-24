@@ -24,20 +24,13 @@ from monarch.actor import Actor, endpoint
 from monarch.job import ProcessJob, TelemetryConfig
 from monarch.mesh_controller import spawn_tensor_engine
 
-job = (
-    ProcessJob({"hosts": 1})
-    .enable_telemetry(TelemetryConfig(snapshot_interval_secs=30.0))
-    .enable_admin()
-)
-job_state = job.state(cached_path=None)
-proc_mesh = job_state.hosts.spawn_procs(per_host={"gpus": 1})
-
 
 def unhandled_fault(fault):
     print(f"Unhandled fault: {fault}", flush=True)
     time.sleep(10000)
 
 
+# pyrefly: ignore [bad-assignment]
 monarch.actor.unhandled_fault_hook = unhandled_fault
 
 
@@ -70,30 +63,42 @@ async def main():
     )
     args = parser.parse_args()
 
-    admin_url = job_state.admin_url
-    assert admin_url is not None
-    mtls_flags = (
-        "--cacert /var/facebook/rootcanal/ca.pem "
-        "--cert /var/facebook/x509_identities/server.pem "
-        "--key /var/facebook/x509_identities/server.pem "
-        if admin_url.startswith("https")
-        else ""
-    )
-    print(f"\nMesh admin server listening on {admin_url}")
-    print(f"  - Root node:     curl {mtls_flags}{admin_url}/v1/root")
-    print(f"  - Mesh tree:     curl {mtls_flags}{admin_url}/v1/tree")
-    print(f"  - API docs:      curl {mtls_flags}{admin_url}/SKILL.md")
-    print(
-        f"  - TUI:           buck2 run fbcode//monarch/hyperactor_mesh_admin_tui:hyperactor_mesh_admin_tui -- --addr {admin_url}"
-    )
-    print("\nPress Ctrl+C to stop.\n", flush=True)
+    job = ProcessJob({"hosts": 1}).enable_telemetry(TelemetryConfig(dashboard_port=0))
+    try:
+        job_state = job.state(cached_path=None)
+        proc_mesh = job_state.hosts.spawn_procs(per_host={"gpus": 1})
 
-    for i in range(args.iterations):
-        dm = spawn_tensor_engine(proc_mesh)
-        if args.sleep > 0:
-            await asyncio.sleep(args.sleep)
-        dm.exit()
-        print(f"iter {i}", flush=True)
+        admin_url = job_state.admin_url
+        assert admin_url is not None
+        mtls_flags = (
+            "--cacert /var/facebook/rootcanal/ca.pem "
+            "--cert /var/facebook/x509_identities/server.pem "
+            "--key /var/facebook/x509_identities/server.pem "
+            if admin_url.startswith("https")
+            else ""
+        )
+        print(f"\nMesh admin server listening on {admin_url}")
+        print(f"  - Root node:     curl {mtls_flags}{admin_url}/v1/root")
+        print(f"  - Mesh tree:     curl {mtls_flags}{admin_url}/v1/tree")
+        print(f"  - API docs:      curl {mtls_flags}{admin_url}/SKILL.md")
+        print(
+            f"  - TUI:           buck2 run fbcode//monarch/hyperactor_mesh_admin_tui:hyperactor_mesh_admin_tui -- --addr {admin_url}"
+        )
+        print("\nPress Ctrl+C to stop.\n", flush=True)
+
+        for i in range(args.iterations):
+            dm = spawn_tensor_engine(proc_mesh)
+            if args.sleep > 0:
+                await asyncio.sleep(args.sleep)
+            dm.exit()
+            print(f"iter {i}", flush=True)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        print("\nShutting down...", flush=True)
+        # Each ProcessJob worker runs in its own detached session; job.kill()
+        # reaps the whole session -- the worker and every proc it spawned.
+        job.kill()
 
 
 asyncio.run(main())

@@ -15,14 +15,15 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperactor as hyperactor_reference;
-use hyperactor::Actor;
+use hyperactor::ActorAddr;
+use hyperactor::ActorRef;
+use hyperactor::Endpoint as _;
 use hyperactor::Handler;
+use hyperactor::ProcAddr;
 use hyperactor::RemoteMessage;
 use hyperactor::RemoteSpawn;
 use hyperactor::accum::StreamingReducerOpts;
 use hyperactor::actor::ActorStatus;
-use hyperactor::actor::Referable;
 use hyperactor::actor::remote::Remote;
 use hyperactor::context;
 use hyperactor::id::Label;
@@ -30,6 +31,7 @@ use hyperactor::supervision::ActorSupervisionEvent;
 use hyperactor_config::CONFIG;
 use hyperactor_config::ConfigAttr;
 use hyperactor_config::attrs::declare_attrs;
+use hyperactor_telemetry::hash_to_u64;
 use ndslice::Extent;
 use ndslice::ViewExt as _;
 use ndslice::view;
@@ -42,16 +44,18 @@ use typeuri::Named;
 
 use crate::ActorMesh;
 use crate::ActorMeshRef;
-use crate::CommActor;
 use crate::Error;
 use crate::HostMeshRef;
 use crate::ValueMesh;
-use crate::comm::CommMeshConfig;
+use crate::host_mesh::GET_PROC_STATE_MAX_IDLE;
+use crate::host_mesh::host_agent::GetHostProcStates;
 use crate::host_mesh::host_agent::ProcState;
 use crate::host_mesh::mesh_to_rankedvalues_with_default;
+use crate::mesh_controller::ActorMeshControlPlane;
 use crate::mesh_controller::ActorMeshController;
 use crate::mesh_id::ActorMeshId;
 use crate::mesh_id::ProcMeshId;
+use crate::mesh_id::ResourceId;
 use crate::proc_agent;
 use crate::proc_agent::ActorState;
 use crate::proc_agent::ProcAgent;
@@ -78,29 +82,24 @@ declare_attrs! {
     pub attr GET_ACTOR_STATE_MAX_IDLE: Duration = Duration::from_secs(30);
 }
 
-/// Name used for the mesh communication actor spawned on each user proc.
-///
-/// The `CommActor` enables proc-to-proc mesh messaging and is always
-/// present as a system actor (`system_children`) on every proc mesh member.
-pub const COMM_ACTOR_NAME: &str = "comm";
+/// Returns the telemetry `meshes.id` value for an actor mesh.
+pub fn telemetry_actor_mesh_id(proc_mesh_id: &ProcMeshId, actor_mesh_id: &ActorMeshId) -> u64 {
+    hash_to_u64(&(proc_mesh_id, actor_mesh_id))
+}
 
 /// A reference to a single [`hyperactor::Proc`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProcRef {
-    proc_id: hyperactor_reference::ProcAddr,
+    proc_id: ProcAddr,
     /// The rank of this proc at creation.
     create_rank: usize,
     /// The agent managing this proc.
-    agent: hyperactor_reference::ActorRef<ProcAgent>,
+    agent: ActorRef<ProcAgent>,
 }
 
 impl ProcRef {
     /// Create a new proc ref from the provided id, create rank and agent.
-    pub fn new(
-        proc_id: hyperactor_reference::ProcAddr,
-        create_rank: usize,
-        agent: hyperactor_reference::ActorRef<ProcAgent>,
-    ) -> Self {
+    pub fn new(proc_id: ProcAddr, create_rank: usize, agent: ActorRef<ProcAgent>) -> Self {
         Self {
             proc_id,
             create_rank,
@@ -108,21 +107,12 @@ impl ProcRef {
         }
     }
 
-    pub fn proc_id(&self) -> &hyperactor_reference::ProcAddr {
+    pub fn proc_addr(&self) -> &ProcAddr {
         &self.proc_id
     }
 
-    pub(crate) fn actor_id(&self, id: &ActorMeshId) -> hyperactor_reference::ActorAddr {
-        self.proc_id.actor_id(id.actor_name())
-    }
-
-    /// Generic bound: `A: Referable` - required because we return
-    /// an `ActorRef<A>`.
-    pub(crate) fn attest<A: Referable>(
-        &self,
-        id: &ActorMeshId,
-    ) -> hyperactor_reference::ActorRef<A> {
-        hyperactor_reference::ActorRef::attest(self.actor_id(id))
+    pub(crate) fn actor_addr(&self, id: &ActorMeshId) -> ActorAddr {
+        self.proc_id.actor_addr_uid(id.uid().clone())
     }
 }
 
@@ -131,24 +121,17 @@ impl ProcRef {
 pub struct ProcMesh {
     #[allow(dead_code)]
     id: ProcMeshId,
-    #[allow(dead_code)]
-    comm_actor_name: Option<ActorMeshId>,
     current_ref: ProcMeshRef,
+    controller: Option<ActorRef<crate::mesh_controller::ProcMeshController>>,
 }
 
 impl ProcMesh {
-    pub(crate) async fn create<C: context::Actor>(
-        cx: &C,
+    pub(crate) fn create(
         id: ProcMeshId,
         extent: Extent,
         hosts: HostMeshRef,
         ranks: Vec<ProcRef>,
-    ) -> crate::Result<Self>
-    where
-        C::A: Handler<MeshFailure>,
-    {
-        let comm_actor_name = ActorMeshId::singleton(Label::new(COMM_ACTOR_NAME).unwrap());
-
+    ) -> crate::Result<Self> {
         let region = extent.into();
         let ranks = Arc::new(ranks);
 
@@ -161,33 +144,18 @@ impl ProcMesh {
             );
         }
 
-        let root_comm_actor = hyperactor_reference::ActorRef::attest(
-            ranks
-                .first()
-                .expect("root mesh cannot be empty")
-                .actor_id(&comm_actor_name)
-                .into(),
-        );
-        let current_ref = ProcMeshRef::new(
-            id.clone(),
-            region,
-            ranks,
-            Some(hosts),
-            None, // this is the root mesh
-            None, // comm actor is not alive yet
-        )
-        .unwrap();
+        let current_ref = ProcMeshRef::new(id.clone(), region, ranks, Some(hosts)).unwrap();
 
         // Notify telemetry that the ProcAgent mesh was created.
         {
             let name_str = id.to_string();
-            let mesh_id_hash = hyperactor_telemetry::hash_to_u64(&name_str);
+            let mesh_id_hash = hash_to_u64(&id);
 
             let hm = current_ref
                 .host_mesh
                 .as_ref()
                 .expect("ProcMesh always has a host mesh");
-            let parent_mesh_id = hyperactor_telemetry::hash_to_u64(&hm.id().to_string());
+            let parent_mesh_id = hash_to_u64(hm.id());
             let parent_view_json = serde_json::to_string(hm.region())
                 .unwrap_or_else(|e| format!("encountered error when serializing region: {}", e));
 
@@ -210,56 +178,93 @@ impl ProcMesh {
             // These are skipped in Proc::spawn_inner. mesh_id directly points to proc mesh.
             let now = std::time::SystemTime::now();
             for rank in current_ref.ranks.iter() {
-                let actor_id = rank.agent.actor_id();
+                let actor_addr = rank.agent.actor_addr();
 
                 hyperactor_telemetry::notify_actor_created(hyperactor_telemetry::ActorEvent {
-                    id: hyperactor_telemetry::hash_to_u64(&actor_id),
+                    id: hyperactor_telemetry::hash_to_u64(actor_addr.id()),
                     timestamp: now,
                     mesh_id: mesh_id_hash,
                     rank: rank.create_rank as u64,
-                    full_name: actor_id.to_string(),
+                    full_name: actor_addr.to_string(),
                     display_name: None,
                 });
             }
         }
 
-        let mut proc_mesh = Self {
+        Ok(Self {
             id,
-            comm_actor_name: Some(comm_actor_name.clone()),
             current_ref,
-        };
+            controller: None,
+        })
+    }
 
-        // CommActor satisfies `Actor + Referable`, so it can be
-        // spawned and safely referenced via ActorRef<CommActor>.
-        // It is a system actor that should not have a controller managing it.
-        let comm_actor_mesh: ActorMesh<CommActor> = proc_mesh
-            .spawn_with_name(cx, comm_actor_name, &Default::default(), None, true)
-            .await?;
-        let address_book: HashMap<_, _> = comm_actor_mesh
-            .iter()
-            .map(|(point, actor_ref)| (point.rank(), actor_ref))
-            .collect();
-        // Now that we have all of the spawned comm actors, kick them all into
-        // mesh mode.
-        for (rank, comm_actor) in &address_book {
-            comm_actor
-                .send(cx, CommMeshConfig::new(*rank, address_book.clone()))
-                .map_err(|e| Error::SendingError(comm_actor.actor_id().clone(), Box::new(e)))?
-        }
-
-        // The comm actor is now set up and ready to go.
-        proc_mesh.current_ref.root_comm_actor = Some(root_comm_actor);
-
-        Ok(proc_mesh)
+    /// Set or clear the controller actor managing this mesh.
+    pub(crate) fn set_controller(
+        &mut self,
+        controller: Option<ActorRef<crate::mesh_controller::ProcMeshController>>,
+    ) {
+        self.controller = controller;
     }
 
     /// Stop this mesh gracefully.
+    ///
+    /// If a `ProcMeshController` is present (owned meshes spawned from a host
+    /// mesh), the stop is delegated to the controller via `resource::Stop`;
+    /// the controller's handler awaits `HostMeshRef::stop_proc_mesh`, which
+    /// casts `Stop` + `WaitRankStatus{min_status: Stopped}` to the
+    /// HostAgents and waits up to `PROC_STOP_MAX_IDLE` for every proc to
+    /// reach `Stopped`. We then serialize behind that handler with a
+    /// `GetState` to read the final statuses out of the controller's
+    /// `health_state`.
     pub async fn stop(&mut self, cx: &impl context::Actor, reason: String) -> anyhow::Result<()> {
+        if let Some(controller) = self.controller.take() {
+            let id = self.id.resource_id().clone();
+            controller.post(
+                cx,
+                resource::Stop {
+                    id: id.clone(),
+                    reason,
+                },
+            );
+
+            // The controller processes messages serially, so by the time it
+            // gets to this `GetState`, its `health_state.statuses` already
+            // reflects the outcome of `stop_proc_mesh` (Stopping, Stopped,
+            // Failed, or Timeout on `PROC_STOP_MAX_IDLE` exhaustion).
+            let (port, mut rx) = cx.mailbox().open_port();
+            controller.post(
+                cx,
+                resource::GetState::<resource::mesh::State<()>> {
+                    id: id.clone(),
+                    reply: port.bind(),
+                },
+            );
+
+            let statuses = rx.recv().await?;
+            let Some(state) = &statuses.state else {
+                anyhow::bail!(
+                    "non-existent state in GetState reply from controller: {}",
+                    controller.actor_addr()
+                );
+            };
+            // `is_terminating` accepts Stopping, Stopped, Failed, and
+            // Timeout. The controller's Stop handler has already awaited
+            // (or timed out) the underlying HostAgent wait, so any rank
+            // still in Running here means the controller never processed
+            // the stop for that rank.
+            let all_stopped = state.statuses.values().all(|s| s.is_terminating());
+            if !all_stopped {
+                anyhow::bail!(
+                    "proc mesh {} not all procs reached terminating state after stop: {:?}",
+                    id,
+                    state.statuses,
+                );
+            }
+            return Ok(());
+        }
+
         let region = self.region.clone();
-        let procs = self
-            .current_ref
-            .proc_ids()
-            .collect::<Vec<hyperactor_reference::ProcAddr>>();
+        let procs = self.current_ref.proc_ids().collect::<Vec<ProcAddr>>();
         // We use the proc mesh region rather than the host mesh region
         // because the host agent stores one entry per proc, not per host.
         self.current_ref
@@ -268,11 +273,8 @@ impl ProcMesh {
             .expect("ProcMesh always has a host mesh")
             .stop_proc_mesh(cx, &self.id, procs, region, reason)
             .await
-    }
-
-    #[cfg(test)]
-    pub(crate) fn ranks(&self) -> Arc<Vec<ProcRef>> {
-        Arc::clone(&self.current_ref.ranks)
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
     }
 }
 
@@ -306,24 +308,51 @@ impl Drop for ProcMesh {
 ///
 /// ProcMeshes can be sliced to create new ProcMeshes with a subset of the
 /// original ranks.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Named, Serialize, Deserialize)]
+///
+/// `ProcMeshRef::sliced` is intentionally pure. A sliced proc mesh can still
+/// expose dense `ProcRef`s, while the backing `ProcAgent` `ActorMeshRef`
+/// carries a lazy cast-domain descriptor that installs itself on first cast.
+#[derive(Debug, Clone, Named, Serialize, Deserialize)]
 pub struct ProcMeshRef {
     id: ProcMeshId,
     region: Region,
     ranks: Arc<Vec<ProcRef>>,
+    /// Actor mesh for the `ProcAgent`s backing this proc mesh view.
+    ///
+    /// `ProcMeshRef::sliced` derives a sliced agent mesh with a lazy cast
+    /// descriptor. The first cast through that view installs the descriptor on
+    /// the caller's sender stream.
+    ///
+    /// The `ProcMeshRef` itself keeps dense `ProcRef`s so it can later
+    /// materialize this field from the current view without consulting the
+    /// parent mesh or using a temporary proc.
+    proc_agent_mesh: ActorMeshRef<ProcAgent>,
     // Some if this was spawned from a host mesh, else none.
     host_mesh: Option<HostMeshRef>,
-    // Temporary: used to fit v1 ActorMesh with v0's casting implementation. This
-    // should be removed after we remove the v0 code.
-    // The root region of this mesh. None means this mesh itself is the root.
-    pub(crate) root_region: Option<Region>,
-    // Temporary: used to fit v1 ActorMesh with v0's casting implementation. This
-    // should be removed after we remove the v0 code.
-    // v0 casting requires root mesh rank 0 as the 1st hop, so we need to provide
-    // it here. For v1, this can be removed since v1 can use any rank.
-    pub(crate) root_comm_actor: Option<hyperactor_reference::ActorRef<CommActor>>,
 }
 wirevalue::register_type!(ProcMeshRef);
+
+// The proc-agent actor mesh is derived from `ranks`, so it is not part of
+// `ProcMeshRef` identity.
+impl PartialEq for ProcMeshRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.region == other.region
+            && self.ranks == other.ranks
+            && self.host_mesh == other.host_mesh
+    }
+}
+
+impl Eq for ProcMeshRef {}
+
+impl std::hash::Hash for ProcMeshRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.region.hash(state);
+        self.ranks.hash(state);
+        self.host_mesh.hash(state);
+    }
+}
 
 impl ProcMeshRef {
     /// Create a new ProcMeshRef from the given id, region, ranks, and so on.
@@ -333,41 +362,42 @@ impl ProcMeshRef {
         region: Region,
         ranks: Arc<Vec<ProcRef>>,
         host_mesh: Option<HostMeshRef>,
-        root_region: Option<Region>,
-        root_comm_actor: Option<hyperactor_reference::ActorRef<CommActor>>,
     ) -> crate::Result<Self> {
+        if ranks.is_empty() {
+            return Err(crate::Error::ConfigurationError(anyhow::anyhow!(
+                "empty proc meshes are not supported"
+            )));
+        }
         if region.num_ranks() != ranks.len() {
             return Err(crate::Error::InvalidRankCardinality {
                 expected: region.num_ranks(),
                 actual: ranks.len(),
             });
         }
+        let proc_agent_mesh = Self::proc_agent_mesh_ref(&id, &region, &ranks)?;
         Ok(Self {
             id,
             region,
             ranks,
+            proc_agent_mesh,
             host_mesh,
-            root_region,
-            root_comm_actor,
         })
     }
 
     /// Create a singleton ProcMeshRef, given the provided ProcRef and id.
     /// This is used to support creating local singleton proc meshes to support `this_proc()`
     /// in python client actors.
-    pub fn new_singleton(id: ProcMeshId, proc_ref: ProcRef) -> Self {
-        Self {
+    pub fn new_singleton(id: ProcMeshId, proc_ref: ProcRef) -> crate::Result<Self> {
+        let region: Region = Extent::unity().into();
+        let ranks = Arc::new(vec![proc_ref]);
+        let proc_agent_mesh = Self::proc_agent_mesh_ref(&id, &region, &ranks)?;
+        Ok(Self {
             id,
-            region: Extent::unity().into(),
-            ranks: Arc::new(vec![proc_ref]),
+            region,
+            ranks,
+            proc_agent_mesh,
             host_mesh: None,
-            root_region: None,
-            root_comm_actor: None,
-        }
-    }
-
-    pub(crate) fn root_comm_actor(&self) -> Option<&hyperactor_reference::ActorRef<CommActor>> {
-        self.root_comm_actor.as_ref()
+        })
     }
 
     pub fn id(&self) -> &ProcMeshId {
@@ -383,18 +413,40 @@ impl ProcMeshRef {
         self.host_mesh.as_ref()
     }
 
-    pub(crate) fn agent_mesh(&self) -> ActorMeshRef<ProcAgent> {
-        let agent_label = self
-            .ranks
+    pub(crate) fn agent_mesh(&self) -> &ActorMeshRef<ProcAgent> {
+        &self.proc_agent_mesh
+    }
+
+    fn proc_agent_mesh_ref(
+        proc_mesh_id: &ProcMeshId,
+        region: &Region,
+        ranks: &[ProcRef],
+    ) -> crate::Result<ActorMeshRef<ProcAgent>> {
+        let agent_label = ranks
             .first()
             .unwrap()
             .agent
-            .actor_id()
+            .actor_addr()
             .label()
             .cloned()
             .unwrap_or_else(|| Label::new(proc_agent::PROC_AGENT_ACTOR_NAME).unwrap());
         let id = ActorMeshId::singleton(agent_label);
-        ActorMeshRef::new(id, self.clone(), None)
+
+        let members = Arc::new(
+            ranks
+                .iter()
+                .map(|rank| rank.agent.actor_addr().clone())
+                .collect_mesh::<ValueMesh<_>>(region.clone())
+                .map_err(|error| crate::Error::ConfigurationError(error.into()))?,
+        );
+
+        Ok(ActorMeshRef::new(
+            id,
+            Some(proc_mesh_id.clone()),
+            region.clone(),
+            None,
+            members,
+        ))
     }
 
     /// Query the state of all actors in this mesh matching the given id.
@@ -417,7 +469,6 @@ impl ProcMeshRef {
         id: ActorMeshId,
         keepalive: Option<std::time::SystemTime>,
     ) -> crate::Result<ValueMesh<resource::State<ActorState>>> {
-        let agent_mesh = self.agent_mesh();
         let (port, mut rx) = cx.mailbox().open_port::<resource::State<ActorState>>();
         let mut port = port.bind();
         // If this proc dies or some other issue renders the reply undeliverable,
@@ -430,7 +481,7 @@ impl ProcMeshRef {
             reply: port,
         };
         if let Some(expires_after) = keepalive {
-            agent_mesh.cast(
+            self.proc_agent_mesh.cast(
                 cx,
                 resource::KeepaliveGetState {
                     expires_after,
@@ -438,9 +489,20 @@ impl ProcMeshRef {
                 },
             )?;
         } else {
-            agent_mesh.cast(cx, get_state)?;
+            self.proc_agent_mesh.cast(cx, get_state)?;
         }
         let expected = self.ranks.len();
+        // Map each managed-actor `ActorAddr` to its rank in *this* (current)
+        // view, so a reply is positioned by the current view rather than the
+        // payload's historical `create_rank` (a reused singleton's `create_rank`
+        // is its rank in the view it was first spawned over). Built once per
+        // query: O(N) to build, O(1) per reply.
+        let rank_of_actor: HashMap<ActorAddr, usize> = self
+            .ranks
+            .iter()
+            .enumerate()
+            .map(|(rank, proc_ref)| (proc_ref.actor_addr(&id), rank))
+            .collect();
         let mut states = Vec::with_capacity(expected);
         let timeout = hyperactor_config::global::get(GET_ACTOR_STATE_MAX_IDLE);
         for _ in 0..expected {
@@ -455,9 +517,20 @@ impl ProcMeshRef {
                 let state = state?;
                 match state.state {
                     Some(ref inner) => {
-                        states.push((inner.create_rank, state));
+                        // Position by this actor's rank in the current view, not
+                        // its historical `create_rank`.
+                        let rank = *rank_of_actor.get(&inner.actor_id).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "state reply from {} is not a member of the queried view",
+                                inner.actor_id,
+                            )
+                        })?;
+                        states.push((rank, state));
                     }
                     None => {
+                        // A received `None` is a definitive NotExist answer;
+                        // return immediately rather than waiting for the timeout
+                        // padding (which is only for ranks that never reply).
                         return Err(Error::NotExist(state.id));
                     }
                 }
@@ -465,7 +538,7 @@ impl ProcMeshRef {
                 tracing::error!(
                     "timeout waiting for a message after {:?} from proc mesh agent in mesh {}",
                     timeout,
-                    agent_mesh
+                    self.proc_agent_mesh
                 );
                 // Timeout error, stop reading from the receiver and send back what we have so far,
                 // padding with failed states.
@@ -477,8 +550,8 @@ impl ProcMeshRef {
                     let rank = *leftover_ranks
                         .pop()
                         .expect("leftover ranks should not be empty");
-                    let agent = agent_mesh.get(rank).expect("agent should exist");
-                    let agent_id = agent.actor_id().clone();
+                    let agent = self.proc_agent_mesh.get(rank).expect("agent should exist");
+                    let agent_id = agent.actor_addr().clone();
                     states.push((
                         // We populate with any ranks leftover at the time of the timeout.
                         rank,
@@ -521,26 +594,91 @@ impl ProcMeshRef {
         Ok(vm)
     }
 
-    pub async fn proc_states(
+    /// Get the state of every proc in this proc mesh.
+    ///
+    /// Casts a single `GetHostProcStates` to the routing host-agent mesh
+    /// carrying this mesh's selected global ranks (the mesh may be sliced, so
+    /// they need not be a dense `0..n`). The cast may reach hosts that own no
+    /// selected procs, but each HostAgent filters locally and only hosts with
+    /// matching ranks reply. Replies reduce up the cast tree (fanning in at cast
+    /// actor 0) instead of every host dialing this caller. When `keepalive` is
+    /// `Some`, each proc's expiry is extended (orphan protection, as with
+    /// `KeepaliveGetState`). Returns `None` when this proc mesh is not backed by
+    /// a host mesh (local/in-process meshes). On timeout, ranks whose host did
+    /// not reply are padded with a `Timeout` state.
+    #[allow(clippy::result_large_err)]
+    pub async fn states(
         &self,
         cx: &impl context::Actor,
+        keepalive: Option<std::time::SystemTime>,
     ) -> crate::Result<Option<ValueMesh<resource::State<ProcState>>>> {
-        let names = self
-            .proc_ids()
-            .collect::<Vec<hyperactor_reference::ProcAddr>>();
-        if let Some(host_mesh) = &self.host_mesh {
-            Ok(Some(
-                host_mesh
-                    .proc_states(cx, names, self.region.clone())
-                    .await?,
-            ))
-        } else {
-            Ok(None)
-        }
+        // Only meaningful when this proc mesh is backed by a host mesh.
+        let Some(host_mesh) = self.host_mesh.as_ref() else {
+            return Ok(None);
+        };
+        let region = self.region.clone();
+        let timeout = hyperactor_config::global::get(GET_PROC_STATE_MAX_IDLE);
+
+        // Per-rank template seeded with `Timeout` placeholders. Hosts overlay
+        // the ranks they own, so any rank never reported keeps its placeholder
+        // and the result is a complete mesh with no post-hoc padding.
+        let template: ValueMesh<resource::State<ProcState>> = self
+            .ranks
+            .iter()
+            .map(|proc_ref| resource::State {
+                id: ResourceId::new(
+                    proc_ref.proc_id.uid().clone(),
+                    proc_ref.proc_id.label().cloned(),
+                ),
+                status: resource::Status::Timeout(timeout),
+                state: None,
+                generation: 0,
+                timestamp: std::time::SystemTime::now(),
+            })
+            .collect_mesh::<ValueMesh<_>>(region.clone())?;
+        // Snapshot returned if no host replies before the idle timeout.
+        let fallback = template.clone();
+
+        // Accumulator port: receives sparse per-host overlays and emits the
+        // merged full mesh (right-wins). The host mesh is a routing
+        // over-approximation for sliced proc meshes; HostAgents that own
+        // selected ranks post an overlay, others stay silent.
+        let (port, rx) = cx.mailbox().open_accum_port_opts(
+            template,
+            StreamingReducerOpts {
+                max_update_interval: Some(Duration::from_millis(50)),
+                initial_update_interval: None,
+            },
+        );
+
+        host_mesh.agent_mesh().cast(
+            cx,
+            GetHostProcStates {
+                proc_mesh_id: self.id.clone(),
+                region: region.clone(),
+                keepalive,
+                reply: port.bind(),
+            },
+        )?;
+
+        // Wait until every rank has reported (moved off its `Timeout`
+        // placeholder) or we idle out. Either way the mesh is complete: ranks
+        // whose host never replied stay `Timeout`, and a failed proc surfaces as
+        // its `Failed` state rather than an error.
+        let mesh =
+            match resource::wait_mesh(rx, timeout, fallback, |s: &resource::State<ProcState>| {
+                !matches!(s.status, resource::Status::Timeout(_))
+            })
+            .await
+            {
+                Ok(mesh) | Err(mesh) => mesh,
+            };
+
+        Ok(Some(mesh))
     }
 
     /// Returns an iterator over the proc ids in this mesh.
-    pub(crate) fn proc_ids(&self) -> impl Iterator<Item = hyperactor_reference::ProcAddr> {
+    pub(crate) fn proc_ids(&self) -> impl Iterator<Item = ProcAddr> {
         self.ranks.iter().map(|proc_ref| proc_ref.proc_id.clone())
     }
 
@@ -564,7 +702,7 @@ impl ProcMeshRef {
         C::A: Handler<MeshFailure>,
     {
         // Spawning from a string is never a system actor.
-        let id = ActorMeshId::unique(Label::strip(name));
+        let id = ActorMeshId::instance(Label::strip(name));
         self.spawn_with_name(cx, id, params, None, false).await
     }
 
@@ -587,6 +725,57 @@ impl ProcMeshRef {
     {
         let id = ActorMeshId::singleton(Label::strip(name));
         self.spawn_with_name(cx, id, params, None, false).await
+    }
+
+    /// Spawn a controllerless 'service' actor.
+    ///
+    /// Like [`spawn_service`](Self::spawn_service), this spawns a singleton
+    /// service actor (a reserved name, deduped to one). Unlike `spawn_service`,
+    /// the resulting mesh has **no** `ActorMeshController`: no per-caller
+    /// controller actor is spawned, and the caller `C` is therefore **not**
+    /// required to implement `Handler<MeshFailure>`.
+    ///
+    /// This is for coordinators that own their own supervision — e.g. a
+    /// controllerless singleton that itself spawns controller-ful children —
+    /// where a per-caller controller would be redundant.
+    #[hyperactor::instrument(fields(
+        host_mesh=self.host_mesh_id().map(|id| id.to_string()),
+        proc_mesh=self.id.to_string(),
+        actor_name=name.to_string(),
+    ))]
+    pub async fn spawn_controllerless_service<A: RemoteSpawn, C: context::Actor>(
+        &self,
+        cx: &C,
+        name: &str,
+        params: &A::Params,
+    ) -> crate::Result<ActorMesh<A>>
+    where
+        A::Params: RemoteMessage,
+    {
+        tracing::info!(
+            name = "ProcMeshStatus",
+            status = "ActorMesh::Spawn::Attempt",
+        );
+        tracing::info!(name = "ActorMeshStatus", status = "Spawn::Attempt");
+        let id = ActorMeshId::singleton(Label::strip(name));
+        let result = self
+            .spawn_mesh_inner(cx, id, params, None)
+            .await
+            .map(|(mesh, _statuses)| mesh);
+        match &result {
+            Ok(_) => {
+                tracing::info!(
+                    name = "ProcMeshStatus",
+                    status = "ActorMesh::Spawn::Success",
+                );
+                tracing::info!(name = "ActorMeshStatus", status = "Spawn::Success");
+            }
+            Err(error) => {
+                tracing::error!(name = "ProcMeshStatus", status = "ActorMesh::Spawn::Failed", %error);
+                tracing::error!(name = "ActorMeshStatus", status = "Spawn::Failed", %error);
+            }
+        }
+        result
     }
 
     /// Spawn an actor on all procs in this mesh under the given
@@ -658,6 +847,55 @@ impl ProcMeshRef {
     where
         C::A: Handler<MeshFailure>,
     {
+        let (mut mesh, statuses) = self
+            .spawn_mesh_inner(cx, actor_mesh_id, params, supervision_display_name.clone())
+            .await?;
+        // System actors are managed by their owning runtime, not an
+        // ActorMeshController.
+        if !is_system_actor {
+            // Spawn a unique mesh manager for each actor mesh, so the type of the
+            // mesh can be preserved.
+            let controller: ActorMeshController<A> = ActorMeshController::new(
+                ActorMeshControlPlane::new(mesh.deref().clone(), self.clone()),
+                supervision_display_name,
+                Some(cx.instance().port().bind()),
+                statuses,
+            );
+            // hyperactor::proc AI-3: controller name must include mesh
+            // identity for proc-wide ActorAddr uniqueness. A fixed base name alone
+            // collides across parents because pid allocation is
+            // parent-scoped.
+            let controller_name = format!(
+                "{}_{}",
+                crate::mesh_controller::ACTOR_MESH_CONTROLLER_NAME,
+                mesh.id()
+            );
+            let controller = cx.spawn_with_label(&controller_name, controller);
+            // Controller and ActorMesh both depend on references from each other, break
+            // the cycle by setting the controller after the fact.
+            mesh.set_controller(Some(controller.bind()));
+        }
+        Ok(mesh)
+    }
+
+    /// The common spawn path shared by
+    /// [`spawn_with_name_inner`](Self::spawn_with_name_inner) and
+    /// [`spawn_controllerless_service`](Self::spawn_controllerless_service): the
+    /// create/update cast, the accumulator port, the bounded
+    /// `GetRankStatus::wait` with terminal / timeout mapping, mesh
+    /// materialization, and telemetry. It carries **no**
+    /// `C::A: Handler<MeshFailure>` bound — that is required only by the
+    /// controller construction (`cx.instance().port().bind()`), which the
+    /// bounded caller layers on afterward. Returns the mesh together with the
+    /// final `StatusMesh` (moved into the controller for non-system actors;
+    /// discarded otherwise — system actors and the controllerless path).
+    async fn spawn_mesh_inner<A: RemoteSpawn, C: context::Actor>(
+        &self,
+        cx: &C,
+        actor_mesh_id: ActorMeshId,
+        params: &A::Params,
+        supervision_display_name: Option<String>,
+    ) -> crate::Result<(ActorMesh<A>, crate::StatusMesh)> {
         let remote = Remote::collect();
         // `RemoteSpawn` + `register_spawnable!(A)` ensure that `A` has a
         // `SpawnableActor` entry in this registry, so
@@ -668,9 +906,7 @@ impl ProcMeshRef {
             .to_string();
 
         let serialized_params = bincode::serde::encode_to_vec(params, bincode::config::legacy())?;
-        let agent_mesh = self.agent_mesh();
-
-        agent_mesh.cast(
+        self.proc_agent_mesh.cast(
             cx,
             resource::CreateOrUpdate::<proc_agent::ActorSpec> {
                 id: actor_mesh_id.resource_id().clone(),
@@ -678,6 +914,7 @@ impl ProcMeshRef {
                 spec: proc_agent::ActorSpec {
                     actor_type: actor_type.clone(),
                     params_data: serialized_params.clone(),
+                    actor_environment: cx.instance().actor_environment().clone(),
                 },
             },
         )?;
@@ -708,10 +945,12 @@ impl ProcMeshRef {
         reply.return_undeliverable(false);
         // Send a message to all ranks. They reply with overlays to
         // `port`.
-        agent_mesh.cast(
+        self.proc_agent_mesh.cast(
             cx,
             resource::GetRankStatus {
                 id: actor_mesh_id.resource_id().clone(),
+                // Filled by the cast layer with this recipient's dense view rank.
+                rank: Default::default(),
                 reply,
             },
         )?;
@@ -726,7 +965,7 @@ impl ProcMeshRef {
         // overlays are applied, it emits a new StatusMesh snapshot.
         // `wait()` loops on it, deciding when the stream is
         // "complete" (no more NotExist) or times out.
-        let (statuses, mut mesh) = match GetRankStatus::wait(
+        let statuses = match GetRankStatus::wait(
             rx,
             self.ranks.len(),
             hyperactor_config::global::get(ACTOR_SPAWN_MAX_IDLE),
@@ -740,10 +979,7 @@ impl ProcMeshRef {
                 // `first_terminating().is_none()` semantics.
                 let has_terminating = statuses.values().any(|s| s.is_terminating());
                 if !has_terminating {
-                    Ok((
-                        statuses,
-                        ActorMesh::new(self.clone(), actor_mesh_id.clone(), None),
-                    ))
+                    Ok(statuses)
                 } else {
                     let legacy = mesh_to_rankedvalues_with_default(
                         &statuses,
@@ -767,44 +1003,28 @@ impl ProcMeshRef {
                 Err(Error::ActorSpawnError { statuses: legacy })
             }
         }?;
-        // We don't need controllers for a system actor like the CommActor.
-        if !is_system_actor {
-            // Spawn a unique mesh manager for each actor mesh, so the type of the
-            // mesh can be preserved.
-            let controller: ActorMeshController<A> = ActorMeshController::new(
-                mesh.deref().clone(),
-                supervision_display_name.clone(),
-                Some(cx.instance().port().bind()),
-                statuses,
-            );
-            // hyperactor::proc AI-3: controller name must include mesh
-            // identity for proc-wide ActorAddr uniqueness. A fixed base name alone
-            // collides across parents because pid allocation is
-            // parent-scoped.
-            let controller_name = format!(
-                "{}_{}",
-                crate::mesh_controller::ACTOR_MESH_CONTROLLER_NAME,
-                mesh.id()
-            );
-            let controller = controller
-                .spawn_with_name(cx, &controller_name)
-                .map_err(|e| {
-                    Error::ControllerActorSpawnError(mesh.id().resource_id().clone(), e)
-                })?;
-            // Controller and ActorMesh both depend on references from each other, break
-            // the cycle by setting the controller after the fact.
-            mesh.set_controller(Some(controller.bind()));
-        }
+
+        let actor_mesh_members = Arc::new(
+            self.ranks
+                .iter()
+                .map(|rank| rank.actor_addr(&actor_mesh_id))
+                .collect_mesh::<ValueMesh<_>>(self.region().clone())
+                .map_err(|error| crate::Error::ConfigurationError(error.into()))?,
+        );
+
+        let mesh = ActorMesh::new(
+            self.clone(),
+            actor_mesh_id.clone(),
+            None,
+            actor_mesh_members,
+        );
         // Notify telemetry that an actor mesh was created.
         {
             let id_str = mesh.id().to_string();
 
-            // Hash the actor mesh id. This is used as mesh_id for both
-            // the MeshEvent and the per-actor ActorEvents below.
-            let mesh_id_hash = hyperactor_telemetry::hash_to_u64(&id_str);
-
             // Hash the proc mesh id for parent_mesh_id.
-            let parent_mesh_id_hash = hyperactor_telemetry::hash_to_u64(&self.id().to_string());
+            let parent_mesh_id_hash = hash_to_u64(self.id());
+            let mesh_id_hash = telemetry_actor_mesh_id(self.id(), mesh.id());
 
             hyperactor_telemetry::notify_mesh_created(hyperactor_telemetry::MeshEvent {
                 id: mesh_id_hash,
@@ -834,19 +1054,19 @@ impl ProcMeshRef {
                     let point = self.region().extent().point_of_rank(rank).unwrap();
                     crate::actor_display_name(sdn, &point)
                 });
-                let actor_id = proc_ref.actor_id(&actor_mesh_id);
+                let actor_addr = proc_ref.actor_addr(&actor_mesh_id);
                 hyperactor_telemetry::notify_actor_created(hyperactor_telemetry::ActorEvent {
-                    id: hyperactor_telemetry::hash_to_u64(&actor_id),
+                    id: hyperactor_telemetry::hash_to_u64(actor_addr.id()),
                     timestamp: now,
                     mesh_id: mesh_id_hash,
                     rank: rank as u64,
-                    full_name: actor_id.to_string(),
+                    full_name: actor_addr.to_string(),
                     display_name,
                 });
             }
         }
 
-        Ok(mesh)
+        Ok((mesh, statuses))
     }
 
     /// Send stop actors message to all mesh agents for a specific actor mesh id.
@@ -884,8 +1104,7 @@ impl ProcMeshRef {
         reason: String,
     ) -> crate::Result<ValueMesh<Status>> {
         let region = self.region().clone();
-        let agent_mesh = self.agent_mesh();
-        agent_mesh.cast(
+        self.proc_agent_mesh.cast(
             cx,
             resource::Stop {
                 id: actor_mesh_id.resource_id().clone(),
@@ -914,10 +1133,12 @@ impl ProcMeshRef {
         // Use WaitRankStatus instead of GetRankStatus so agents defer
         // their reply until the actor reaches terminal state, rather
         // than replying immediately with Stopping.
-        agent_mesh.cast(
+        self.proc_agent_mesh.cast(
             cx,
             resource::WaitRankStatus {
                 id: actor_mesh_id.resource_id().clone(),
+                // Filled by the cast layer with this recipient's dense view rank.
+                rank: Default::default(),
                 min_status: Status::Stopped,
                 reply: port.bind(),
             },
@@ -985,6 +1206,10 @@ impl view::Ranked for ProcMeshRef {
 }
 
 impl view::RankedSliceable for ProcMeshRef {
+    /// Return a pure slice of this proc mesh.
+    ///
+    /// The returned `ProcMeshRef` contains the selected dense `ProcRef`s, and
+    /// its `proc_agent_mesh` carries a lazy actor-mesh slice descriptor.
     fn sliced(&self, region: Region) -> Self {
         debug_assert!(region.is_subset(view::Ranked::region(self)));
         let ranks = self
@@ -992,16 +1217,15 @@ impl view::RankedSliceable for ProcMeshRef {
             .remap(&region)
             .unwrap()
             .map(|index| self.get(index).unwrap().clone())
-            .collect();
-        Self::new(
-            self.id.clone(),
+            .collect::<Vec<_>>();
+
+        Self {
+            id: self.id.clone(),
+            proc_agent_mesh: self.proc_agent_mesh.sliced(region.clone()),
             region,
-            Arc::new(ranks),
-            self.host_mesh.clone(),
-            Some(self.root_region.as_ref().unwrap_or(&self.region).clone()),
-            self.root_comm_actor.clone(),
-        )
-        .unwrap()
+            ranks: Arc::new(ranks),
+            host_mesh: self.host_mesh.clone(),
+        }
     }
 }
 
@@ -1029,27 +1253,62 @@ fn python_class_from_supervision_name(sdn: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use hyperactor::Instance;
-    use ndslice::extent;
-    use timed_test::assert_no_process_leak;
-    use timed_test::async_timed_test;
+    #[cfg(fbcode_build)]
+    use std::collections::HashMap;
+    #[cfg(fbcode_build)]
+    use std::collections::HashSet;
+    #[cfg(fbcode_build)]
+    use std::ops::Deref;
+    #[cfg(fbcode_build)]
+    use std::time::Duration;
 
+    #[cfg(fbcode_build)]
+    use hyperactor::ActorEnvironment;
+    #[cfg(fbcode_build)]
+    use hyperactor::Instance;
+    #[cfg(fbcode_build)]
+    use hyperactor::accum::StreamingReducerOpts;
+    #[cfg(fbcode_build)]
+    use hyperactor::context::Mailbox;
+    #[cfg(fbcode_build)]
+    use ndslice::ViewExt as _;
+    #[cfg(fbcode_build)]
+    use ndslice::extent;
+    #[cfg(fbcode_build)]
+    use ndslice::view::Ranked as _;
+    #[cfg(fbcode_build)]
+    use timed_test::assert_no_process_leak;
+    #[cfg(fbcode_build)]
+    use timed_test::async_timed_test;
+    #[cfg(fbcode_build)]
+    use uuid::Uuid;
+
+    #[cfg(fbcode_build)]
+    use super::ACTOR_SPAWN_MAX_IDLE;
+    #[cfg(fbcode_build)]
+    use crate::ActorMesh;
+    #[cfg(fbcode_build)]
+    use crate::casting::CAST_POINT;
+    #[cfg(fbcode_build)]
+    use crate::host_mesh::PROC_SPAWN_MAX_IDLE;
+    #[cfg(fbcode_build)]
     use crate::resource::RankedValues;
+    #[cfg(fbcode_build)]
     use crate::resource::Status;
+    #[cfg(fbcode_build)]
     use crate::testactor;
+    #[cfg(fbcode_build)]
     use crate::testing;
 
     #[cfg(fbcode_build)]
-    #[assert_no_process_leak]
-    #[async_timed_test(timeout_secs = 30)]
-    async fn test_spawn_actor() {
+    async fn execute_spawn_actor() {
         hyperactor_telemetry::initialize_logging(hyperactor_telemetry::DefaultTelemetryClock {});
 
         let instance = testing::instance();
 
-        let mut hm = testing::host_mesh(4).await;
+        let mut hm = testing::host_mesh(2).await;
         let proc_mesh = hm
-            .spawn(&instance, "test", extent!(gpus = 2), None)
+            .spawn(&instance, "test", extent!(gpus = 1), None, None)
             .await
             .unwrap();
         let actor_mesh = proc_mesh.spawn(instance, "test", &()).await.unwrap();
@@ -1058,17 +1317,553 @@ mod tests {
         let _ = hm.shutdown(instance).await;
     }
 
+    #[async_timed_test(timeout_secs = 300)]
+    #[cfg(fbcode_build)]
+    async fn actor_environment_survives_two_remote_hops_and_excludes_cast_point() {
+        const SENTINEL: u64 = 0xA0FE;
+        let operation_timeout = Duration::from_secs(120);
+
+        let config = hyperactor_config::global::lock();
+        let _guard = config.override_key(PROC_SPAWN_MAX_IDLE, operation_timeout);
+        let _guard2 = config.override_key(
+            hyperactor::config::HOST_SPAWN_READY_TIMEOUT,
+            operation_timeout,
+        );
+
+        let base = testing::instance();
+        let persistent_point = extent!(persistent = 3).point_of_rank(2).unwrap();
+        let mut environment = ActorEnvironment::default();
+        environment
+            .set(testactor::ACTOR_ENVIRONMENT_TEST_TAG, SENTINEL)
+            .expect("seed persistent tag");
+        environment
+            .set(CAST_POINT, persistent_point.clone())
+            .expect("seed persistent cast-point collision");
+        let root = base
+            .proc()
+            .actor_instance_in_environment::<testing::TestRootClient>(
+                &format!("actor_environment_root_{}", Uuid::now_v7()),
+                environment,
+            )
+            .expect("create seeded root instance");
+
+        let mut hm = testing::host_mesh(1).await;
+        let proc_mesh = hm
+            .spawn(
+                &root.instance,
+                "actor_environment",
+                extent!(gpus = 2),
+                None,
+                None,
+            )
+            .await
+            .expect("spawn proc mesh");
+        let first_hop = proc_mesh
+            .range("gpus", 0..1)
+            .expect("first proc-mesh slice");
+        let second_hop = proc_mesh
+            .range("gpus", 1..2)
+            .expect("second proc-mesh slice");
+        let first_point = first_hop
+            .region()
+            .extent()
+            .point_of_rank(0)
+            .expect("first slice has rank zero");
+        let second_point = second_hop
+            .region()
+            .extent()
+            .point_of_rank(0)
+            .expect("second slice has rank zero");
+        let first_proc_addr = first_hop
+            .get(0)
+            .expect("first proc")
+            .proc_addr()
+            .to_string();
+        let second_proc_addr = second_hop
+            .get(0)
+            .expect("second proc")
+            .proc_addr()
+            .to_string();
+        assert_ne!(
+            first_proc_addr, second_proc_addr,
+            "the two hops must target distinct proc addresses",
+        );
+        assert!(
+            persistent_point != first_point && persistent_point != second_point,
+            "persistent and transient cast points must be distinct",
+        );
+
+        let (reply, mut replies) = root
+            .instance
+            .open_port::<testactor::ActorEnvironmentObservation>();
+        first_hop
+            .spawn_controllerless_service::<testactor::ActorEnvironmentProbe, _>(
+                &root.instance,
+                "actor_environment_hop_1",
+                &testactor::ActorEnvironmentProbeParams {
+                    label: "hop_1".to_string(),
+                    reply: reply.bind(),
+                    nested: Some((
+                        second_hop,
+                        "actor_environment_hop_2".to_string(),
+                        "hop_2".to_string(),
+                    )),
+                },
+            )
+            .await
+            .expect("spawn first environment probe");
+
+        let expected = HashMap::from([
+            ("hop_1".to_string(), (first_point, first_proc_addr)),
+            ("hop_2".to_string(), (second_point, second_proc_addr)),
+        ]);
+        let mut seen = HashSet::new();
+        let reply_deadline = tokio::time::Instant::now() + operation_timeout;
+        for _ in 0..2 {
+            let observed = tokio::time::timeout_at(reply_deadline, replies.recv())
+                .await
+                .expect("environment probe reply timed out")
+                .expect("environment probe reply port closed");
+            let (expected_point, expected_proc_addr) = expected
+                .get(&observed.label)
+                .unwrap_or_else(|| panic!("unexpected probe label {}", observed.label));
+            assert!(
+                seen.insert(observed.label.clone()),
+                "received duplicate observation from {}",
+                observed.label,
+            );
+            assert_eq!(
+                observed.persistent_tag,
+                Some(SENTINEL),
+                "{} must inherit the persistent tag",
+                observed.label,
+            );
+            assert_eq!(
+                observed.constructor_tag,
+                Some(SENTINEL),
+                "{} constructor must see the persistent tag",
+                observed.label,
+            );
+            assert_eq!(
+                observed.stored_point,
+                Some(persistent_point.clone()),
+                "{} must store only the persistent point",
+                observed.label,
+            );
+            assert_eq!(
+                observed.constructor_point,
+                Some(expected_point.clone()),
+                "{} constructor must see its real rank-local cast point",
+                observed.label,
+            );
+            assert_eq!(
+                &observed.proc_addr, expected_proc_addr,
+                "{} must run on its requested proc",
+                observed.label,
+            );
+        }
+        assert_eq!(seen.len(), expected.len(), "both hops must report");
+
+        hm.shutdown(&root.instance)
+            .await
+            .expect("host mesh shutdown should complete");
+    }
+
+    /// Reuse a per-proc singleton service across two overlapping proc-mesh views
+    /// whose shared proc is renumbered — a whole view and a `gpus` sub-slice, so
+    /// the shared proc (gpu 1) is rank 1 in the whole and rank 0 in the slice.
+    /// `spawn_service` creates one deduped actor per proc, so the slice must
+    /// keep the whole's actor on the shared proc.
+    ///
+    /// One `host_mesh(1)` fixture drives three uniquely-named scenarios to keep
+    /// the harness footprint minimal (one Tokio runtime, one host process, no
+    /// process-global config override): reuse whole-then-slice, reuse
+    /// slice-then-whole, and a deferred `WaitRankStatus` over the slice. Each
+    /// spawn must resolve (a reused spawn positions its readiness overlay at the
+    /// consuming-view rank, so the accumulator completes), the slice must
+    /// reference the whole's shared actor with no new actors, and a Stopped-waiter
+    /// registered while the service runs must flush at slice-local ranks.
+    /// The assertions exercise the ProcAgent readiness path; the per-view
+    /// controllers remain idle because this test does not trigger supervision.
+    /// Snapshot assertions also verify that both reuse orders return actor state
+    /// in the queried view's rank order.
+    #[async_timed_test(timeout_secs = 120)]
+    #[cfg(fbcode_build)]
+    async fn test_singleton_service_reuse_over_overlapping_views() {
+        let instance = testing::instance();
+        let mut hm = testing::host_mesh(1).await;
+        let proc_mesh = hm
+            .spawn(&instance, "test", extent!(gpus = 2), None, None)
+            .await
+            .unwrap();
+        let whole = proc_mesh.deref().clone();
+        let slice = proc_mesh.range("gpus", 1..2).unwrap();
+
+        // The slice reuses the whole's actor on the shared proc; no new actors.
+        fn assert_shared(
+            whole_mesh: &ActorMesh<testactor::TestActor>,
+            slice_mesh: &ActorMesh<testactor::TestActor>,
+        ) {
+            let whole_ids: HashSet<_> = whole_mesh
+                .values()
+                .map(|actor_ref| actor_ref.actor_addr().id().clone())
+                .collect();
+            let slice_ids: HashSet<_> = slice_mesh
+                .values()
+                .map(|actor_ref| actor_ref.actor_addr().id().clone())
+                .collect();
+            assert_eq!(whole_ids.len(), 2, "whole view spans two procs");
+            assert_eq!(slice_ids.len(), 1, "slice spans one proc");
+            assert!(
+                slice_ids.is_subset(&whole_ids),
+                "slice reuses the shared proc's actor: {slice_ids:?} vs {whole_ids:?}",
+            );
+            assert_eq!(
+                whole_ids.union(&slice_ids).count(),
+                2,
+                "no new actors created for the overlapping slice",
+            );
+        }
+
+        // Scenario 1: spawn over the whole, then reuse over the renumbered slice.
+        let w1 = whole
+            .spawn_service::<testactor::TestActor, _>(instance, "svc_whole_first", &())
+            .await
+            .unwrap();
+        let s1 = slice
+            .spawn_service::<testactor::TestActor, _>(instance, "svc_whole_first", &())
+            .await
+            .unwrap();
+        assert_shared(&w1, &s1);
+        let s1_states = slice.actor_states(instance, s1.id().clone()).await.unwrap();
+        for rank in 0..slice.region().num_ranks() {
+            assert_eq!(
+                s1_states
+                    .get(rank)
+                    .and_then(|state| state.state.as_ref())
+                    .map(|state| &state.actor_id),
+                s1.get(rank).map(|actor| actor.actor_addr()),
+                "whole-first state is positioned at slice rank {rank}",
+            );
+        }
+
+        // Scenario 2: spawn over the slice first, then reuse over the whole.
+        let s2 = slice
+            .spawn_service::<testactor::TestActor, _>(instance, "svc_slice_first", &())
+            .await
+            .unwrap();
+        let w2 = whole
+            .spawn_service::<testactor::TestActor, _>(instance, "svc_slice_first", &())
+            .await
+            .unwrap();
+        assert_shared(&w2, &s2);
+        let w2_states = whole.actor_states(instance, w2.id().clone()).await.unwrap();
+        for rank in 0..whole.region().num_ranks() {
+            assert_eq!(
+                w2_states
+                    .get(rank)
+                    .and_then(|state| state.state.as_ref())
+                    .map(|state| &state.actor_id),
+                w2.get(rank).map(|actor| actor.actor_addr()),
+                "slice-first state is positioned at whole-view rank {rank}",
+            );
+        }
+
+        // Scenario 3: a `WaitRankStatus{Stopped}` registered over the renumbered
+        // slice while the service runs is deferred and flushed on stop. The
+        // flushed overlays land at slice-local ranks, within the slice region the
+        // accumulator was opened over, so the wait completes. Registering before
+        // the stop makes the deferred branch deterministic.
+        whole
+            .spawn_service::<testactor::TestActor, _>(instance, "svc_wait", &())
+            .await
+            .unwrap();
+        let sw = slice
+            .spawn_service::<testactor::TestActor, _>(instance, "svc_wait", &())
+            .await
+            .unwrap();
+        let id = sw.id().resource_id().clone();
+        let region = slice.region().clone();
+        let num_ranks = region.num_ranks();
+        let (port, rx) = instance.mailbox().open_accum_port_opts(
+            crate::StatusMesh::from_single(region.clone(), Status::NotExist),
+            StreamingReducerOpts {
+                max_update_interval: Some(Duration::from_millis(50)),
+                initial_update_interval: None,
+            },
+        );
+        slice
+            .agent_mesh()
+            .cast(
+                instance,
+                crate::resource::WaitRankStatus {
+                    id: id.clone(),
+                    // Filled by the cast layer with this recipient's dense view rank.
+                    rank: Default::default(),
+                    min_status: Status::Stopped,
+                    reply: port.bind(),
+                },
+            )
+            .unwrap();
+        slice
+            .agent_mesh()
+            .cast(
+                instance,
+                crate::resource::Stop {
+                    id: id.clone(),
+                    reason: "test".to_string(),
+                },
+            )
+            .unwrap();
+        let statuses = crate::resource::GetRankStatus::wait(
+            rx,
+            num_ranks,
+            hyperactor_config::global::get(ACTOR_SPAWN_MAX_IDLE),
+            region,
+        )
+        .await
+        .unwrap();
+        assert!(
+            statuses.values().all(|s| s.is_terminating()),
+            "deferred waiters flushed at slice-local ranks: {statuses:?}",
+        );
+
+        hm.shutdown(instance)
+            .await
+            .expect("host mesh shutdown should complete");
+    }
+
+    #[async_timed_test(timeout_secs = 120)]
+    #[cfg(fbcode_build)]
+    async fn test_spawn_actor_casting() {
+        let config = hyperactor_config::global::lock();
+        let _guard = config.override_key(PROC_SPAWN_MAX_IDLE, Duration::from_secs(120));
+        let _guard2 = config.override_key(
+            hyperactor::config::HOST_SPAWN_READY_TIMEOUT,
+            Duration::from_secs(120),
+        );
+        execute_spawn_actor().await;
+    }
+
+    #[async_timed_test(timeout_secs = 120)]
+    #[cfg(fbcode_build)]
+    async fn test_spawn_actor_casting_p2p() {
+        let config = hyperactor_config::global::lock();
+        let _guard = config.override_key(crate::config::V1_CAST_POINT_TO_POINT_THRESHOLD, 1024);
+        let _guard2 = config.override_key(PROC_SPAWN_MAX_IDLE, Duration::from_secs(120));
+        let _guard3 = config.override_key(
+            hyperactor::config::HOST_SPAWN_READY_TIMEOUT,
+            Duration::from_secs(120),
+        );
+        execute_spawn_actor().await;
+    }
+
+    /// Spawn an actor mesh, then do a random number of casts to bump the seq
+    /// numbers for all actors participating in the cast. This avoids the test
+    /// mistakenly passing.
+    #[cfg(fbcode_build)]
+    async fn spawn_for_seq_test(
+        cx: &Instance<testing::TestRootClient>,
+        proc_mesh: &super::ProcMeshRef,
+    ) -> ActorMesh<testactor::TestActor> {
+        let actor_mesh: ActorMesh<testactor::TestActor> =
+            proc_mesh.spawn(cx, "test", &()).await.unwrap();
+
+        let instance = cx
+            .proc()
+            .client(&format!("random_casts_{}", Uuid::now_v7()));
+        let n = 1;
+        for _ in 0..n {
+            actor_mesh.cast(&instance, ()).unwrap();
+        }
+        println!(
+            "did {} casts with sequencer session id {}",
+            n,
+            instance.sequencer().session_id()
+        );
+        actor_mesh
+    }
+
+    #[async_timed_test(timeout_secs = 60)]
+    #[cfg(fbcode_build)]
+    async fn test_seq_from_same_sender_to_different_meshes() {
+        let config = hyperactor_config::global::lock();
+        let _guard = config.override_key(PROC_SPAWN_MAX_IDLE, Duration::from_secs(60));
+        let _guard2 = config.override_key(
+            hyperactor::config::HOST_SPAWN_READY_TIMEOUT,
+            Duration::from_secs(60),
+        );
+
+        hyperactor_telemetry::initialize_logging_for_test();
+        let instance = testing::instance();
+        let session_id = instance.sequencer().session_id();
+
+        let mut hm = testing::host_mesh(2).await;
+        let proc_mesh = hm
+            .spawn(&instance, "test", extent!(gpus = 1), None, None)
+            .await
+            .unwrap();
+        let proc_mesh_ref = proc_mesh.deref();
+
+        // Sequence numbers are scoped based on the (client, dest) pair.
+        // So casts to different meshes from the same client instance would
+        // result in seq 1 for all casts.
+        let handles = (0..3)
+            .map(|_| {
+                let proc_mesh_ref_clone = proc_mesh_ref.clone();
+                tokio::spawn(async move {
+                    let actor_mesh = spawn_for_seq_test(instance, &proc_mesh_ref_clone).await;
+                    let expected_seqs = vec![1; 2];
+                    testactor::assert_casting_correctness(
+                        &actor_mesh,
+                        instance,
+                        Some((session_id, expected_seqs)),
+                    )
+                    .await;
+                })
+            })
+            .collect::<Vec<_>>();
+        futures::future::join_all(handles).await;
+
+        let _ = hm.shutdown(instance).await;
+    }
+
+    /// Verify that the seq numbers are assigned correctly when we cast to
+    /// different views of the same root mesh.
+    #[async_timed_test(timeout_secs = 60)]
+    #[cfg(fbcode_build)]
+    async fn test_seq_from_same_sender_to_different_views() {
+        let config = hyperactor_config::global::lock();
+        let _guard = config.override_key(PROC_SPAWN_MAX_IDLE, Duration::from_secs(60));
+        let _guard2 = config.override_key(
+            hyperactor::config::HOST_SPAWN_READY_TIMEOUT,
+            Duration::from_secs(60),
+        );
+
+        hyperactor_telemetry::initialize_logging_for_test();
+
+        let instance = testing::instance();
+        let session_id = instance.sequencer().session_id();
+
+        let mut hm = testing::host_mesh(3).await;
+        let proc_mesh = hm
+            .spawn(&instance, "test", extent!(gpus = 1), None, None)
+            .await
+            .unwrap();
+
+        let actor_mesh = spawn_for_seq_test(instance, &proc_mesh).await;
+
+        // First cast. The seq should be 1 for all actors.
+        let expected_seqs = vec![1; 3];
+        testactor::assert_casting_correctness(
+            &actor_mesh,
+            instance,
+            Some((session_id, expected_seqs)),
+        )
+        .await;
+
+        // Verify casting to the sliced actor mesh
+        let sliced_actor_mesh = actor_mesh.range("hosts", 1..3).unwrap();
+        // Second cast. The seq should be 2 for actors in the sliced mesh.
+        let expected_seqs = vec![2; 2];
+        testactor::assert_casting_correctness(
+            &sliced_actor_mesh,
+            instance,
+            Some((session_id, expected_seqs)),
+        )
+        .await;
+
+        // Verify casting to a different sliced actor mesh
+        let sliced_actor_mesh = actor_mesh.range("hosts", 0..2).unwrap();
+        // For actors in the previous sliced mesh, the seq should be 3 since
+        // this is the third cast for them. For other actors, the seq should
+        // be 2.
+        let expected_seqs = vec![2, 3];
+        testactor::assert_casting_correctness(
+            &sliced_actor_mesh,
+            instance,
+            Some((session_id, expected_seqs)),
+        )
+        .await;
+
+        let _ = hm.shutdown(instance).await;
+    }
+
+    #[async_timed_test(timeout_secs = 60)]
+    #[cfg(fbcode_build)]
+    async fn test_seq_from_different_senders() {
+        let config = hyperactor_config::global::lock();
+        let _guard = config.override_key(PROC_SPAWN_MAX_IDLE, Duration::from_secs(60));
+        let _guard2 = config.override_key(
+            hyperactor::config::HOST_SPAWN_READY_TIMEOUT,
+            Duration::from_secs(60),
+        );
+
+        hyperactor_telemetry::initialize_logging_for_test();
+
+        use hyperactor::Proc;
+        use hyperactor::channel::ChannelTransport;
+
+        let proc = Proc::direct(ChannelTransport::Unix.any(), "test_0".to_string()).unwrap();
+        let instance = proc
+            .actor_instance::<testing::TestRootClient>("test_client")
+            .unwrap()
+            .instance;
+        let first_instance = proc
+            .actor_instance::<testing::TestRootClient>("first_client")
+            .unwrap()
+            .instance;
+        let second_instance = proc
+            .actor_instance::<testing::TestRootClient>("second_client")
+            .unwrap()
+            .instance;
+        let third_instance = proc
+            .actor_instance::<testing::TestRootClient>("third_client")
+            .unwrap()
+            .instance;
+
+        let mut hm = testing::host_mesh(2).await;
+        let proc_mesh = hm
+            .spawn(&instance, "test", extent!(gpus = 1), None, None)
+            .await
+            .unwrap();
+
+        let actor_mesh = spawn_for_seq_test(&instance, &proc_mesh).await;
+
+        // Sequence numbers are calculated based on the sequencer, i.e. the
+        // client name. So three casts would result in seq 1 for all actors.
+        for inst in [&first_instance, &second_instance, &third_instance] {
+            let expected_seqs = vec![1; 2];
+            let session_id = inst.sequencer().session_id();
+            testactor::assert_casting_correctness(
+                &actor_mesh,
+                inst,
+                Some((session_id, expected_seqs)),
+            )
+            .await;
+        }
+
+        let _ = hm.shutdown(&instance).await;
+    }
+
     #[cfg(fbcode_build)]
     #[assert_no_process_leak]
     #[tokio::test]
     async fn test_failing_spawn_actor() {
         hyperactor_telemetry::initialize_logging(hyperactor_telemetry::DefaultTelemetryClock {});
 
+        let config = hyperactor_config::global::lock();
+        let _guard = config.override_key(PROC_SPAWN_MAX_IDLE, Duration::from_secs(60));
+        let _guard2 = config.override_key(
+            hyperactor::config::HOST_SPAWN_READY_TIMEOUT,
+            Duration::from_secs(60),
+        );
+
         let instance = testing::instance();
 
-        let mut hm = testing::host_mesh(4).await;
+        let mut hm = testing::host_mesh(1).await;
         let proc_mesh = hm
-            .spawn(&instance, "test", extent!(gpus = 2), None)
+            .spawn(&instance, "test", extent!(gpus = 1), None, None)
             .await
             .unwrap();
         let err = proc_mesh
@@ -1082,8 +1877,169 @@ mod tests {
         let statuses = err.into_actor_spawn_error().unwrap();
         assert_eq!(
             statuses,
-            RankedValues::from((0..8, Status::Failed("test failure".to_string()))),
+            RankedValues::from((0..1, Status::Failed("test failure".to_string()))),
         );
+
+        let _ = hm.shutdown(instance).await;
+    }
+
+    #[cfg(fbcode_build)]
+    #[assert_no_process_leak]
+    #[tokio::test]
+    async fn test_failing_spawn_controllerless() {
+        hyperactor_telemetry::initialize_logging(hyperactor_telemetry::DefaultTelemetryClock {});
+
+        let config = hyperactor_config::global::lock();
+        let _guard = config.override_key(PROC_SPAWN_MAX_IDLE, Duration::from_secs(60));
+        let _guard2 = config.override_key(
+            hyperactor::config::HOST_SPAWN_READY_TIMEOUT,
+            Duration::from_secs(60),
+        );
+
+        let instance = testing::instance();
+
+        let mut hm = testing::host_mesh(1).await;
+        let proc_mesh = hm
+            .spawn(&instance, "test", extent!(gpus = 1), None, None)
+            .await
+            .unwrap();
+        // The controllerless path shares spawn_mesh_inner, so it must still run
+        // the bounded spawn wait and surface the same ActorSpawnError shape on a
+        // terminal init failure — identical to spawn/spawn_service.
+        let err = proc_mesh
+            .spawn_controllerless_service::<testactor::FailingCreateTestActor, _>(
+                instance,
+                "testfail_controllerless",
+                &(),
+            )
+            .await
+            .unwrap_err();
+        let statuses = err.into_actor_spawn_error().unwrap();
+        assert_eq!(
+            statuses,
+            RankedValues::from((0..1, Status::Failed("test failure".to_string()))),
+        );
+
+        let _ = hm.shutdown(instance).await;
+    }
+
+    #[async_timed_test(timeout_secs = 60)]
+    #[cfg(fbcode_build)]
+    async fn test_spawn_actor_on_proc_mesh_slice_only_spawns_slice_members() {
+        let instance = testing::instance();
+
+        let mut hm = testing::host_mesh(2).await;
+        let proc_mesh = hm
+            .spawn(&instance, "test", extent!(gpus = 2), None, None)
+            .await
+            .unwrap();
+        let host1 = proc_mesh.range("hosts", 1..2).unwrap();
+        let actor_name = crate::mesh_id::ActorMeshId::instance(
+            hyperactor::id::Label::new("slice_only").unwrap(),
+        );
+
+        let actor_mesh = host1
+            .spawn_with_name::<testactor::TestActor, _>(
+                instance,
+                actor_name.clone(),
+                &(),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        testactor::assert_casting_correctness(&actor_mesh, instance, None).await;
+
+        let slice_states = host1
+            .actor_states(instance, actor_name.clone())
+            .await
+            .unwrap();
+        assert_eq!(slice_states.extent(), host1.extent());
+
+        let err = proc_mesh
+            .actor_states(instance, actor_name.clone())
+            .await
+            .unwrap_err();
+        let expected_name = actor_name.into();
+        match err {
+            crate::Error::NotExist(name) if name == expected_name => {}
+            other => panic!("expected NotExist for {expected_name}, got {other:?}"),
+        }
+
+        let _ = hm.shutdown(instance).await;
+    }
+
+    /// `proc_states` must resolve exactly the procs of the (possibly sliced)
+    /// mesh it is called on — gpu-dim slices, host-dim slices, and
+    /// slice-of-slice — rather than re-deriving a dense `0..n` from per-host
+    /// counts or from the recipient's stamped (sliced-ordinal) rank.
+    #[cfg(fbcode_build)]
+    async fn assert_proc_states_match_slice<C: hyperactor::context::Actor>(
+        mesh: &super::ProcMeshRef,
+        cx: &C,
+    ) {
+        // The slice's own procs, by their original global rank.
+        let mut expected: Vec<usize> = mesh.ranks.iter().map(|r| r.create_rank).collect();
+        expected.sort();
+
+        let states = mesh
+            .states(cx, None)
+            .await
+            .unwrap()
+            .expect("host-backed mesh yields Some");
+
+        assert_eq!(states.extent(), mesh.extent());
+
+        let mut got: Vec<usize> = states
+            .values()
+            .map(|s| {
+                assert!(
+                    !matches!(
+                        s.status,
+                        Status::NotExist | Status::Failed(_) | Status::Timeout(_)
+                    ),
+                    "rank should resolve to a live proc, got status {:?}",
+                    s.status
+                );
+                s.state.expect("live proc carries ProcState").create_rank
+            })
+            .collect();
+
+        got.sort();
+
+        assert_eq!(
+            got, expected,
+            "proc_states must return exactly this (sub)mesh's procs"
+        );
+    }
+
+    #[async_timed_test(timeout_secs = 60)]
+    #[cfg(fbcode_build)]
+    async fn test_proc_states_on_sliced_mesh() {
+        let instance = testing::instance();
+        let mut hm = testing::host_mesh(2).await;
+        // 2 hosts x 4 gpus, host-major: global rank = host * 4 + gpu.
+        let proc_mesh = hm
+            .spawn(&instance, "test", extent!(gpus = 4), None, None)
+            .await
+            .unwrap();
+
+        // Full mesh: ranks 0..8.
+        assert_proc_states_match_slice(&proc_mesh, instance).await;
+        // gpu-dim slice (gpus 2..4): ranks {2,3,6,7} — the original mis-derivation.
+        assert_proc_states_match_slice(&proc_mesh.range("gpus", 2..4).unwrap(), instance).await;
+        // host-dim slice (host 1): ranks {4,5,6,7} — the stamped-ordinal trap.
+        assert_proc_states_match_slice(&proc_mesh.range("hosts", 1..2).unwrap(), instance).await;
+        // slice-of-slice (host 1, gpus 2..4): ranks {6,7} — pins base-rank composition.
+        assert_proc_states_match_slice(
+            &proc_mesh
+                .range("gpus", 2..4)
+                .unwrap()
+                .range("hosts", 1..2)
+                .unwrap(),
+            instance,
+        )
+        .await;
 
         let _ = hm.shutdown(instance).await;
     }
@@ -1109,5 +2065,78 @@ mod tests {
             python_class_from_supervision_name("instance0.<NoModule mesh>"),
             None,
         );
+    }
+
+    // Compile-only proof that `spawn_controllerless_service` does NOT require
+    // `C::A: Handler<MeshFailure>` — the whole point of the controllerless
+    // path. This generic wrapper omits that bound and still type-checks; the
+    // identical wrapper over `spawn_service` would fail to compile. (Generic
+    // fn bodies are type-checked at definition, so this holds without ever
+    // being called.)
+    #[allow(dead_code)]
+    async fn _spawn_controllerless_needs_no_mesh_failure_handler<A, C>(
+        pm: &super::ProcMeshRef,
+        cx: &C,
+        name: &str,
+        params: &A::Params,
+    ) -> crate::Result<crate::ActorMesh<A>>
+    where
+        A: hyperactor::RemoteSpawn,
+        A::Params: hyperactor::RemoteMessage,
+        C: hyperactor::context::Actor,
+    {
+        pm.spawn_controllerless_service::<A, C>(cx, name, params)
+            .await
+    }
+
+    #[cfg(fbcode_build)]
+    async fn execute_spawn_controllerless() {
+        hyperactor_telemetry::initialize_logging(hyperactor_telemetry::DefaultTelemetryClock {});
+
+        let instance = testing::instance();
+
+        let mut hm = testing::host_mesh(2).await;
+        let proc_mesh = hm
+            .spawn(&instance, "test", extent!(gpus = 1), None, None)
+            .await
+            .unwrap();
+
+        // A controllerless service mesh has no ActorMeshController...
+        let controllerless = proc_mesh
+            .spawn_controllerless_service::<testactor::TestActor, _>(
+                instance,
+                "svc_controllerless",
+                &(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            controllerless.controller().is_none(),
+            "spawn_controllerless_service must not create a controller",
+        );
+
+        // ...whereas an ordinary service mesh does (contrast).
+        let with_controller = proc_mesh
+            .spawn_service::<testactor::TestActor, _>(instance, "svc_with_controller", &())
+            .await
+            .unwrap();
+        assert!(
+            with_controller.controller().is_some(),
+            "spawn_service must create a controller",
+        );
+
+        let _ = hm.shutdown(instance).await;
+    }
+
+    #[async_timed_test(timeout_secs = 120)]
+    #[cfg(fbcode_build)]
+    async fn test_spawn_controllerless_service() {
+        let config = hyperactor_config::global::lock();
+        let _guard = config.override_key(PROC_SPAWN_MAX_IDLE, Duration::from_secs(120));
+        let _guard2 = config.override_key(
+            hyperactor::config::HOST_SPAWN_READY_TIMEOUT,
+            Duration::from_secs(120),
+        );
+        execute_spawn_controllerless().await;
     }
 }

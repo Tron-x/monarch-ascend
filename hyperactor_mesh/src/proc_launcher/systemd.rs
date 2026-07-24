@@ -71,7 +71,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use hyperactor as hyperactor_reference;
 use hyperactor::channel::ChannelAddr;
 use tokio::sync::oneshot;
 use tracing::Instrument;
@@ -1102,6 +1101,7 @@ mod tests {
     use hyperactor::testing::ids::test_proc_id;
 
     use super::*;
+    use crate::mesh_id::ResourceId;
 
     // Helpers
 
@@ -1190,10 +1190,11 @@ mod tests {
 
         let launcher = SystemdProcLauncher::new();
 
-        let proc_id = hyperactor::ProcAddr::from_resource_name(any_unix_addr(), "env-vars");
+        let proc_id = ResourceId::proc_addr_from_name(any_unix_addr(), "env-vars");
         // The bootstrap payload content doesn't matter for this test.
         let bootstrap = Bootstrap::Host {
             addr: any_unix_addr(),
+            callback_addr: any_unix_addr(),
             command: None,
             config: None,
             exit_on_shutdown: false,
@@ -1295,11 +1296,12 @@ mod tests {
         // The bootstrap payload content doesn't matter for this test.
         let bootstrap = Bootstrap::Host {
             addr: any_unix_addr(),
+            callback_addr: any_unix_addr(),
             command: None,
             config: None,
             exit_on_shutdown: false,
         };
-        let proc_id = hyperactor::ProcAddr::from_resource_name(any_unix_addr(), "exit-7");
+        let proc_id = ResourceId::proc_addr_from_name(any_unix_addr(), "exit-7");
         let opts = LaunchOptions {
             command: with_sh("exit 7"),
             bootstrap_payload: bootstrap.to_env_safe_string().unwrap(),
@@ -1342,11 +1344,12 @@ mod tests {
         // The bootstrap payload content doesn't matter for this test.
         let bootstrap = Bootstrap::Host {
             addr: any_unix_addr(),
+            callback_addr: any_unix_addr(),
             command: None,
             config: None,
             exit_on_shutdown: false,
         };
-        let proc_id = hyperactor::ProcAddr::from_resource_name(any_unix_addr(), "killed");
+        let proc_id = ResourceId::proc_addr_from_name(any_unix_addr(), "killed");
         let opts = LaunchOptions {
             command: with_sh("sleep 30"),
             bootstrap_payload: bootstrap.to_env_safe_string().unwrap(),
@@ -1409,11 +1412,12 @@ mod tests {
         // The bootstrap payload content doesn't matter for this test.
         let bootstrap = Bootstrap::Host {
             addr: any_unix_addr(),
+            callback_addr: any_unix_addr(),
             command: None,
             config: None,
             exit_on_shutdown: false,
         };
-        let proc_id = hyperactor::ProcAddr::from_resource_name(any_unix_addr(), "terminated");
+        let proc_id = ResourceId::proc_addr_from_name(any_unix_addr(), "terminated");
         let opts = LaunchOptions {
             command: with_sh("sleep 30"),
             bootstrap_payload: bootstrap.to_env_safe_string().unwrap(),
@@ -1457,7 +1461,7 @@ mod tests {
 
         let launcher = SystemdProcLauncher::new();
 
-        let unknown_proc_id = hyperactor::ProcAddr::from_resource_name(any_unix_addr(), "unknown");
+        let unknown_proc_id = ResourceId::proc_addr_from_name(any_unix_addr(), "unknown");
 
         let result = launcher
             .terminate(&unknown_proc_id, Duration::from_secs(1))
@@ -1479,7 +1483,7 @@ mod tests {
 
         let launcher = SystemdProcLauncher::new();
 
-        let unknown_proc_id = hyperactor::ProcAddr::from_resource_name(any_unix_addr(), "unknown");
+        let unknown_proc_id = ResourceId::proc_addr_from_name(any_unix_addr(), "unknown");
 
         let result = launcher.kill(&unknown_proc_id).await;
 
@@ -1584,12 +1588,12 @@ mod tests {
         // The bootstrap payload content doesn't matter for this test.
         let bootstrap = Bootstrap::Host {
             addr: any_unix_addr(),
+            callback_addr: any_unix_addr(),
             command: None,
             config: None,
             exit_on_shutdown: false,
         };
-        let proc_id =
-            hyperactor::ProcAddr::from_resource_name(any_unix_addr(), "drop-cleanup-test");
+        let proc_id = ResourceId::proc_addr_from_name(any_unix_addr(), "drop-cleanup-test");
 
         let exit_rx;
 
@@ -1623,10 +1627,10 @@ mod tests {
             // was still alive.
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
-                if let Ok(content) = std::fs::read_to_string(&marker) {
-                    if content.contains("running") {
-                        break;
-                    }
+                if let Ok(content) = std::fs::read_to_string(&marker)
+                    && content.contains("running")
+                {
+                    break;
                 }
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -1688,10 +1692,11 @@ mod tests {
 
         let launcher = SystemdProcLauncher::new();
 
-        let proc_id = hyperactor::ProcAddr::from_resource_name(any_unix_addr(), "long-running");
+        let proc_id = ResourceId::proc_addr_from_name(any_unix_addr(), "long-running");
         // The bootstrap payload content doesn't matter for this test.
         let bootstrap = Bootstrap::Host {
             addr: any_unix_addr(),
+            callback_addr: any_unix_addr(),
             command: None,
             config: None,
             exit_on_shutdown: false,

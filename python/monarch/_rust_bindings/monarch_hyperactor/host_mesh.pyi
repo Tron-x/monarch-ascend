@@ -6,12 +6,12 @@
 
 # pyre-strict
 
-from typing import Any, final
+from typing import Any, Callable, final
 
 from monarch._rust_bindings.monarch_hyperactor.context import Instance
 from monarch._rust_bindings.monarch_hyperactor.proc_mesh import ProcMesh
 from monarch._rust_bindings.monarch_hyperactor.pytokio import PythonTask
-from monarch._rust_bindings.monarch_hyperactor.shape import Extent, Region
+from monarch._rust_bindings.monarch_hyperactor.shape import Extent, Point, Region
 
 @final
 class HostMesh:
@@ -21,6 +21,7 @@ class HostMesh:
         name: str,
         per_host: Extent,
         proc_bind: list[dict[str, str]] | None = None,
+        per_rank_bootstrap: Callable[[Point], BootstrapCommand] | None = None,
     ) -> PythonTask[ProcMesh]:
         """
         Spawn a new actor on this mesh.
@@ -29,6 +30,11 @@ class HostMesh:
         - `instance`: The instance to use to spawn the mesh.
         - `name`: Name of the proc mesh
         - `per_host`: Extent describing the shape of the proc mesh on each host.
+        - `proc_bind`: Optional per-process CPU/NUMA binding config.
+        - `per_rank_bootstrap`: Optional callable invoked once per proc with
+          that proc's ``Point`` over the combined ``host ⊕ per_host``
+          extent; its returned ``BootstrapCommand`` is used for that proc.
+          Scoped to this spawn; the mesh itself is not mutated.
         """
         ...
 
@@ -59,6 +65,7 @@ class HostMesh:
         ...
 
     def __reduce__(self) -> Any: ...
+    # pyrefly: ignore [bad-override]
     def __eq__(self, other: "HostMesh") -> bool: ...
     def shutdown(self, instance: Instance) -> PythonTask[None]:
         """
@@ -102,9 +109,20 @@ class BootstrapCommand:
         ...
 
     def __repr__(self) -> str: ...
+    def with_env(self, env: dict[str, str]) -> "BootstrapCommand":
+        """
+        Return a copy of this command with `env` merged on top of its
+        environment. Keys in `env` override any conflicting keys in the
+        existing environment.
+
+        Arguments:
+        - `env`: Additional environment variables to merge.
+        """
+        ...
 
 def bootstrap_host(
     bootstrap_cmd: BootstrapCommand | None,
+    via: str | None = None,
 ) -> PythonTask[tuple[HostMesh, ProcMesh, Instance]]:
     """
     Bootstrap a host mesh in this process, returning the host mesh,
@@ -112,6 +130,14 @@ def bootstrap_host(
 
     Arguments:
     - `bootstrap_cmd`: The bootstrap command to use to bootstrap the host.
+    - `via`: Optional ZMQ-style address of a remote host's duplex server.
+      When set, the local host's gateway is attached to that remote
+      gateway: outbound traffic to unknown destinations is forwarded over
+      the duplex, and inbound traffic from the duplex is delivered into
+      local procs. `this_host()` still names the current machine; `via`
+      only controls how this host's procs are reached. It must be supplied
+      before actor and port refs are minted, because those refs snapshot
+      their location. Supplied via the `attach` entrypoint.
     """
     ...
 
@@ -131,7 +157,7 @@ def shutdown_local_host_mesh() -> PythonTask[None]:
 class PyMeshAdminRef:
     """Opaque capability token for ActorRef<MeshAdminAgent>.
     No methods — used only to transport the typed ref across the
-    Python boundary from _spawn_admin to _start_periodic_snapshots."""
+    Python boundary from _spawn_admin to _start_periodic_snapshots_http."""
 
     ...
 

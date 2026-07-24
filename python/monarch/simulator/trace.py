@@ -358,6 +358,7 @@ class MemoryViewer:
             action: Literal["alloc", "free_requested"] = "free_requested"
 
         frames: List[Frame] = [
+            # pyrefly: ignore [bad-assignment]
             {"filename": frame.filename, "line": frame.lineno, "name": frame.name}
             for frame in _filter_traceback(traceback)
         ]
@@ -372,7 +373,6 @@ class MemoryViewer:
         self.snapshot["device_traces"][-1].append(trace)
         if delta < 0:
             self.snapshot["device_traces"][-1].append(
-                # pyre-ignore
                 {**trace, "action": "free_completed"}
             )
 

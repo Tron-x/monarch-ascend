@@ -4,7 +4,7 @@
 #   1. setup.py needs to detect torch installation paths and C++11 ABI
 #   2. C++ extensions (monarch.common._C, gradient_generator) link against libtorch
 #   3. Build-time torch detection determines whether to enable tensor_engine feature
-# The torch index is controlled by [tool.uv.sources] below (e.g., pytorch-cu128)
+# The torch index is controlled by [tool.uv.sources] below (e.g., pytorch-cu132)
 requires = ["setuptools>=77", "setuptools-rust", "wheel", "numpy", "torch"]
 build-backend = "setuptools.build_meta"
 
@@ -20,7 +20,7 @@ authors = [
     {name = "Meta", email = "oncall+monarch@xmail.facebook.com"}
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Operating System :: POSIX :: Linux",
@@ -42,13 +42,12 @@ dependencies = [
     "pyre-extensions",
     "typing-extensions>=4.12",
     "cloudpickle",
-    "torchx-nightly",
+    # torchx-nightly is an optional dependency; see the `torchx` extra below.
     "lark",
     "tabulate",
     "opentelemetry-api",
     "clusterscope",
     "flask>=2.0",
-    "xxhash",
     "py-spy",
 ]
 
@@ -71,15 +70,20 @@ url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
+
+[[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
 # Override with: uv sync --extra-index-url https://download.pytorch.org/whl/nightly/{platform} e.g.
-# uv sync --extra-index-url https://download.pytorch.org/whl/nightly/cu128
+# uv sync --extra-index-url https://download.pytorch.org/whl/nightly/cu132
 torch = [
-    { index = "pytorch-cu128", marker = "sys_platform != 'darwin'"  },
+    { index = "pytorch-cu132", marker = "sys_platform != 'darwin'"  },
     # MacOS cannot have cuda symbols, so default to CPU.
     { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
 ]
@@ -109,6 +113,10 @@ examples = [
     "ipython",
     "psutil",
 ]
+torchx = [
+    # Optional dependency — only needed for TorchX-backed scheduling / job launching.
+    "torchx-nightly",
+]
 test = [
     "kubernetes",
     "pytest",
@@ -116,6 +124,7 @@ test = [
     "pytest-asyncio",
     "pytest-xdist",
     "pyright",
+    "torchx-nightly",
 ]
 kubernetes = [
     "kubernetes",
@@ -123,6 +132,19 @@ kubernetes = [
 
 # Modern dependency groups for uv
 [dependency-groups]
+docs = [
+    "sphinx>=6.2.1",
+    "pytorch-sphinx-theme2",
+    "sphinxcontrib.katex>=0.9.10",
+    "docutils>=0.18.1,<0.21",
+    "sphinx-design>=0.6.0",
+    "sphinxcontrib-mermaid>=0.9.2",
+    "myst-parser",
+    "sphinx-gallery>=0.14.0",
+    "sphinx-sitemap>=2.7.1",
+    "sphinxext-opengraph",
+    "pillow",
+]
 dev = [
     "pytest>=7.0",
     "pytest-timeout>=2.0",
@@ -131,14 +153,16 @@ dev = [
     "pytest-split",
     "pyright>=1.1",
     "torch>=2.9.1",
+    "torchx-nightly",
     "setuptools-rust",
 ]
 
 [project.urls]
-Homepage = "https://meta-pytorch.org/monarch/"
-Documentation = "https://meta-pytorch.org/monarch/"
-Repository = "https://github.com/meta-pytorch/monarch"
-Issues = "https://github.com/meta-pytorch/monarch/issues"
+homepage = "https://meta-pytorch.org/monarch/"
+documentation = "https://meta-pytorch.org/monarch/"
+source = "https://github.com/meta-pytorch/monarch"
+issues = "https://github.com/meta-pytorch/monarch/issues"
+releasenotes = "https://github.com/meta-pytorch/monarch/releases"
 
 [project.scripts]
 monarch = "monarch.tools.cli:main"
@@ -162,3 +186,23 @@ markers = [
 asyncio_mode = "auto"
 # Default timeout of 5 minutes
 timeout = 300
+
+[tool.pyrefly]
+project-includes = [
+    "**/*.py*",
+    "**/*.ipynb",
+]
+
+# Formatting code
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint.isort]
+case-sensitive = false
+combine-as-imports = true
+detect-same-package = false
+order-by-type = false
+
+[tool.ufmt]
+formatter = "ruff-api"
+sorter = "ruff-api"

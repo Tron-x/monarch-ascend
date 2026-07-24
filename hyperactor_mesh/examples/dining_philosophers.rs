@@ -17,17 +17,16 @@ use async_trait::async_trait;
 use clap::Parser;
 use hyperactor as reference;
 use hyperactor::Actor;
-use hyperactor::Bind;
 use hyperactor::Context;
+use hyperactor::Endpoint as _;
 use hyperactor::Handler;
 use hyperactor::Instance;
 use hyperactor::RemoteSpawn;
-use hyperactor::Unbind;
 use hyperactor::context;
 use hyperactor_config::Flattrs;
 use hyperactor_mesh::ActorMesh;
 use hyperactor_mesh::ActorMeshRef;
-use hyperactor_mesh::comm::multicast::CastInfo;
+use hyperactor_mesh::casting::CastInfo;
 use hyperactor_mesh::context;
 use hyperactor_mesh::host_mesh::HostMesh;
 use hyperactor_mesh::host_mesh::spawn_admin;
@@ -59,7 +58,7 @@ enum ChopstickStatus {
 }
 
 #[derive(Debug)]
-#[hyperactor::export(PhilosopherMessage { cast = true })]
+#[hyperactor::export(PhilosopherMessage)]
 #[hyperactor::spawnable]
 struct PhilosopherActor {
     /// Status of left and right chopsticks
@@ -73,9 +72,13 @@ struct PhilosopherActor {
 }
 
 /// Message from the waiter to a philosopher
-#[derive(Debug, Serialize, Deserialize, Named, Clone, Bind, Unbind)]
+#[derive(Debug, Serialize, Deserialize, Named, Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "example actor message with PortRef; boxing fields would make the example harder to read"
+)]
 enum PhilosopherMessage {
-    Start(#[binding(include)] reference::PortRef<WaiterMessage>),
+    Start(reference::PortRef<WaiterMessage>),
     GrantChopstick(usize),
 }
 
@@ -123,10 +126,10 @@ impl PhilosopherActor {
         self.waiter
             .get()
             .ok_or(anyhow::anyhow!("uninitialized waiter port"))?
-            .send(
+            .post(
                 cx,
                 WaiterMessage::RequestChopsticks((self.rank, left, right)),
-            )?;
+            );
         self.chopsticks = (ChopstickStatus::Requested, ChopstickStatus::Requested);
         Ok(())
     }
@@ -142,7 +145,7 @@ impl PhilosopherActor {
         self.waiter
             .get()
             .ok_or(anyhow::anyhow!("uninitialized waiter port"))?
-            .send(cx, WaiterMessage::ReleaseChopsticks((left, right)))?;
+            .post(cx, WaiterMessage::ReleaseChopsticks((left, right)));
         self.chopsticks = (ChopstickStatus::None, ChopstickStatus::None);
         Ok(())
     }
@@ -295,7 +298,7 @@ async fn main() -> Result<ExitCode> {
         "  - Diagnose:      cargo run -p hyperactor_mesh_admin_tui_lib --bin hyperactor_mesh_admin_tui -- --addr {} --diagnose",
         mesh_admin_url
     );
-    let host_addr = &host_mesh.hosts()[0];
+    let host_addr = &host_mesh.host_addrs()[0];
     println!(
         "  - Hyper list:    buck2 run fbcode//monarch/hyper:hyper -- list {}\n                   cargo run --manifest-path hyper/Cargo.toml -- list {}",
         host_addr, host_addr
@@ -310,6 +313,7 @@ async fn main() -> Result<ExitCode> {
             instance,
             "philosophers",
             extent!(replica = group_size),
+            None,
             None,
         )
         .await?;

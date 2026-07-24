@@ -25,6 +25,7 @@
 - Do NOT add headers (e.g., in comments) to denote different sections of code; only use modules, structs, impl blocks, etc. for organization.
 - Use "that" for restrictive clauses (essential to meaning, no commas) and "which" for non-restrictive clauses (additional info, set off by commas). "The actor that crashed must be restarted" (identifies a specific actor) vs "The actor, which was created yesterday, is still running" (adds extra detail about an already-identified actor).
 - In Rust code, error messages are concise lowercase sentences without trailing punctuation
+- The same is true for all *log* (tracing) messages: they should begin with a lowercase letter, and be concise sentences without trailing punctuation; use ":" to denote context, e.g., "operation xyz: disk i/o error"; use structured logging whenever possible
 - In Rust, avoid creating type aliases in `use` statements; prefer to use qualified identifiers to disambiguate
 
 
@@ -87,11 +88,11 @@ For external/open-source development:
 ```bash
 # Build with tensor_engine (CUDA/GPU support) - default
 uv sync
-python setup.py bdist_wheel
+uv build --wheel --no-build-isolation
 
 # Build without tensor_engine (CPU-only)
 USE_TENSOR_ENGINE=0 uv sync
-USE_TENSOR_ENGINE=0 python setup.py bdist_wheel
+USE_TENSOR_ENGINE=0 uv build --wheel --no-build-isolation
 
 # Development installation
 pip install -e .
@@ -108,9 +109,9 @@ uv sync
 - `MONARCH_GPU_PLATFORM` - Select GPU platform: `cuda`, `rocm`, or `none` (CPU-only tensor engine). Leave unset to auto-detect; required when both CUDA and ROCm are installed
 
 **PyTorch Index Configuration:**
-The project uses PyTorch from specific indices (see `pyproject.toml`). Default is `pytorch-cu128`. To change:
+The project uses PyTorch from specific indices (see `pyproject.toml`). Default is `pytorch-cu132`. To change:
 ```bash
-uv sync --extra-index-url https://download.pytorch.org/whl/cu126
+uv sync --extra-index-url https://download.pytorch.org/whl/cu130
 ```
 
 ### Meta Internal Build (Buck2)
@@ -138,7 +139,7 @@ The `check` script provides a unified workflow for linting, typechecking, and te
 ```bash
 # Full build with GPU support (requires CUDA, torch, RDMA libraries)
 uv sync
-python setup.py bdist_wheel
+uv build --wheel --no-build-isolation
 
 # CPU-only build (no CUDA/RDMA required)
 USE_TENSOR_ENGINE=0 uv sync
@@ -303,7 +304,7 @@ Default pytest timeout is 5 minutes (configured in `pyproject.toml`).
 
 1. **Rust Python Linking Errors**: If you see "could not find native static library `python3.12`", activate your Python environment first
 2. **C++11 ABI Mismatches**: The build auto-detects PyTorch's ABI, but mismatches cause runtime errors
-3. **CUDA Version Mismatches**: Ensure your CUDA installation matches the PyTorch index (e.g., cu128 = CUDA 12.8)
+3. **CUDA Version Mismatches**: Ensure your CUDA installation matches the PyTorch index (e.g., cu132 = CUDA 13.2)
 4. **Missing tensor_engine**: If you get import errors for RDMA/distributed tensors, rebuild with `USE_TENSOR_ENGINE=1`
 
 ## Development Workflow
@@ -311,7 +312,7 @@ Default pytest timeout is 5 minutes (configured in `pyproject.toml`).
 ### OSS Contribution Workflow
 
 1. Make changes to Rust or Python code
-2. Build: `uv sync && python setup.py develop`
+2. Build: `uv sync`
 3. Test: `uv run pytest python/tests/ -v -m "not oss_skip"`
 4. Run Rust tests: `uv run cargo nextest run`
 5. Format: `cargo fmt` (Rust), ensure `.flake8` compliance (Python)
@@ -329,7 +330,7 @@ Default pytest timeout is 5 minutes (configured in `pyproject.toml`).
 - `setup.py` - Build configuration, extension definitions, environment detection
 - `Cargo.toml` - Rust workspace definition
 - `.cargo/config.toml` - Rust build flags (`tracing_unstable`)
-- `rust-toolchain` - Pinned to `nightly-2026-01-18`
+- `rust-toolchain` - Pinned to `nightly-2026-04-11`
 - `.flake8` - Python linting configuration (max-line-length: 256)
 - `docs/source/conf.py` - Sphinx documentation configuration
 

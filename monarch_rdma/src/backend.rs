@@ -11,8 +11,8 @@
 //! On GPU: ibverbs backend (rdmaxcel) for InfiniBand/RoCE.
 //! On NPU: HIXL backend for Ascend RDMA/RoCE/HCCS.
 
-#[cfg(all(test, not(feature = "hixl")))]
-pub(crate) mod cuda_test_utils;
+#[cfg(all(any(test, feature = "test-utils"), not(feature = "hixl")))]
+pub mod cuda_test_utils;
 #[cfg(not(feature = "hixl"))]
 pub mod ibverbs;
 #[cfg(not(feature = "hixl"))]
@@ -22,106 +22,351 @@ pub mod tcp;
 pub mod hixl;
 
 use std::fmt::Debug;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use hyperactor as reference;
+use hyperactor::context;
 use serde::Deserialize;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
+use typeuri::Named;
 
 use crate::RdmaOp;
 use crate::RdmaTransportLevel;
+#[cfg(feature = "hixl")]
+use crate::HixlConfig;
+#[cfg(not(feature = "hixl"))]
+use crate::backend::ibverbs::efa_device::EfaDevice;
+#[cfg(not(feature = "hixl"))]
+use crate::backend::ibverbs::manager_actor::IbvBackend;
+#[cfg(not(feature = "hixl"))]
+use crate::backend::ibverbs::mlx_device::MlxDevice;
+#[cfg(not(feature = "hixl"))]
+use crate::backend::ibverbs::primitives::IbvConfig;
+#[cfg(not(feature = "hixl"))]
+use crate::backend::tcp::manager_actor::TcpBackend;
+use crate::local_memory::KeepaliveLocalMemory;
+use crate::rdma_components::RdmaRemoteBuffer;
 
-/// Backend-specific context for a remote buffer.
-///
-/// - **Ibverbs**: native Rust-managed QP/MR transport (GPU).
-/// - **Tcp**: TCP fallback transport.
-/// - **Hixl**: Rust-managed HIXL transport (Ascend NPU).
-#[derive(Debug, Clone)]
-pub enum RdmaRemoteBackendContext {
+/// Configuration for spawning RDMA backends.
+#[derive(Debug, Clone, Default)]
+pub struct RdmaConfig {
+    /// Configuration for ibverbs-based backends.
     #[cfg(not(feature = "hixl"))]
-    Ibverbs(
-        reference::ActorRef<ibverbs::manager_actor::IbvManagerActor>,
-        Arc<tokio::sync::OnceCell<ibverbs::IbvBuffer>>,
-    ),
-    #[cfg(not(feature = "hixl"))]
-    Tcp(reference::ActorRef<tcp::manager_actor::TcpManagerActor>),
+    pub(crate) ibv: Option<IbvConfig>,
+    /// Configuration for the HiXL backend.
     #[cfg(feature = "hixl")]
-    Hixl(hixl::HixlBuffer),
+    pub(crate) hixl: Option<HixlConfig>,
 }
 
-impl Serialize for RdmaRemoteBackendContext {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            #[cfg(not(feature = "hixl"))]
-            RdmaRemoteBackendContext::Ibverbs(actor_ref, _) => serializer
-                .serialize_newtype_variant("RdmaRemoteBackendContext", 0, "Ibverbs", actor_ref),
-            #[cfg(not(feature = "hixl"))]
-            RdmaRemoteBackendContext::Tcp(actor_ref) => serializer.serialize_newtype_variant(
-                "RdmaRemoteBackendContext",
-                1,
-                "Tcp",
-                actor_ref,
-            ),
-            #[cfg(feature = "hixl")]
-            RdmaRemoteBackendContext::Hixl(buf) => {
-                serializer.serialize_newtype_variant("RdmaRemoteBackendContext", 0, "Hixl", buf)
-            }
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for RdmaRemoteBackendContext {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(rename = "RdmaRemoteBackendContext")]
-        enum Repr {
-            #[cfg(not(feature = "hixl"))]
-            Ibverbs(reference::ActorRef<ibverbs::manager_actor::IbvManagerActor>),
-            #[cfg(not(feature = "hixl"))]
-            Tcp(reference::ActorRef<tcp::manager_actor::TcpManagerActor>),
-            #[cfg(feature = "hixl")]
-            Hixl(hixl::HixlBuffer),
-        }
-
-        match Repr::deserialize(deserializer)? {
-            #[cfg(not(feature = "hixl"))]
-            Repr::Ibverbs(actor_ref) => Ok(RdmaRemoteBackendContext::Ibverbs(
-                actor_ref,
-                Arc::new(tokio::sync::OnceCell::new()),
-            )),
-            #[cfg(not(feature = "hixl"))]
-            Repr::Tcp(actor_ref) => Ok(RdmaRemoteBackendContext::Tcp(actor_ref)),
-            #[cfg(feature = "hixl")]
-            Repr::Hixl(buf) => Ok(RdmaRemoteBackendContext::Hixl(buf)),
-        }
-    }
-}
-
-/// Backend for executing RDMA operations over a specific transport.
+/// A transport backend for RDMA operations.
 ///
-/// Each backend manages the transport-specific details of connection
-/// management and data movement. The backend decides internally how to
-/// batch and schedule submitted operations.
-///
-/// Current implementations:
-/// - [`ibverbs::IbvManagerActor`] -- ibverbs NIC transport
-/// - [`tcp::TcpManagerActor`] -- TCP fallback transport
-/// - `hixl::HixlManagerActor` -- HIXL transport (Ascend NPU, feature `hixl`)
+/// Implementors (e.g. [`IbvBackend<I>`], [`TcpBackend`]) are assembled
+/// into the [`RdmaBackendHandle`] and [`RdmaRemoteBackends`] registries
+/// by [`register_rdma_backends!`].
 #[async_trait]
-pub trait RdmaBackend: Send + Debug {
+pub trait RdmaBackend: Clone + Debug + Send + Sync + 'static {
+    /// Serializable per-buffer context carried on the wire.
+    type RemoteBackendContext: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static;
+
+    /// Backend-specific transport details (e.g. a cffi struct with raw
+    /// ibverbs handles for GPU-initiated RDMA).
     type TransportInfo;
 
+    /// Whether this backend is available on this host in the current proc.
+    /// Returns false if the backend is supported on the host but is
+    /// disabled by a config.
+    fn available() -> bool;
+
+    /// The transport level this backend provides.
+    fn transport_level(&self) -> RdmaTransportLevel;
+
+    /// Low-level transport details for direct control over RDMA
+    /// operations (e.g. from a GPU kernel).
+    fn transport_info(&self) -> Option<Self::TransportInfo>;
+
+    /// Spawn the backend's actor(s) as children of `cx` and return its handle.
+    async fn spawn(cx: &(impl context::Actor + Send + Sync), config: &RdmaConfig) -> Result<Self>
+    where
+        Self: Sized;
+
+    /// Register `local` for remote access and return its wire context.
+    async fn register_remote_buffer(
+        &self,
+        cx: &(impl context::Actor + Send + Sync),
+        remote_buf_id: usize,
+        local: KeepaliveLocalMemory,
+    ) -> Result<Self::RemoteBackendContext>;
+
+    /// Release a buffer registration by id.
+    async fn release_buffer(
+        &self,
+        cx: &(impl context::Actor + Send + Sync),
+        remote_buf_id: usize,
+    ) -> Result<()>;
+
+    /// Submit a batch of ops to this backend.
     async fn submit(
-        &mut self,
-        cx: &(impl hyperactor::context::Actor + Send + Sync),
+        &self,
+        cx: &(impl context::Actor + Send + Sync),
         ops: Vec<RdmaOp>,
         timeout: Duration,
     ) -> Result<()>;
+}
 
-    fn transport_level(&self) -> RdmaTransportLevel;
+/// Resolves backend `B`'s context from a buffer's advertised backends.
+/// One impl per backend is generated by [`register_rdma_backends!`].
+#[cfg_attr(feature = "hixl", allow(dead_code))]
+pub(crate) trait ResolveRemoteBackendContext<B: RdmaBackend> {
+    fn resolve(&self) -> Option<B::RemoteBackendContext>;
+}
 
-    fn transport_info(&self) -> Option<Self::TransportInfo>;
+/// Derives the per-process RDMA backend registry from a list of
+/// `Variant: Handle` pairs, where each `Handle` implements
+/// [`RdmaBackend`].
+///
+/// The expansion defines [`RdmaRemoteBackends`] (a buffer's per-backend
+/// wire contexts) with its [`ResolveRemoteBackendContext`] impls and
+/// `RdmaRemoteBuffer::resolve_<name>` accessors, [`RdmaBackendHandle`]
+/// and its `submit` dispatch, and [`RdmaBackends`] (the proc's spawned
+/// backends). The list order is the routing priority.
+macro_rules! register_rdma_backends {
+    ($($variant:ident: $handle:ty),+ $(,)?) => {
+        paste::paste! {
+            /// The backends a buffer is reachable through, one slot per backend.
+            #[derive(Debug, Clone, Serialize, Deserialize, Named, Default)]
+            pub(crate) struct RdmaRemoteBackends {
+                $(pub(crate) [<$variant:lower>]: Option<<$handle as RdmaBackend>::RemoteBackendContext>,)+
+            }
+
+            $(
+                impl ResolveRemoteBackendContext<$handle> for RdmaRemoteBuffer {
+                    fn resolve(&self) -> Option<<$handle as RdmaBackend>::RemoteBackendContext> {
+                        self.[<resolve_ $variant:lower>]()
+                    }
+                }
+            )+
+
+            impl RdmaRemoteBuffer {
+                $(
+                    /// Context for this backend, if the buffer advertises it.
+                    pub fn [<resolve_ $variant:lower>](
+                        &self,
+                    ) -> Option<<$handle as RdmaBackend>::RemoteBackendContext> {
+                        self.backends.[<$variant:lower>].clone()
+                    }
+                )+
+
+                /// Whether this buffer advertises a backend compatible with `handle`.
+                pub(crate) fn is_compatible_with(&self, handle: &RdmaBackendHandle) -> bool {
+                    match handle {
+                        $(
+                            RdmaBackendHandle::$variant(_) => {
+                                self.backends.[<$variant:lower>].is_some()
+                            }
+                        )+
+                    }
+                }
+            }
+
+            /// The backends spawned on this proc.
+            #[derive(Debug, Default)]
+            pub(crate) struct RdmaBackends {
+                $([<$variant:lower>]: Option<$handle>,)+
+            }
+
+            impl RdmaBackends {
+                /// Spawn every [`available`](RdmaBackend::available) backend.
+                /// A backend that fails to spawn is skipped; bails only if no
+                /// backend spawns.
+                pub(crate) async fn spawn_available(
+                    cx: &(impl context::Actor + Send + Sync),
+                    config: &RdmaConfig,
+                ) -> Result<Self> {
+                    let mut backends = Self::default();
+                    let mut errors: Vec<String> = Vec::new();
+                    $(
+                        if <$handle as RdmaBackend>::available() {
+                            match <$handle as RdmaBackend>::spawn(cx, config).await {
+                                Ok(handle) => backends.[<$variant:lower>] = Some(handle),
+                                Err(e) => errors.push(format!("{}: {e}", stringify!($variant))),
+                            }
+                        }
+                    )+
+                    if backends.is_empty() {
+                        if errors.is_empty() {
+                            anyhow::bail!("no RDMA backend available");
+                        }
+                        anyhow::bail!(
+                            "all available RDMA backends failed to initialize: {}",
+                            errors.join("; ")
+                        );
+                    }
+                    if !errors.is_empty() {
+                        tracing::warn!("some RDMA backends failed to initialize: {}", errors.join("; "));
+                    }
+                    Ok(backends)
+                }
+
+                fn is_empty(&self) -> bool {
+                    $(self.[<$variant:lower>].is_none() &&)+ true
+                }
+
+                /// Handles for all spawned backends, in priority order.
+                pub(crate) fn handles(&self) -> Vec<RdmaBackendHandle> {
+                    let mut handles = Vec::new();
+                    $(
+                        if let Some(handle) = &self.[<$variant:lower>] {
+                            handles.push(RdmaBackendHandle::$variant(handle.clone()));
+                        }
+                    )+
+                    handles
+                }
+
+                /// Register `local` with every spawned backend. On the first
+                /// failure, release the backends that already registered and
+                /// return that error.
+                pub(crate) async fn register_all(
+                    &self,
+                    cx: &(impl context::Actor + Send + Sync),
+                    remote_buf_id: usize,
+                    local: KeepaliveLocalMemory,
+                ) -> Result<RdmaRemoteBackends> {
+                    let mut remotes = RdmaRemoteBackends::default();
+                    $(
+                        if let Some(handle) = &self.[<$variant:lower>] {
+                            match <$handle as RdmaBackend>::register_remote_buffer(
+                                handle,
+                                cx,
+                                remote_buf_id,
+                                local.clone(),
+                            )
+                            .await
+                            {
+                                Ok(context) => remotes.[<$variant:lower>] = Some(context),
+                                Err(e) => {
+                                    // Release only the backends that already
+                                    // registered: this one failed and later
+                                    // ones were never reached.
+                                    if let Err(release_err) =
+                                        self.release_registered(cx, remote_buf_id, &remotes).await
+                                    {
+                                        tracing::warn!("failed to release remote buffers after registration failure: {release_err}");
+                                    }
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    )+
+                    Ok(remotes)
+                }
+
+                /// Release `remote_buf_id` from only the backends that
+                /// successfully registered (those present in `registered`),
+                /// accumulating any failures.
+                async fn release_registered(
+                    &self,
+                    cx: &(impl context::Actor + Send + Sync),
+                    remote_buf_id: usize,
+                    registered: &RdmaRemoteBackends,
+                ) -> Result<()> {
+                    let mut errors: Vec<String> = Vec::new();
+                    $(
+                        if let Some(handle) = &self.[<$variant:lower>]
+                            && registered.[<$variant:lower>].is_some()
+                        {
+                            if let Err(e) =
+                                <$handle as RdmaBackend>::release_buffer(handle, cx, remote_buf_id).await
+                            {
+                                errors.push(format!("({}) {e}", stringify!($variant)));
+                            }
+                        }
+                    )+
+                    if errors.is_empty() {
+                        Ok(())
+                    } else {
+                        anyhow::bail!(
+                            "RDMA release failed on {} backend(s):\n{}",
+                            errors.len(),
+                            errors.join("\n")
+                        )
+                    }
+                }
+
+                /// Release `remote_buf_id` from every spawned backend,
+                /// accumulating any failures.
+                pub(crate) async fn release_all(
+                    &self,
+                    cx: &(impl context::Actor + Send + Sync),
+                    remote_buf_id: usize,
+                ) -> Result<()> {
+                    let mut errors: Vec<String> = Vec::new();
+                    $(
+                        if let Some(handle) = &self.[<$variant:lower>] {
+                            if let Err(e) =
+                                <$handle as RdmaBackend>::release_buffer(handle, cx, remote_buf_id).await
+                            {
+                                errors.push(format!("({}) {e}", stringify!($variant)));
+                            }
+                        }
+                    )+
+                    if errors.is_empty() {
+                        Ok(())
+                    } else {
+                        anyhow::bail!(
+                            "RDMA release failed on {} backend(s):\n{}",
+                            errors.len(),
+                            errors.join("\n")
+                        )
+                    }
+                }
+            }
+        }
+
+        wirevalue::register_type!(RdmaRemoteBackends);
+
+        /// Handle to a spawned backend.
+        #[derive(Debug, Clone)]
+        pub enum RdmaBackendHandle {
+            $($variant($handle),)+
+        }
+
+        impl RdmaBackendHandle {
+            /// The backend's name, for diagnostics.
+            pub(crate) fn backend_name(&self) -> &'static str {
+                match self {
+                    $(RdmaBackendHandle::$variant(_) => stringify!($variant),)+
+                }
+            }
+
+            /// Submit `ops` to this backend.
+            pub(crate) async fn submit(
+                &self,
+                cx: &(impl context::Actor + Send + Sync),
+                ops: Vec<RdmaOp>,
+                timeout: Duration,
+            ) -> Result<()> {
+                match self {
+                    $(
+                        RdmaBackendHandle::$variant(handle) => {
+                            <$handle as RdmaBackend>::submit(handle, cx, ops, timeout).await
+                        }
+                    )+
+                }
+            }
+        }
+    };
+}
+
+#[cfg(not(feature = "hixl"))]
+register_rdma_backends! {
+    Mlx: IbvBackend<MlxDevice>,
+    Efa: IbvBackend<EfaDevice>,
+    Tcp: TcpBackend,
+}
+
+#[cfg(feature = "hixl")]
+register_rdma_backends! {
+    Hixl: hixl::manager_actor::HixlBackend,
 }

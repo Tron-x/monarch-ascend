@@ -8,40 +8,38 @@ edition = "2024"
 license = "BSD-3-Clause"
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.103"
 async-trait = "0.1.86"
-bytes = { version = "1.11.1", features = ["serde"] }
-dashmap = { version = "6.1.0", features = ["rayon", "serde"] }
+backoff = { version = "0.4.0", features = ["futures", "tokio"] }
+bytes = { version = "1.12.1", features = ["serde"] }
+dashmap = { version = "6.2.1", features = ["rayon", "serde"] }
 erased-serde = "0.4.10"
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 hyperactor = { version = "0.0.0", path = "../hyperactor" }
 hyperactor_config = { version = "0.0.0", path = "../hyperactor_config" }
 hyperactor_mesh = { version = "0.0.0", path = "../hyperactor_mesh" }
-rand = "0.10.1"
-rdmaxcel-sys = { path = "../rdmaxcel-sys", optional = true }
+inventory = "0.3.24"
 hixl-sys = { path = "../hixl-sys", optional = true }
 hostname = { version = "0.4", optional = true }
 libc = { version = "0.2", optional = true }
-regex = "1.12.3"
+ndslice = { version = "0.0.0", path = "../ndslice" }
+paste = "1.0.14"
+rand = "0.10.2"
+rdmaxcel-sys = { path = "../rdmaxcel-sys", optional = true }
+regex = "1.13.1"
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_multipart = { version = "0.0.0", path = "../serde_multipart" }
-tokio = { version = "1.52.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
 tokio-util = { version = "0.7.18", features = ["full"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 typeuri = { version = "0.0.0", path = "../typeuri" }
 wirevalue = { version = "0.0.0", path = "../wirevalue" }
 
 [dev-dependencies]
-ndslice = { version = "0.0.0", path = "../ndslice" }
 timed_test = { version = "0.0.0", path = "../timed_test" }
 
 [features]
 cuda = ["dep:rdmaxcel-sys"]
 hixl = ["dep:hixl-sys", "dep:hostname", "dep:libc"]
-# Default is now [] (no cuda by default) -- NPU profile sets --no-default-features
-# anyway, and CUDA users must opt-in explicitly via --features cuda. This avoids
-# `default = ["cuda"]` accidentally pulling rdmaxcel-sys (CUDA-only) on NPU builds.
-default = []
-
-[lints]
-rust = { unexpected_cfgs = { check-cfg = ["cfg(test_8_gpus)"], level = "warn" } }
+default = ["cuda"]
+test-utils = []

@@ -82,7 +82,6 @@ use std::time::Duration;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
-use hyperactor as hyperactor_reference;
 use tokio::sync::oneshot;
 use tracing::Instrument;
 
@@ -635,6 +634,7 @@ mod tests {
     use tokio::io::BufReader;
 
     use super::*;
+    use crate::mesh_id::ResourceId;
 
     // Helpers
 
@@ -719,6 +719,7 @@ mod tests {
         // The bootstrap payload content doesn't matter for this test.
         let bootstrap = Bootstrap::Host {
             addr: any_unix_addr(),
+            callback_addr: any_unix_addr(),
             command: None,
             config: None,
             exit_on_shutdown: false,
@@ -811,12 +812,12 @@ mod tests {
             // The bootstrap payload content doesn't matter for this test.
             let bootstrap = Bootstrap::Host {
                 addr: any_unix_addr(),
+                callback_addr: any_unix_addr(),
                 command: None,
                 config: None,
                 exit_on_shutdown: false,
             };
-            let proc_id =
-                hyperactor::ProcAddr::from_resource_name(any_unix_addr(), "stdio-captured");
+            let proc_id = ResourceId::proc_addr_from_name(any_unix_addr(), "stdio-captured");
             let opts = LaunchOptions {
                 command: with_sh(script),
                 bootstrap_payload: bootstrap.to_env_safe_string().unwrap(),
@@ -851,12 +852,12 @@ mod tests {
             // The bootstrap payload content doesn't matter for this test.
             let bootstrap = Bootstrap::Host {
                 addr: any_unix_addr(),
+                callback_addr: any_unix_addr(),
                 command: None,
                 config: None,
                 exit_on_shutdown: false,
             };
-            let proc_id =
-                hyperactor::ProcAddr::from_resource_name(any_unix_addr(), "stdio-inherited");
+            let proc_id = ResourceId::proc_addr_from_name(any_unix_addr(), "stdio-inherited");
             let opts = LaunchOptions {
                 command: with_sh(script),
                 bootstrap_payload: bootstrap.to_env_safe_string().unwrap(),
@@ -895,11 +896,12 @@ mod tests {
         // The bootstrap payload content doesn't matter for this test.
         let bootstrap = Bootstrap::Host {
             addr: any_unix_addr(),
+            callback_addr: any_unix_addr(),
             command: None,
             config: None,
             exit_on_shutdown: false,
         };
-        let proc_id = hyperactor::ProcAddr::from_resource_name(any_unix_addr(), "exit-7");
+        let proc_id = ResourceId::proc_addr_from_name(any_unix_addr(), "exit-7");
         let opts = LaunchOptions {
             command: with_sh("exit 7"),
             bootstrap_payload: bootstrap.to_env_safe_string().unwrap(),
@@ -939,11 +941,12 @@ mod tests {
         // The bootstrap payload content doesn't matter for this test.
         let bootstrap = Bootstrap::Host {
             addr: any_unix_addr(),
+            callback_addr: any_unix_addr(),
             command: None,
             config: None,
             exit_on_shutdown: false,
         };
-        let proc_id = hyperactor::ProcAddr::from_resource_name(any_unix_addr(), "killed");
+        let proc_id = ResourceId::proc_addr_from_name(any_unix_addr(), "killed");
         let opts = LaunchOptions {
             command: with_sh("sleep 30"),
             bootstrap_payload: bootstrap.to_env_safe_string().unwrap(),
@@ -1016,11 +1019,12 @@ mod tests {
         // The bootstrap payload content doesn't matter for this test.
         let bootstrap = Bootstrap::Host {
             addr: any_unix_addr(),
+            callback_addr: any_unix_addr(),
             command: None,
             config: None,
             exit_on_shutdown: false,
         };
-        let proc_id = hyperactor::ProcAddr::from_resource_name(any_unix_addr(), "term-escalate");
+        let proc_id = ResourceId::proc_addr_from_name(any_unix_addr(), "term-escalate");
         let opts = LaunchOptions {
             command: with_sh(script),
             bootstrap_payload: bootstrap.to_env_safe_string().unwrap(),
@@ -1109,12 +1113,12 @@ while True:
         // The bootstrap payload content doesn't matter for this test.
         let bootstrap = Bootstrap::Host {
             addr: any_unix_addr(),
+            callback_addr: any_unix_addr(),
             command: None,
             config: None,
             exit_on_shutdown: false,
         };
-        let proc_id =
-            hyperactor::ProcAddr::from_resource_name(any_unix_addr(), "drop-cleanup-test");
+        let proc_id = ResourceId::proc_addr_from_name(any_unix_addr(), "drop-cleanup-test");
         let opts = LaunchOptions {
             command,
             bootstrap_payload: bootstrap.to_env_safe_string().unwrap(),

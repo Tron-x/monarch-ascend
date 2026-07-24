@@ -35,7 +35,6 @@ use tokio::io::ReadHalf;
 use tokio::io::WriteHalf;
 use tokio::sync::OwnedMutexGuard;
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use super::Frame;
@@ -49,7 +48,9 @@ use super::serialize_response;
 use crate::RemoteMessage;
 use crate::channel::ChannelAddr;
 use crate::channel::ChannelError;
+use crate::channel::CompletionSink;
 use crate::channel::SendError;
+use crate::channel::SendErrorReason;
 use crate::config;
 use crate::metrics;
 
@@ -331,7 +332,7 @@ pub(super) struct PendingMessage<M: RemoteMessage> {
     pub(super) seq: u64,
     pub(super) message: M,
     pub(super) received_at: Instant,
-    pub(super) return_channel: oneshot::Sender<SendError<M>>,
+    pub(super) completion: CompletionSink<M>,
 }
 
 pub(super) struct QueuedMessage<M: RemoteMessage> {
@@ -339,7 +340,7 @@ pub(super) struct QueuedMessage<M: RemoteMessage> {
     pub(super) message: serde_multipart::Message,
     pub(super) received_at: Instant,
     pub(super) sent_at: Option<tokio::time::Instant>,
-    pub(super) return_channel: oneshot::Sender<SendError<M>>,
+    pub(super) completion: CompletionSink<M>,
 }
 
 impl<M: RemoteMessage> fmt::Display for QueuedMessage<M> {
@@ -367,10 +368,10 @@ impl<M: RemoteMessage> QueuedMessage<M> {
     /// `Frame::Message<M>` and return it to the original
     /// sender. Falls back to logging if the frame is not a
     /// message or deserialization fails.
-    pub(super) fn try_return(self, reason: Option<String>) {
+    pub(super) fn try_return(self, reason: Option<SendErrorReason>) {
         match serde_multipart::deserialize_bincode::<Frame<M>>(self.message) {
             Ok(Frame::Message(_, msg)) => {
-                let _ = self.return_channel.send(SendError {
+                self.completion.reject(SendError {
                     error: ChannelError::Closed,
                     message: msg,
                     reason,
@@ -381,6 +382,7 @@ impl<M: RemoteMessage> QueuedMessage<M> {
                     seq = self.seq,
                     "failed to deserialize queued frame for return"
                 );
+                self.completion.accept();
             }
         }
     }
@@ -502,7 +504,7 @@ impl<M: RemoteMessage> Outbox<M> {
 
     pub(super) fn push_back(
         &mut self,
-        (message, return_channel, received_at): (M, oneshot::Sender<SendError<M>>, Instant),
+        (message, completion, received_at): (M, CompletionSink<M>, Instant),
     ) -> Result<(), String> {
         assert!(
             self.deque.back().is_none_or(|msg| msg.seq < self.next_seq),
@@ -515,8 +517,13 @@ impl<M: RemoteMessage> Outbox<M> {
         );
 
         let frame = Frame::Message(self.next_seq, message);
-        let message = serde_multipart::serialize_bincode(&frame)
-            .map_err(|e| format!("serialization error: {e}"))?;
+        let message = match serde_multipart::serialize_bincode(&frame) {
+            Ok(message) => message,
+            Err(e) => {
+                completion.accept();
+                return Err(format!("serialization error: {e}"));
+            }
+        };
         let message_size = message.frame_len();
         metrics::REMOTE_MESSAGE_SEND_SIZE.record(message_size as f64, &[]);
 
@@ -541,7 +548,7 @@ impl<M: RemoteMessage> Outbox<M> {
             message,
             received_at,
             sent_at: None,
-            return_channel,
+            completion,
         });
         self.next_seq += 1;
         Ok(())
@@ -607,10 +614,11 @@ impl<M: RemoteMessage> Unacked<M> {
             message.seq
         );
 
-        if let Some(AckedSeq(largest, _)) = self.largest_acked {
-            if message.seq <= largest {
-                return;
-            }
+        if let Some(AckedSeq(largest, _)) = self.largest_acked
+            && message.seq <= largest
+        {
+            message.completion.accept();
+            return;
         }
 
         self.deque.push_back(message);
@@ -647,6 +655,7 @@ impl<M: RemoteMessage> Unacked<M> {
                         "session_id" => session_id.to_string(),
                     ),
                 );
+                msg.completion.accept();
             } else {
                 break;
             }
@@ -945,8 +954,8 @@ pub(super) enum SendLoopError {
     ServerClosed,
     /// Delivery timeout on oldest unacked message.
     DeliveryTimeout,
-    /// Frame exceeds maximum allowed size.
-    OversizedFrame(String),
+    /// Frame `size` exceeded `max` (= `CODEC_MAX_FRAME_LENGTH`).
+    OversizedFrame { size: usize, max: usize },
 }
 
 impl fmt::Display for SendLoopError {
@@ -957,7 +966,11 @@ impl fmt::Display for SendLoopError {
             Self::Rejected(r) => write!(f, "rejected: {r}"),
             Self::ServerClosed => write!(f, "server closed"),
             Self::DeliveryTimeout => write!(f, "delivery timeout"),
-            Self::OversizedFrame(r) => write!(f, "oversized frame: {r}"),
+            Self::OversizedFrame { size, max } => write!(
+                f,
+                "oversized frame: rejecting oversize frame: len={size} > max={max}. \
+                 ack will not arrive before timeout; increase CODEC_MAX_FRAME_LENGTH to allow."
+            ),
         }
     }
 }
@@ -1312,7 +1325,7 @@ mod ack_watermark_tests {
 pub(super) async fn send_connected<M, R, W>(
     stream: &TaggedStream<R, W>,
     deliveries: &mut Deliveries<M>,
-    receiver: &mut mpsc::UnboundedReceiver<(M, oneshot::Sender<SendError<M>>, Instant)>,
+    receiver: &mut mpsc::UnboundedReceiver<(M, CompletionSink<M>, Instant)>,
 ) -> Result<(), SendLoopError>
 where
     M: RemoteMessage,
@@ -1327,17 +1340,13 @@ where
             let len = deliveries.outbox.front_size().expect("not empty");
             let max = stream.max_frame_len();
             if len > max {
-                let reason = format!(
-                    "rejecting oversize frame: len={} > max={}. \
-                    ack will not arrive before timeout; increase CODEC_MAX_FRAME_LENGTH to allow.",
-                    len, max
-                );
+                let reason = SendErrorReason::OversizedFrame { len, max };
                 deliveries
                     .outbox
                     .pop_front()
                     .expect("not empty")
-                    .try_return(Some(reason.clone()));
-                return Err(SendLoopError::OversizedFrame(reason));
+                    .try_return(Some(reason));
+                return Err(SendLoopError::OversizedFrame { size: len, max });
             }
             let message = deliveries.outbox.front_message().expect("not empty");
             pending = Some(stream.write(message.framed()));

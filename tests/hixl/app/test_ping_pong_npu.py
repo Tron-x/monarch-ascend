@@ -118,7 +118,7 @@ async def main():
     toy = mesh.spawn("toy", ToyActor)
 
     print("[broadcast] Calling hello_world on all actors...")
-    toy.hello_world.call("hey from main!").get()
+    await toy.hello_world.call("hey from main!")
 
     print("[per-rank] Calling each actor individually...")
     for idx in range(NUM_ACTORS):
@@ -138,8 +138,8 @@ async def main():
     actor_a = mesh_a.spawn("actor_a", PingPongActor, "A")
     actor_b = mesh_b.spawn("actor_b", PingPongActor, "B")
 
-    actor_a.init.call(actor_b).get()
-    actor_b.init.call(actor_a).get()
+    await actor_a.init.call(actor_b)
+    await actor_b.init.call(actor_a)
 
     print("[ping] A → B")
     r1 = await actor_a.send.call_one("Ping!")
@@ -159,6 +159,10 @@ async def main():
 
 
 if __name__ == "__main__":
-    from monarch._src.actor.actor_mesh import context
+    from monarch._src.actor.actor_mesh import context, shutdown_context
+
     context()
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        shutdown_context().get(timeout=45.0)

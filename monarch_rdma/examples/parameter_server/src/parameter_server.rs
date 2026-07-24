@@ -57,14 +57,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use hyperactor as reference;
 use hyperactor::Actor;
-use hyperactor::Bind;
+use hyperactor::ActorRef;
 use hyperactor::Context;
+use hyperactor::Endpoint as _;
 use hyperactor::Handler;
 use hyperactor::Instance;
+use hyperactor::OncePortRef;
+use hyperactor::PortRef;
 use hyperactor::RemoteSpawn;
-use hyperactor::Unbind;
 use hyperactor::channel::ChannelTransport;
 use hyperactor::context::Mailbox as _;
 use hyperactor::id::Label;
@@ -72,16 +73,18 @@ use hyperactor::supervision::ActorSupervisionEvent;
 use hyperactor_config::Flattrs;
 use hyperactor_mesh::ActorMesh;
 use hyperactor_mesh::Bootstrap;
+use hyperactor_mesh::HostBootstrapReady;
 use hyperactor_mesh::HostMeshRef;
-use hyperactor_mesh::comm::multicast::CastInfo;
+use hyperactor_mesh::casting::CastInfo;
 use hyperactor_mesh::context;
 use hyperactor_mesh::mesh_id::HostMeshId;
 use monarch_rdma::IbvConfig;
 use monarch_rdma::RdmaManagerActor;
 use monarch_rdma::RdmaManagerMessageClient;
 use monarch_rdma::RdmaRemoteBuffer;
-use monarch_rdma::local_memory::RdmaLocalMemory;
-use monarch_rdma::local_memory::UnsafeLocalMemory;
+use monarch_rdma::backend::ibverbs::device_selection::IbvDeviceTarget;
+use monarch_rdma::local_memory::Keepalive;
+use monarch_rdma::local_memory::KeepaliveLocalMemory;
 use ndslice::extent;
 use ndslice::view::Ranked;
 use serde::Deserialize;
@@ -91,6 +94,33 @@ use typeuri::Named;
 
 // Constants to control the setup.
 const BUFFER_SIZE: usize = 8;
+
+// HACK — `NoKeepalive` keeps nothing alive. The
+// `Box<[u8]>` fields on `ParameterServerActor` / `WorkerActor`
+// (`weights_data`, `grad_buffer_data`, `local_gradients`) own the
+// backing storage; the `KeepaliveLocalMemory` clones registered with
+// RDMA carry only an empty marker.
+//
+// We tolerate the lie here *temporarily* because the actual implementation
+// logic is unchanged from the pre-`Keepalive` version. If it was correct
+// before, it's still correct now.
+//
+// TODO(samlurye): rework the actor fields so the RDMA-registered
+// buffer is the single source of truth (e.g., `Arc<KeepaliveLocal-
+// Memory>` with a `Box<[u8]>` keepalive), and route the local
+// gradient/weight math through the `KeepaliveLocalMemory` API.
+struct NoKeepalive {
+    addr: usize,
+    size: usize,
+}
+impl Keepalive for NoKeepalive {
+    fn addr(&self) -> usize {
+        self.addr
+    }
+    fn size(&self) -> usize {
+        self.size
+    }
+}
 
 // Parameter Server Actor
 #[derive(Debug)]
@@ -107,7 +137,7 @@ pub struct ParameterServerActor {
     grad_buffer_data: Box<[Box<[u8]>]>,
     weights_handle: Option<RdmaRemoteBuffer>,
     grad_buffer_handles: HashMap<usize, RdmaRemoteBuffer>,
-    owner_ref: reference::ActorRef<RdmaManagerActor>,
+    owner_ref: ActorRef<RdmaManagerActor>,
 }
 
 #[async_trait]
@@ -130,7 +160,7 @@ impl Actor for ParameterServerActor {
 
 #[async_trait]
 impl RemoteSpawn for ParameterServerActor {
-    type Params = (reference::ActorRef<RdmaManagerActor>, usize);
+    type Params = (ActorRef<RdmaManagerActor>, usize);
 
     async fn new(_params: Self::Params, _environment: Flattrs) -> Result<Self, anyhow::Error> {
         let (owner_ref, worker_world_size) = _params;
@@ -151,20 +181,20 @@ impl RemoteSpawn for ParameterServerActor {
 }
 
 // Message to get handles to the parameter server's weights and gradient buffers.
-// - reference::OncePortRef<(RdmaRemoteBuffer, RdmaRemoteBuffer)>: OncePortRef to the parameter server's weights and gradient buffers.
+// - OncePortRef<(RdmaRemoteBuffer, RdmaRemoteBuffer)>: OncePortRef to the parameter server's weights and gradient buffers.
 #[derive(Debug, Serialize, Deserialize, Named, Clone)]
 struct PsGetBuffers(
     pub usize,
-    pub reference::OncePortRef<(RdmaRemoteBuffer, RdmaRemoteBuffer)>,
+    pub OncePortRef<(RdmaRemoteBuffer, RdmaRemoteBuffer)>,
 );
 
 // Message to update the parameter server's weights with its current gradient buffer.
-// - reference::OncePortRef<bool>: OncePortRef used primarily for workload synchronization.
+// - OncePortRef<bool>: OncePortRef used primarily for workload synchronization.
 #[derive(Debug, Serialize, Deserialize, Named, Clone)]
-struct PsUpdate(pub reference::OncePortRef<bool>);
+struct PsUpdate(pub OncePortRef<bool>);
 
 // Message to log actors' weights and gradients.
-#[derive(Debug, Serialize, Deserialize, Named, Clone, Bind, Unbind)]
+#[derive(Debug, Serialize, Deserialize, Named, Clone)]
 struct Log;
 
 #[async_trait]
@@ -178,8 +208,8 @@ impl Handler<PsGetBuffers> for ParameterServerActor {
         if self.weights_handle.is_none() {
             let addr = self.weights_data.as_ptr() as usize;
             let size = self.weights_data.len();
-            let local_memory: Arc<dyn RdmaLocalMemory> =
-                Arc::new(UnsafeLocalMemory::new(addr, size));
+            // See the module-level note on `NoKeepalive`.
+            let local_memory = KeepaliveLocalMemory::new(Arc::new(NoKeepalive { addr, size }));
             let handle = self
                 .owner_ref
                 .downcast_handle(cx)
@@ -198,8 +228,8 @@ impl Handler<PsGetBuffers> for ParameterServerActor {
             std::collections::hash_map::Entry::Vacant(e) => {
                 let addr = self.grad_buffer_data[rank].as_ptr() as usize;
                 let size = self.grad_buffer_data[rank].len();
-                let local_memory: Arc<dyn RdmaLocalMemory> =
-                    Arc::new(UnsafeLocalMemory::new(addr, size));
+                // See the module-level note on `NoKeepalive`.
+                let local_memory = KeepaliveLocalMemory::new(Arc::new(NoKeepalive { addr, size }));
                 let handle = self
                     .owner_ref
                     .downcast_handle(cx)
@@ -210,7 +240,7 @@ impl Handler<PsGetBuffers> for ParameterServerActor {
                 grad_buffer_handle
             }
         };
-        reply.send(cx, (weights_handle.clone(), grad_buffer_handle.clone()))?;
+        reply.post(cx, (weights_handle.clone(), grad_buffer_handle.clone()));
         Ok(())
     }
 }
@@ -230,7 +260,7 @@ impl Handler<PsUpdate> for ParameterServerActor {
             grad.fill(0);
         }
         tracing::info!("[parameter server actor] updated");
-        reply.send(cx, true)?;
+        reply.post(cx, true);
         Ok(())
     }
 }
@@ -253,10 +283,10 @@ impl Handler<Log> for ParameterServerActor {
 #[hyperactor::spawnable]
 #[hyperactor::export(
     handlers = [
-        WorkerInit { cast = true },
-        WorkerStep { cast = true },
-        WorkerUpdate { cast = true },
-        Log { cast = true },
+        WorkerInit,
+        WorkerStep,
+        WorkerUpdate,
+        Log,
     ],
 )]
 pub struct WorkerActor {
@@ -301,22 +331,22 @@ impl RemoteSpawn for WorkerActor {
 // Message to initialize the worker.
 // This message is sent to workers to establish their connection with the parameter server
 // and obtain handles to the shared weights and gradient buffers.
-#[derive(Debug, Serialize, Deserialize, Named, Clone, Bind, Unbind)]
-pub struct WorkerInit(pub reference::ActorRef<ParameterServerActor>);
+#[derive(Debug, Serialize, Deserialize, Named, Clone)]
+pub struct WorkerInit(pub ActorRef<ParameterServerActor>);
 
 // Message to signal the worker to update its gradients and transmit them to the server.
-// The reference::PortRef<bool> is used to notify the main process when the operation completes.
+// The PortRef<bool> is used to notify the main process when the operation completes.
 // - Workers compute local gradients (weights + 1)
 // - Workers write these gradients to their assigned buffer on the parameter server using RDMA
-#[derive(Debug, Serialize, Deserialize, Named, Clone, Bind, Unbind)]
-pub struct WorkerStep(#[binding(include)] reference::PortRef<bool>);
+#[derive(Debug, Serialize, Deserialize, Named, Clone)]
+pub struct WorkerStep(PortRef<bool>);
 
 // Message to signal the worker to pull updated weights from the parameter server.
-// The reference::PortRef<bool> is used to notify the main process when the operation completes.
+// The PortRef<bool> is used to notify the main process when the operation completes.
 // - Workers read the updated weights from the parameter server using RDMA
 // - This happens after the parameter server has applied all gradients to update the weights
-#[derive(Debug, Serialize, Deserialize, Named, Clone, Bind, Unbind)]
-pub struct WorkerUpdate(#[binding(include)] reference::PortRef<bool>);
+#[derive(Debug, Serialize, Deserialize, Named, Clone)]
+pub struct WorkerUpdate(PortRef<bool>);
 
 #[async_trait]
 impl Handler<WorkerInit> for WorkerActor {
@@ -331,7 +361,7 @@ impl Handler<WorkerInit> for WorkerActor {
         tracing::info!("[worker_actor_{}] initializing", rank);
 
         let (handle, receiver) = cx.mailbox().open_once_port();
-        ps_ref.send(cx, PsGetBuffers(rank, handle.bind()))?;
+        ps_ref.post(cx, PsGetBuffers(rank, handle.bind()));
         let (ps_weights_handle, ps_grad_handle) = receiver.recv().await?;
         self.ps_weights_handle = Some(ps_weights_handle);
         self.ps_grad_handle = Some(ps_grad_handle);
@@ -369,16 +399,17 @@ impl Handler<WorkerStep> for WorkerActor {
             .ps_grad_handle
             .as_ref()
             .expect("worker_actor should be initialized");
-        let local_memory: Arc<dyn RdmaLocalMemory> = Arc::new(UnsafeLocalMemory::new(
-            self.local_gradients.as_ptr() as usize,
-            self.local_gradients.len(),
-        ));
+        // See the module-level note on `NoKeepalive`.
+        let local_memory = KeepaliveLocalMemory::new(Arc::new(NoKeepalive {
+            addr: self.local_gradients.as_ptr() as usize,
+            size: self.local_gradients.len(),
+        }));
 
         ps_grad_handle.write_from_local(cx, local_memory, 5).await?;
 
         self.local_gradients.fill(0);
 
-        reply.send(cx, true)?;
+        reply.post(cx, true);
         Ok(())
     }
 }
@@ -402,14 +433,15 @@ impl Handler<WorkerUpdate> for WorkerActor {
             .ps_weights_handle
             .as_ref()
             .expect("worker_actor should be initialized");
-        let local_memory: Arc<dyn RdmaLocalMemory> = Arc::new(UnsafeLocalMemory::new(
-            self.weights_data.as_ptr() as usize,
-            self.weights_data.len(),
-        ));
+        // See the module-level note on `NoKeepalive`.
+        let local_memory = KeepaliveLocalMemory::new(Arc::new(NoKeepalive {
+            addr: self.weights_data.as_ptr() as usize,
+            size: self.weights_data.len(),
+        }));
         ps_weights_handle
             .read_into_local(cx, local_memory, 5)
             .await?;
-        reply.send(cx, true)?;
+        reply.post(cx, true);
         Ok(())
     }
 }
@@ -431,7 +463,7 @@ pub async fn run(num_workers: usize, num_steps: usize) -> Result<(), anyhow::Err
         .with_max_level(tracing::Level::INFO)
         .init();
 
-    let devices = monarch_rdma::get_all_devices();
+    let devices = monarch_rdma::backend::ibverbs::device::list_all_devices();
 
     // In this example, the parameter server and workers all live on the same host.
     // Parameter server is assigned to its unique ibverbs device, and all workers
@@ -445,13 +477,13 @@ pub async fn run(num_workers: usize, num_steps: usize) -> Result<(), anyhow::Err
     // Quick check for H100
     if devices.len() > 4 {
         ps_ibv_config = IbvConfig {
-            device: devices.clone().into_iter().next().unwrap(),
+            target: Some(IbvDeviceTarget::nic(devices[0].name().clone())),
             ..Default::default()
         };
         // The second device used is the 3rd. Main reason is because 0 and 3 are both backend
         // devices on gtn H100 devices.
         worker_ibv_config = IbvConfig {
-            device: devices.clone().into_iter().nth(3).unwrap(),
+            target: Some(IbvDeviceTarget::nic(devices[3].name().clone())),
             ..Default::default()
         };
     } else {
@@ -474,8 +506,10 @@ pub async fn run(num_workers: usize, num_steps: usize) -> Result<(), anyhow::Err
         buck_resources::get("monarch/monarch_rdma/examples/parameter_server/bootstrap").unwrap(),
     );
     let host_addr = ChannelTransport::Unix.any();
+    let callback = HostBootstrapReady::new(host_addr.clone())?;
     let boot = Bootstrap::Host {
         addr: host_addr.clone(),
+        callback_addr: callback.callback_addr(),
         command: None, // use current binary
         config: None,
         exit_on_shutdown: false,
@@ -483,13 +517,14 @@ pub async fn run(num_workers: usize, num_steps: usize) -> Result<(), anyhow::Err
     boot.to_env(&mut command);
     command.kill_on_drop(true);
     let _child = command.spawn().unwrap();
+    callback.wait().await?;
 
     let host_mesh = HostMeshRef::from_hosts(
-        HostMeshId::unique(Label::new("test").unwrap()),
+        HostMeshId::instance(Label::new("test").unwrap()),
         vec![host_addr],
     );
     let ps_proc_mesh = host_mesh
-        .spawn(instance, "ps", extent!(gpu = 1), None)
+        .spawn(instance, "ps", extent!(gpu = 1), None, None)
         .await?;
 
     tracing::info!(
@@ -509,7 +544,7 @@ pub async fn run(num_workers: usize, num_steps: usize) -> Result<(), anyhow::Err
     // Create a proc mesh for workers, where each worker is assigned to its own GPU.
     tracing::info!("creating worker proc mesh ({} workers)...", num_workers);
     let worker_proc_mesh = host_mesh
-        .spawn(instance, "workers", extent!(gpu = num_workers), None)
+        .spawn(instance, "workers", extent!(gpu = num_workers), None, None)
         .await?;
 
     tracing::info!(
@@ -569,7 +604,7 @@ pub async fn run(num_workers: usize, num_steps: usize) -> Result<(), anyhow::Err
         }
 
         let (handle, recv) = instance.mailbox().open_once_port::<bool>();
-        ps_actor.send(instance, PsUpdate(handle.bind())).unwrap();
+        ps_actor.post(instance, PsUpdate(handle.bind()));
 
         let finished = recv.recv().await.unwrap();
         if !finished {
@@ -589,7 +624,7 @@ pub async fn run(num_workers: usize, num_steps: usize) -> Result<(), anyhow::Err
         if !results.iter().any(|&result| result) {
             panic!("worker update step did not complete properly.");
         }
-        ps_actor.send(instance, Log {}).unwrap();
+        ps_actor.post(instance, Log {});
     }
     Ok(())
 }

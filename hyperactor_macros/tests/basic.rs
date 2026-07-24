@@ -7,7 +7,6 @@
  */
 
 #![allow(dead_code)]
-pub mod castable;
 pub mod export;
 
 use std::fmt::Debug;
@@ -182,9 +181,9 @@ mod tests {
     // Verify it compiles
     #[async_timed_test(timeout_secs = 30)]
     async fn test_client_macros() {
-        let proc = Proc::local();
-        let (client, _) = proc.instance("client").unwrap();
-        let actor_handle = proc.spawn("foo", TestVariantFormsActor {}).unwrap();
+        let proc = Proc::isolated();
+        let client = proc.client("client");
+        let actor_handle = proc.spawn(TestVariantFormsActor {});
 
         assert_eq!(actor_handle.call_struct(&client, 10).await.unwrap(), 10,);
 
@@ -202,6 +201,6 @@ mod tests {
     #[test]
     fn test_uid_macro_instance() {
         let id = uid!(d5d54d7201103869);
-        assert_eq!(id, Uid::Instance(0xd5d54d7201103869));
+        assert_eq!(id, Uid::Instance(0xd5d54d7201103869, None));
     }
 }

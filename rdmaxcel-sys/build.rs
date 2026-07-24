@@ -119,9 +119,12 @@ fn main() {
     // Generate bindings
     let mut builder = bindgen::Builder::default()
         .header(header_path.to_string_lossy())
+        // Parse the header as C, matching the internal Buck build
+        // (`rust_bindgen_library(lang = "c")`). `rdmaxcel.h` guards its C++ and
+        // `std::atomic` usage behind `#ifdef __cplusplus`, so it parses cleanly
+        // as C.
         .clang_arg("-x")
-        .clang_arg("c++")
-        .clang_arg("-std=c++14")
+        .clang_arg("c")
         .clang_arg(format!("-I{}", compute_include_path))
         .clang_arg(format!("-I{}", rdma_include))
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
@@ -144,12 +147,15 @@ fn main() {
         .allowlist_function("rdma_get_all_registered_segment_info")
         .allowlist_function("register_segments")
         .allowlist_function("deregister_segments")
+        .allowlist_function("ensure_cuda_driver_loaded")
         .allowlist_function("rdmaxcel_cu.*")
         .allowlist_function("get_cuda_pci_address_from_ptr")
         .allowlist_function("rdmaxcel_print_device_info")
         .allowlist_function("rdmaxcel_error_string")
         .allowlist_function("rdmaxcel_qp_.*")
         .allowlist_function("rdmaxcel_register_segment_scanner")
+        .allowlist_function("rdmaxcel_bind_mr_list")
+        .allowlist_function("rdmaxcel_destroy_mkey")
         .allowlist_function("poll_cq_with_cache")
         .allowlist_function("completion_cache_.*")
         // EFA functions (ibverbs-based)

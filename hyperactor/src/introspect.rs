@@ -36,9 +36,9 @@
 //!   `InstanceCell` never sets `last_message_handler` to
 //!   `IntrospectMessage`.
 //! - **S3.** Sender routing is unchanged -- senders target the same
-//!   `PortId` (`IntrospectMessage::port()`) across processes.
+//!   control `PortId` across processes.
 //! - **S4.** `IntrospectMessage` never produces a `WorkCell` --
-//!   pre-registration via `open_message_port` gives the introspect
+//!   pre-registration via `bind_control_port` gives the introspect
 //!   port its own channel, independent of the actor's work queue.
 //! - **S5.** Replies never use `PanickingMailboxSender` -- the
 //!   introspect task replies via `Mailbox::serialize_and_send_once`.
@@ -51,7 +51,7 @@
 //!   publish `Root` or `Error` payloads (only `Host` and `Proc`
 //!   variants).
 //! - **S9.** Port binding is single source of truth -- the introspect
-//!   port is bound exactly once via `bind_actor_port()` in
+//!   port is bound exactly once via `bind_handler_port()` in
 //!   `Instance::new()`.
 //! - **S10.** Introspect receiver lifecycle -- created in
 //!   `Instance::new()`, spawned in `start()`, dropped in
@@ -93,10 +93,14 @@
 //!   this_actor_id`.
 //! - **FI-5 (is_poisoned <-> failed_actor_count):** `is_poisoned ==
 //!   true` iff `failed_actor_count > 0`.
-//! - **FI-6 (clean stop = no artifacts):** When an actor stops
-//!   cleanly, `supervision_event` is `None`, failure attrs are
-//!   absent, and the actor does not contribute to
-//!   `failed_actor_count`.
+//! - **FI-6 (clean stop leaves no failure artifacts):** When an
+//!   actor stops cleanly through the serving loop,
+//!   `supervision_event` holds a non-error terminal event
+//!   (`actor_status` is `Stopped`, so `is_error()` is `false`),
+//!   failure attrs are absent, and the actor does not contribute to
+//!   `failed_actor_count`. The field records the terminal supervision
+//!   event, not just failures; see the `supervision_event` accessor
+//!   for when the field is `None`.
 //! - **FI-7 (propagated-stopped-root-cause):** When a failed actor's
 //!   supervision chain bottoms out in a `Stopped` child event,
 //!   structured failure metadata must still name the stopped child as
@@ -105,6 +109,15 @@
 //!   is derived from root-cause actor identity; a parent that failed
 //!   due to a child's event must report `failure_is_propagated ==
 //!   true`.
+//! - **FI-9 (stored-terminal vs delivered-zombie):** For an actor
+//!   marked `Zombie` during teardown that then reaches a terminal
+//!   status, `InstanceCell::supervision_event` records the true
+//!   terminal event (`Stopped`/`Failed`, for introspection) while
+//!   the supervision event delivered to the parent/proc remains the
+//!   non-error `Zombie` verdict (for supervision policy). The two
+//!   intentionally diverge; enforced in `proc.rs` `serve()`, where
+//!   the stored `event` and the delivered `event_to_deliver` are
+//!   computed separately.
 //!
 //! ## Attrs view invariants (AV-*)
 //!
@@ -118,6 +131,69 @@
 //!   required keys for that view are missing.
 //! - **AV-3 (unknown-key-tolerance):** Unknown attrs keys must not
 //!   affect successful decode outcome.
+//!
+//! ## Inbound ordering exposure invariants (IO-*)
+//!
+//! - **IO-1 (inbound-ordering tri-state semantics):**
+//!   `ActorAttrsView::inbound_ordering` carries three meaningful states
+//!   that consumers (DTO, TUI, agents) MUST distinguish:
+//!   * `None` -- no snapshot callback was installed. In current code
+//!     this means structural absence: an `InstanceCellState` not built
+//!     through `Instance::new` (hand-built test fixtures, or any future
+//!     code path that bypasses the constructor). Live actors built via
+//!     `Instance::new` always install Some, and terminated-actor
+//!     payloads -- which still go through `live_actor_payload(&cell)`
+//!     while the cell exists -- inherit that Some.
+//!   * `Some({enabled: false, ...})` -- ordered path exists but reorder
+//!     buffering is disabled; `sessions` is empty regardless of traffic.
+//!     Messages bypass receiver-local sequencing.
+//!   * `Some({enabled: true, ...})` -- buffering active; `sessions`
+//!     is meaningful.
+//!
+//!   `None` is NOT equivalent to `Some({enabled: false, ...})`.
+//! - **IO-2 (inbound-ordering reflects publish-time state):** When
+//!   present, the snapshot is computed at `build_actor_attrs`
+//!   invocation time via the sequenced receiver's snapshot handle.
+//!   `last_released_seq` etc. are point-in-time. Sessions held by a
+//!   concurrent receive show up in `skipped_session_count` (never silently omitted);
+//!   `is_complete()` reports the all-clear.
+//! - **IO-3 (queue-depth and inbound-ordering are independent
+//!   diagnostics, no arithmetic contract):**
+//!   * `ACTOR_QUEUE_DEPTH` (per PD-5a/PD-5b in `proc.rs`): accepted
+//!     handler work not yet dequeued by the actor loop.
+//!   * `INBOUND_ORDERING.sessions[*].buffered_count`: messages held by
+//!     receiver-local sequencing waiting for a seq gap to fill.
+//!
+//!   These are two independent point-in-time diagnostics. No
+//!   arithmetic or ordering relationship between them is part of the
+//!   API contract; the accounting paths are free to change. Consumers
+//!   must not derive one from the other.
+//!
+//! ## Actor-attrs snapshot invariants (AS-*)
+//!
+//! These govern the generic per-actor introspection-attrs snapshot
+//! seam: an actor may install a `Fn() -> Attrs` callback via
+//! `Instance::set_attrs_snapshot`, which the introspect task invokes in
+//! `build_actor_attrs` and merges into the Actor view. The seam is the
+//! runtime-agnostic transport for actor-supplied introspection data
+//! (e.g. a Python actor reporting in-flight handler execution); core
+//! interprets none of it.
+//!
+//! - **AS-1 (snapshot-opacity):** actor-supplied attrs are merged into
+//!   the Actor view verbatim. Core neither interprets nor validates the
+//!   keys -- any key the actor sets is transported as-is. This is what
+//!   keeps the seam runtime-agnostic (no Rust-vs-Python knowledge, no
+//!   "endpoint" concept in core).
+//! - **AS-2 (core-precedence):** on a key collision, the core/runtime
+//!   key wins over the actor-supplied value. This is the Actor-view
+//!   analog of IA-2, which governs the published-attrs path; the two
+//!   sources of actor-supplied keys (published attrs, snapshot seam) are
+//!   distinct, but both yield to core keys.
+//! - **AS-3 (snapshot-non-fatal):** an absent, empty, or panicking
+//!   snapshot degrades to the core-only Actor view. The callback is
+//!   `catch_unwind`-guarded and the merge falls back to the core attrs,
+//!   so a bad snapshot can never empty or invalidate `attrs` (with IA-1,
+//!   IA-5).
 
 use std::fmt;
 use std::str::FromStr;
@@ -132,8 +208,8 @@ use serde::Serialize;
 use typeuri::Named;
 
 use crate::ActorAddr;
+use crate::Addr;
 use crate::AddrParseError;
-use crate::Address;
 use crate::InstanceCell;
 use crate::OncePortRef;
 use crate::ProcAddr;
@@ -158,7 +234,7 @@ hyperactor_config::impl_attrvalue!(IntrospectRef);
 pub enum IntrospectRefParseError {
     /// The address text could not be parsed.
     #[error(transparent)]
-    Address(#[from] AddrParseError),
+    Addr(#[from] AddrParseError),
     /// Port references are not introspectable.
     #[error("port references are not valid introspection references")]
     PortNotAllowed,
@@ -177,11 +253,11 @@ impl FromStr for IntrospectRef {
     type Err = IntrospectRefParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let r: Address = s.parse()?;
+        let r: Addr = s.parse()?;
         match r {
-            Address::Proc(id) => Ok(Self::Proc(id)),
-            Address::Actor(id) => Ok(Self::Actor(id)),
-            Address::Port(_) => Err(IntrospectRefParseError::PortNotAllowed),
+            Addr::Proc(id) => Ok(Self::Proc(id)),
+            Addr::Actor(id) => Ok(Self::Actor(id)),
+            Addr::Port(_) => Err(IntrospectRefParseError::PortNotAllowed),
         }
     }
 }
@@ -364,6 +440,39 @@ declare_attrs! {
         desc: "Whether the failure was propagated from a child".into(),
     })
     pub attr FAILURE_IS_PROPAGATED: bool = false;
+
+    /// Stable per-instance identifier (`Uuid::now_v7`) assigned at
+    /// `Instance::new`.
+    @meta(INTROSPECT = IntrospectAttr {
+        name: "instance_id".into(),
+        desc: "Stable per-instance Uuid::now_v7() identity assigned at Instance::new".into(),
+    })
+    pub attr INSTANCE_ID: String;
+
+    /// Accepted handler work not yet dequeued by the actor loop (per
+    /// `proc.rs` PD-5a/PD-5b). Independent of `INBOUND_ORDERING`:
+    /// no arithmetic or ordering relationship between the two is part
+    /// of the API contract. See IO-3.
+    @meta(INTROSPECT = IntrospectAttr {
+        name: "queue_depth".into(),
+        desc: "Accepted handler work not yet dequeued by the actor loop (PD-5a/b). Independent of inbound_ordering; no arithmetic contract -- see IO-3.".into(),
+    })
+    pub attr ACTOR_QUEUE_DEPTH: u64 = 0;
+
+    /// Per-session reorder state from the sequenced receiver snapshot.
+    /// `sessions[*].buffered_count` reports messages held by
+    /// receiver-local sequencing waiting for a seq gap to fill. Independent
+    /// diagnostic from `queue_depth`; no arithmetic contract -- see
+    /// IO-3.
+    ///
+    /// Absence (`None` on `ActorAttrsView`) means structural absence
+    /// (no snapshot callback installed). `Some({enabled: false, ...})`
+    /// means the path exists but buffering is disabled. See IO-1.
+    @meta(INTROSPECT = IntrospectAttr {
+        name: "inbound_ordering".into(),
+        desc: "Per-session reorder-buffer state from receiver-local sequencing. Independent diagnostic from queue_depth; no arithmetic contract -- see IO-3. Absence vs Some({enabled: false}) is meaningful -- see IO-1.".into(),
+    })
+    pub attr INBOUND_ORDERING: crate::ordering::OrderingSnapshot;
 }
 
 // See FI-1 through FI-8 in module doc.
@@ -434,6 +543,8 @@ pub struct ActorAttrsView {
     pub status_reason: Option<String>,
     /// Fully-qualified actor type name.
     pub actor_type: String,
+    /// Stable per-instance identifier (`Uuid::now_v7`) as a string.
+    pub instance_id: String,
     /// Number of messages processed.
     pub messages_processed: u64,
     /// When this actor was created.
@@ -442,10 +553,20 @@ pub struct ActorAttrsView {
     pub last_handler: Option<String>,
     /// Total CPU time in message handlers (microseconds).
     pub total_processing_time_us: u64,
+    /// Accepted handler work not yet dequeued by the actor loop
+    /// (PD-5a/b). Independent diagnostic from `inbound_ordering`;
+    /// no arithmetic contract between the two -- see IO-3. Defaults
+    /// to 0 when the attr is absent.
+    pub queue_depth: u64,
     /// Flight recorder JSON, if available.
     pub flight_recorder: Option<String>,
     /// Whether this is a system/infrastructure actor.
     pub is_system: bool,
+    /// Per-session reorder state. `None` means no snapshot callback was
+    /// installed (structural absence per IO-1); `Some({enabled: false, ..})`
+    /// means buffering is disabled; `Some({enabled: true, ..})` means active.
+    /// Consumers must distinguish all three states.
+    pub inbound_ordering: Option<crate::ordering::OrderingSnapshot>,
     /// Failure details, present iff status == "failed".
     pub failure: Option<FailureAttrs>,
 }
@@ -466,12 +587,18 @@ impl ActorAttrsView {
             .get(ACTOR_TYPE)
             .ok_or_else(|| AttrsViewError::missing("actor_type"))?
             .clone();
+        let instance_id = attrs
+            .get(INSTANCE_ID)
+            .ok_or_else(|| AttrsViewError::missing("instance_id"))?
+            .clone();
         let messages_processed = *attrs.get(MESSAGES_PROCESSED).unwrap_or(&0);
         let created_at = attrs.get(CREATED_AT).copied();
         let last_handler = attrs.get(LAST_HANDLER).cloned();
         let total_processing_time_us = *attrs.get(TOTAL_PROCESSING_TIME_US).unwrap_or(&0);
+        let queue_depth = *attrs.get(ACTOR_QUEUE_DEPTH).unwrap_or(&0);
         let flight_recorder = attrs.get(FLIGHT_RECORDER).cloned();
         let is_system = *attrs.get(IS_SYSTEM).unwrap_or(&false);
+        let inbound_ordering = attrs.get(INBOUND_ORDERING).cloned();
 
         // IA-3 (one-sided): status_reason must not be present for
         // non-terminal status. The converse is not enforced —
@@ -540,12 +667,15 @@ impl ActorAttrsView {
             status,
             status_reason,
             actor_type,
+            instance_id,
             messages_processed,
             created_at,
             last_handler,
             total_processing_time_us,
+            queue_depth,
             flight_recorder,
             is_system,
+            inbound_ordering,
             failure,
         })
     }
@@ -558,6 +688,7 @@ impl ActorAttrsView {
             attrs.set(STATUS_REASON, reason.clone());
         }
         attrs.set(ACTOR_TYPE, self.actor_type.clone());
+        attrs.set(INSTANCE_ID, self.instance_id.clone());
         attrs.set(MESSAGES_PROCESSED, self.messages_processed);
         if let Some(t) = self.created_at {
             attrs.set(CREATED_AT, t);
@@ -566,10 +697,14 @@ impl ActorAttrsView {
             attrs.set(LAST_HANDLER, handler.clone());
         }
         attrs.set(TOTAL_PROCESSING_TIME_US, self.total_processing_time_us);
+        attrs.set(ACTOR_QUEUE_DEPTH, self.queue_depth);
         if let Some(fr) = &self.flight_recorder {
             attrs.set(FLIGHT_RECORDER, fr.clone());
         }
         attrs.set(IS_SYSTEM, self.is_system);
+        if let Some(snapshot) = &self.inbound_ordering {
+            attrs.set(INBOUND_ORDERING, snapshot.clone());
+        }
         if let Some(fi) = &self.failure {
             attrs.set(FAILURE_ERROR_MESSAGE, fi.error_message.clone());
             attrs.set(FAILURE_ROOT_CAUSE_ACTOR, fi.root_cause_actor.clone());
@@ -587,12 +722,12 @@ impl ActorAttrsView {
 /// The mesh layer constructs the API-facing `NodePayload` (with
 /// `properties`) from this via `derive_properties`.
 ///
-/// This is the internal wire type — it travels over actor ports
+/// This is the internal wire type — it travels over handler ports
 /// via `IntrospectMessage`. The presentation-layer `NodePayload`
 /// (with `NodeProperties`) lives in `hyperactor_mesh::introspect`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Named)]
 pub struct IntrospectResult {
-    /// Address identifying this node.
+    /// Addr identifying this node.
     pub identity: IntrospectRef,
     /// JSON-serialized `Attrs` bag containing introspection attributes.
     pub attrs: String,
@@ -645,8 +780,8 @@ pub enum IntrospectMessage {
     },
     /// "Describe one of your children."
     QueryChild {
-        /// Address identifying the child to describe.
-        child_ref: Address,
+        /// Addr identifying the child to describe.
+        child_ref: Addr,
         /// Reply port receiving the child's description.
         reply: OncePortRef<IntrospectResult>,
     },
@@ -738,6 +873,15 @@ fn build_actor_attrs(cell: &crate::InstanceCell, snap: &ActorSnapshot) -> String
     attrs.set(CREATED_AT, cell.created_at());
     attrs.set(TOTAL_PROCESSING_TIME_US, cell.total_processing_time_us());
     attrs.set(IS_SYSTEM, snap.is_system);
+    attrs.set(INSTANCE_ID, cell.instance_id().to_string());
+    attrs.set(ACTOR_QUEUE_DEPTH, cell.queue_depth());
+
+    if let Some(snapshot) = cell.inbound_ordering_snapshot() {
+        // TODO: truncation / filtering of long session lists belongs at
+        // the API/DTO layer, not here. `build_actor_attrs` returns the
+        // full per-actor snapshot verbatim so consumers can decide.
+        attrs.set(INBOUND_ORDERING, snapshot);
+    }
 
     if let Some(handler) = &snap.last_handler {
         attrs.set(LAST_HANDLER, handler.clone());
@@ -759,7 +903,22 @@ fn build_actor_attrs(cell: &crate::InstanceCell, snap: &ActorSnapshot) -> String
     // IA-4: failure attrs absent when not failed — guaranteed by
     // starting from a fresh Attrs bag (no stale keys possible).
 
-    serde_json::to_string(&attrs).unwrap_or_else(|_| "{}".to_string())
+    let core_json = serde_json::to_string(&attrs).unwrap_or_else(|_| "{}".to_string());
+
+    // Merge actor-supplied attrs (the generic seam, AS-1). `Attrs::merge`
+    // overwrites the receiver's keys with the argument's, so merging the
+    // core bag *onto* the actor snapshot makes core keys win on collision
+    // (AS-2, the Actor-view analog of IA-2). No snapshot → the core bag is
+    // returned unchanged; if the merged bag somehow fails to serialize,
+    // fall back to the core-only JSON so a bad snapshot can never empty or
+    // invalidate the actor view (AS-3).
+    match cell.actor_attrs_snapshot() {
+        None => core_json,
+        Some(mut merged) => {
+            merged.merge(attrs);
+            serde_json::to_string(&merged).unwrap_or(core_json)
+        }
+    }
 }
 
 /// Build an [`IntrospectResult`] from live [`InstanceCell`] state.
@@ -768,8 +927,15 @@ fn build_actor_attrs(cell: &crate::InstanceCell, snap: &ActorSnapshot) -> String
 /// the cell. Used by the introspect task (which runs outside
 /// the actor's message loop) and by `Instance::introspect_payload`.
 pub fn live_actor_payload(cell: &InstanceCell) -> IntrospectResult {
-    let actor_id = cell.actor_id();
     let status = cell.status().borrow().clone();
+    live_actor_payload_with_status(cell, &status)
+}
+
+fn live_actor_payload_with_status(
+    cell: &InstanceCell,
+    status: &crate::actor::ActorStatus,
+) -> IntrospectResult {
+    let actor_id = cell.actor_addr();
     let last_handler = cell.last_message_handler();
 
     let children: Vec<IntrospectRef> = cell
@@ -799,7 +965,7 @@ pub fn live_actor_payload(cell: &InstanceCell) -> IntrospectResult {
 
     let supervisor = cell
         .parent()
-        .map(|p| IntrospectRef::Actor(p.actor_id().clone()));
+        .map(|p| IntrospectRef::Actor(p.actor_addr().clone()));
 
     // FI-3: failure_info is computed from the same status value as
     // actor_status, ensuring they agree on whether the actor failed.
@@ -837,51 +1003,58 @@ pub fn live_actor_payload(cell: &InstanceCell) -> IntrospectResult {
     }
 }
 
-/// Introspect task: runs on a dedicated tokio task per actor,
-/// handling [`IntrospectMessage`] by reading [`InstanceCell`]
-/// directly and replying via the actor's [`Mailbox`].
+/// Serve introspection for one actor.
 ///
-/// The actor's message loop never sees these messages.
+/// This runs on a dedicated Tokio task owned by the actor runtime. It
+/// handles [`IntrospectMessage`] by reading [`InstanceCell`] directly
+/// and replying through the owning [`Proc`](crate::Proc). The actor's
+/// message loop never sees these messages, so a stuck actor can still
+/// be introspected.
+///
+/// The task's lifetime is controlled by `shutdown`, not by terminal
+/// [`ActorStatus`](crate::actor::ActorStatus). Runtime teardown sends
+/// the final status through `shutdown`; this task then builds and
+/// stores the terminated snapshot with that status and exits. The
+/// actor's serving loop, or the proc-managed lifecycle for detached
+/// instances, joins this task before publishing terminal status, so
+/// terminal status remains the single authoritative signal that the
+/// actor's full runtime, including introspection, has shut down.
+///
+/// If the introspect receiver closes before shutdown, the task stops
+/// accepting queries but remains alive until runtime shutdown. This
+/// preserves the shutdown path that stores the post-mortem snapshot and
+/// breaks the `InstanceCell` reference cycle.
 ///
 /// # Invariants exercised
 ///
 /// Exercises S1, S2, S4, S5, S6, S11 (see module doc).
 pub(crate) async fn serve_introspect(
     cell: InstanceCell,
-    mailbox: crate::mailbox::Mailbox,
     mut receiver: crate::mailbox::PortReceiver<IntrospectMessage>,
+    mut shutdown: tokio::sync::oneshot::Receiver<crate::actor::ActorStatus>,
 ) {
-    use crate::actor::ActorStatus;
     use crate::mailbox::PortSender as _;
 
-    // Watch for terminal status so we can break the reference cycle:
-    // InstanceCellState → Ports → introspect sender → keeps receiver
-    // open → this task holds InstanceCell → InstanceCellState.
-    // Without this, a stopped actor's InstanceCellState is never
-    // dropped and the actor lingers in the proc's instances map.
-    let mut status = cell.status().clone();
+    // Runtime shutdown, not terminal status, owns this task's lifetime.
+    // Terminal status is published only after this task snapshots and exits.
+    let mut receiver_open = true;
 
     loop {
         let msg = tokio::select! {
-            msg = receiver.recv() => {
+            msg = receiver.recv(), if receiver_open => {
                 match msg {
                     Ok(msg) => msg,
                     Err(_) => {
-                        // Channel closed. If the actor reached a
-                        // terminal state, snapshot it before exiting
-                        // so it remains queryable post-mortem.
-                        if cell.status().borrow().is_terminal() {
-                            let snapshot = live_actor_payload(&cell);
-                            cell.store_terminated_snapshot(snapshot);
-                        }
-                        break;
+                        receiver_open = false;
+                        continue;
                     }
                 }
             }
-            _ = status.wait_for(ActorStatus::is_terminal) => {
-                // Snapshot for post-mortem introspection before
-                // dropping our InstanceCell reference.
-                let snapshot = live_actor_payload(&cell);
+            terminal_status = &mut shutdown => {
+                let Ok(terminal_status) = terminal_status else {
+                    break;
+                };
+                let snapshot = live_actor_payload_with_status(&cell, &terminal_status);
                 cell.store_terminated_snapshot(snapshot);
                 break;
             }
@@ -897,12 +1070,12 @@ pub(crate) async fn serve_introspect(
                             let children: Vec<IntrospectRef> =
                                 published.get(CHILDREN).cloned().unwrap_or_default();
                             IntrospectResult {
-                                identity: IntrospectRef::Actor(cell.actor_id().clone()),
+                                identity: IntrospectRef::Actor(cell.actor_addr().clone()),
                                 attrs: attrs_json,
                                 children,
                                 parent: cell
                                     .parent()
-                                    .map(|p| IntrospectRef::Actor(p.actor_id().clone())),
+                                    .map(|p| IntrospectRef::Actor(p.actor_addr().clone())),
                                 as_of: SystemTime::now(),
                             }
                         }
@@ -910,14 +1083,14 @@ pub(crate) async fn serve_introspect(
                     },
                     IntrospectView::Actor => live_actor_payload(&cell),
                 };
-                mailbox.serialize_and_send_once(
+                cell.proc().serialize_and_send_once(
                     reply,
                     payload,
                     crate::mailbox::monitored_return_handle(),
                 )
             }
             IntrospectMessage::QueryChild { child_ref, reply } => {
-                let child_ref_: Address = child_ref.clone();
+                let child_ref_: Addr = child_ref.clone();
                 let payload = cell.query_child(&child_ref_).unwrap_or_else(|| {
                     let mut error_attrs = hyperactor_config::Attrs::new();
                     error_attrs.set(ERROR_CODE, "not_found".to_string());
@@ -927,9 +1100,9 @@ pub(crate) async fn serve_introspect(
                     );
                     // Use the queried child_ref as identity for the error node.
                     let identity = match &child_ref {
-                        Address::Proc(id) => IntrospectRef::Proc(id.clone()),
-                        Address::Actor(id) => IntrospectRef::Actor(id.clone()),
-                        Address::Port(id) => IntrospectRef::Actor(id.actor_ref()),
+                        Addr::Proc(id) => IntrospectRef::Proc(id.clone()),
+                        Addr::Actor(id) => IntrospectRef::Actor(id.clone()),
+                        Addr::Port(id) => IntrospectRef::Actor(id.actor_addr()),
                     };
                     IntrospectResult {
                         identity,
@@ -940,7 +1113,7 @@ pub(crate) async fn serve_introspect(
                         as_of: SystemTime::now(),
                     }
                 });
-                mailbox.serialize_and_send_once(
+                cell.proc().serialize_and_send_once(
                     reply,
                     payload,
                     crate::mailbox::monitored_return_handle(),
@@ -952,7 +1125,7 @@ pub(crate) async fn serve_introspect(
         }
     }
     tracing::debug!(
-        actor_id = %cell.actor_id(),
+        actor_id = %cell.actor_addr(),
         "introspect task exiting"
     );
 }
@@ -988,6 +1161,9 @@ mod tests {
             ("failure_root_cause_name", FAILURE_ROOT_CAUSE_NAME.attrs()),
             ("failure_occurred_at", FAILURE_OCCURRED_AT.attrs()),
             ("failure_is_propagated", FAILURE_IS_PROPAGATED.attrs()),
+            ("instance_id", INSTANCE_ID.attrs()),
+            ("queue_depth", ACTOR_QUEUE_DEPTH.attrs()),
+            ("inbound_ordering", INBOUND_ORDERING.attrs()),
         ];
 
         for (expected_name, meta) in &cases {
@@ -1060,6 +1236,7 @@ mod tests {
         let mut attrs = Attrs::new();
         attrs.set(STATUS, "running".to_string());
         attrs.set(ACTOR_TYPE, "MyActor".to_string());
+        attrs.set(INSTANCE_ID, uuid::Uuid::from_u128(0xfeed_face).to_string());
         attrs.set(MESSAGES_PROCESSED, 42u64);
         attrs.set(CREATED_AT, SystemTime::UNIX_EPOCH);
         attrs.set(IS_SYSTEM, false);
@@ -1067,7 +1244,7 @@ mod tests {
     }
 
     fn test_actor_id(proc_name: &str, actor_name: &str) -> ActorAddr {
-        ProcAddr::from_resource_name(ChannelAddr::Local(0), proc_name).actor_ref(actor_name)
+        ProcAddr::singleton(ChannelAddr::Local(0), proc_name).actor_addr(actor_name)
     }
 
     fn failed_actor_attrs() -> Attrs {
@@ -1089,6 +1266,10 @@ mod tests {
         assert_eq!(view.status, "running");
         assert_eq!(view.actor_type, "MyActor");
         assert_eq!(view.messages_processed, 42);
+        // Default values for the new fields when not set in the
+        // running_actor_attrs() fixture.
+        assert_eq!(view.queue_depth, 0);
+        assert!(view.inbound_ordering.is_none());
         assert!(view.failure.is_none());
 
         let round_tripped = ActorAttrsView::from_attrs(&view.to_attrs()).unwrap();
@@ -1124,6 +1305,65 @@ mod tests {
         attrs.set(STATUS, "running".to_string());
         let err = ActorAttrsView::from_attrs(&attrs).unwrap_err();
         assert_eq!(err, AttrsViewError::MissingKey { key: "actor_type" });
+    }
+
+    /// AV-2: `instance_id` is a required key on the actor view --
+    /// every live actor's attrs bag carries one.
+    #[test]
+    fn test_actor_view_missing_instance_id() {
+        let mut attrs = Attrs::new();
+        attrs.set(STATUS, "running".to_string());
+        attrs.set(ACTOR_TYPE, "X".to_string());
+        let err = ActorAttrsView::from_attrs(&attrs).unwrap_err();
+        assert_eq!(err, AttrsViewError::MissingKey { key: "instance_id" });
+    }
+
+    /// AV-1 + IO-1: round-trip with inbound_ordering = Some(...).
+    /// Pins that the typed `OrderingSnapshot` survives the
+    /// Attrs encode/decode boundary.
+    #[test]
+    fn test_actor_view_round_trip_with_inbound_ordering() {
+        use crate::ordering::OrderingSessionSnapshot;
+        use crate::ordering::OrderingSnapshot;
+
+        let session_addr = test_actor_id("sender_proc", "sender_actor");
+        let snapshot = OrderingSnapshot {
+            enabled: true,
+            sessions: vec![OrderingSessionSnapshot {
+                session_id: uuid::Uuid::from_u128(7),
+                sender: Some(session_addr),
+                last_released_seq: 3,
+                expected_next_seq: 4,
+                buffered_count: 2,
+                oldest_buffered_seq: Some(5),
+                newest_buffered_seq: Some(6),
+            }],
+            skipped_session_count: 0,
+        };
+
+        let mut attrs = running_actor_attrs();
+        attrs.set(ACTOR_QUEUE_DEPTH, 7u64);
+        attrs.set(INBOUND_ORDERING, snapshot.clone());
+
+        let view = ActorAttrsView::from_attrs(&attrs).unwrap();
+        assert_eq!(view.queue_depth, 7);
+        assert_eq!(view.inbound_ordering.as_ref(), Some(&snapshot));
+
+        let round_tripped = ActorAttrsView::from_attrs(&view.to_attrs()).unwrap();
+        assert_eq!(round_tripped, view);
+    }
+
+    /// AV-1 + IO-1: round-trip with inbound_ordering = None survives
+    /// cleanly. Pins the "structural absence" semantics: round-tripping
+    /// the view does not invent a Some({enabled: false}) value.
+    #[test]
+    fn test_actor_view_round_trip_without_inbound_ordering() {
+        let view = ActorAttrsView::from_attrs(&running_actor_attrs()).unwrap();
+        assert!(view.inbound_ordering.is_none());
+
+        let round_tripped = ActorAttrsView::from_attrs(&view.to_attrs()).unwrap();
+        assert!(round_tripped.inbound_ordering.is_none());
+        assert_eq!(round_tripped, view);
     }
 
     #[test]
@@ -1203,9 +1443,9 @@ mod tests {
     /// integration coverage.
     #[test]
     fn test_fi7_fi8_propagated_stopped_child() {
-        let proc_id = ProcAddr::from_resource_name(ChannelAddr::Local(0), "test_proc");
-        let child_id = proc_id.actor_id("proc_agent");
-        let parent_id = proc_id.actor_id("mesh_actor");
+        let proc_id = ProcAddr::singleton(ChannelAddr::Local(0), "test_proc");
+        let child_id = proc_id.actor_addr("proc_agent");
+        let parent_id = proc_id.actor_addr("mesh_actor");
 
         let child_event = ActorSupervisionEvent::new(
             child_id.clone(),

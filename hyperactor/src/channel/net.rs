@@ -64,13 +64,15 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
-use tokio::time::Instant;
+use tracing::Instrument;
 
 use super::*;
 use crate::RemoteMessage;
 
 pub mod duplex;
 mod framed;
+pub(super) mod mux;
+pub(crate) mod quic;
 pub(super) mod server;
 pub(super) mod session;
 pub use server::ServerHandle;
@@ -106,15 +108,29 @@ pub(crate) const INITIATOR_TO_ACCEPTOR: u8 = 0;
 /// Logical channel tag for acceptor→initiator traffic.
 pub(crate) const ACCEPTOR_TO_INITIATOR: u8 = 1;
 
+/// Wire-level protocol kind carried by [`ProtocolKind`] in the
+/// [`LinkInit`](write_link_init) header. Distinguishes simplex
+/// (one-direction byte stream carrying tag `0x00` frames) from
+/// duplex (bidirectional byte stream carrying both `0x00` and
+/// `0x01` frames) so a server listening on a single address can
+/// demultiplex both styles without peeking at application payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProtocolKind {
+    Simplex,
+    Duplex,
+}
+
+const SIMPLEX_MAGIC: [u8; 4] = *b"SMP\0";
+const DUPLEX_MAGIC: [u8; 4] = *b"DPX\0";
+
 /// Fixed-size header sent at the start of every physical connection.
-/// This is written/read directly on the wire (not framed), before
-/// any session framing begins.
+/// Written/read directly on the wire (not framed), before any session
+/// framing begins.
 ///
 /// Wire format (13 bytes, big-endian):
 /// ```text
-/// [magic: 4B "LNK\0"] [session_id: 8B u64 BE] [stream_id: 1B u8]
+/// [magic: 4B ("SMP\0" | "DPX\0")] [session_id: 8B u64 BE] [stream_id: 1B u8]
 /// ```
-const LINK_INIT_MAGIC: [u8; 4] = *b"LNK\0";
 const LINK_INIT_SIZE: usize = 4 + 8 + 1;
 
 /// Parsed LinkInit header.
@@ -122,37 +138,119 @@ const LINK_INIT_SIZE: usize = 4 + 8 + 1;
 pub(crate) struct LinkInit {
     pub session_id: SessionId,
     pub stream_id: u8,
+    pub kind: ProtocolKind,
 }
 
-/// Write a LinkInit header to the stream.
-async fn write_link_init<S: AsyncWrite + Unpin>(
+/// Write a LinkInit header to the stream, tagged by `kind`.
+pub(crate) async fn write_link_init<S: AsyncWrite + Unpin>(
     stream: &mut S,
     session_id: SessionId,
     stream_id: u8,
+    kind: ProtocolKind,
 ) -> Result<(), std::io::Error> {
     let mut buf = [0u8; LINK_INIT_SIZE];
-    buf[0..4].copy_from_slice(&LINK_INIT_MAGIC);
+    let magic = match kind {
+        ProtocolKind::Simplex => &SIMPLEX_MAGIC,
+        ProtocolKind::Duplex => &DUPLEX_MAGIC,
+    };
+    buf[0..4].copy_from_slice(magic);
     buf[4..12].copy_from_slice(&session_id.0.to_be_bytes());
     buf[12] = stream_id;
     stream.write_all(&buf).await
 }
 
-/// Read a LinkInit header from the stream.
+/// Read a LinkInit header from the stream, recovering the session
+/// id and protocol kind the client wrote.
 async fn read_link_init<S: AsyncRead + Unpin>(stream: &mut S) -> Result<LinkInit, std::io::Error> {
     let mut buf = [0u8; LINK_INIT_SIZE];
     stream.read_exact(&mut buf).await?;
-    if buf[0..4] != LINK_INIT_MAGIC {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("invalid LinkInit magic: expected LNK, got {:?}", &buf[0..4]),
-        ));
-    }
+    let kind = match &buf[0..4] {
+        m if m == SIMPLEX_MAGIC => ProtocolKind::Simplex,
+        m if m == DUPLEX_MAGIC => ProtocolKind::Duplex,
+        other => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid LinkInit magic: expected {:?} or {:?}, got {:?}",
+                    SIMPLEX_MAGIC, DUPLEX_MAGIC, other
+                ),
+            ));
+        }
+    };
     let session_id = SessionId(u64::from_be_bytes(buf[4..12].try_into().unwrap()));
     let stream_id = buf[12];
     Ok(LinkInit {
         session_id,
         stream_id,
+        kind,
     })
+}
+
+/// Prepare an accepted byte stream for dispatch: optionally negotiate
+/// TLS for TLS transports, read the [`LinkInit`] header, and (when
+/// `expected_kind` is set) validate the client's [`ProtocolKind`].
+///
+/// Shared by the simplex, duplex, and muxed accept loops so each
+/// `prepare` closure stays a thin wrapper over this function. Pass
+/// `expected_kind = None` to accept either kind (used by the mux
+/// listener, which dispatches by kind after the header is read).
+pub(super) async fn prepare_accepted_stream(
+    stream: Box<dyn Stream>,
+    source: ChannelAddr,
+    dest: ChannelAddr,
+    expected_kind: Option<ProtocolKind>,
+) -> Result<(LinkInit, Box<dyn Stream>), anyhow::Error> {
+    let is_tls = dest.transport().is_tls();
+    let (link_init, stream): (LinkInit, Box<dyn Stream>) = if is_tls {
+        let tls_acceptor = match dest.transport() {
+            ChannelTransport::Tls => tls::tls_acceptor()?,
+            _ => meta::tls_acceptor(true)?,
+        };
+        let mut tls_stream = tls_acceptor.accept(stream).await?;
+        let link_init = read_link_init(&mut tls_stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("LinkInit read failed from {}: {}", source, e))?;
+        (link_init, Box::new(tls_stream))
+    } else {
+        let mut stream = stream;
+        let link_init = read_link_init(&mut stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("LinkInit read failed from {}: {}", source, e))?;
+        (link_init, stream)
+    };
+    if let Some(expected) = expected_kind
+        && link_init.kind != expected
+    {
+        return Err(anyhow::anyhow!(
+            "{:?} server received {:?} client from {}",
+            expected,
+            link_init.kind,
+            source
+        ));
+    }
+    Ok((link_init, stream))
+}
+
+/// Future type produced by [`preparer_for`]'s closure.
+type PreparedStreamFut = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<(LinkInit, Box<dyn Stream>), anyhow::Error>> + Send,
+    >,
+>;
+
+/// Build a `prepare` closure suitable for [`server::accept_loop`] that
+/// wraps [`prepare_accepted_stream`] with the given destination address
+/// and expected [`ProtocolKind`]. Pass `expected_kind = None` for the
+/// muxed listener path, which dispatches on `link_init.kind` after the
+/// header is read instead of validating up front.
+pub(super) fn preparer_for(
+    dest: ChannelAddr,
+    expected_kind: Option<ProtocolKind>,
+) -> impl Fn(Box<dyn Stream>, ChannelAddr) -> PreparedStreamFut + Clone + Send + 'static {
+    move |stream, source| {
+        let dest = dest.clone();
+        Box::pin(prepare_accepted_stream(stream, source, dest, expected_kind))
+    }
 }
 
 /// Link represents a network link through which connections may be
@@ -178,6 +276,35 @@ use session::Session;
 
 use crate::config;
 use crate::metrics;
+
+/// TCP keepalive probe interval after the idle period elapses.
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Number of failed keepalive probes before the kernel marks the
+/// connection dead.
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+/// Enable TCP keepalive on a freshly-created socket so the kernel can
+/// surface peer death on otherwise-idle connections.
+/// [`config::CHANNEL_TCP_KEEPALIVE_IDLE`] is the kernel idle period —
+/// the gap from last activity to the first probe — so on a healthy
+/// idle connection it's also the probe cadence. Total detection time
+/// is `idle + TCP_KEEPALIVE_RETRIES * TCP_KEEPALIVE_INTERVAL`. Logs
+/// and ignores errors: keepalive is best-effort and some test
+/// harnesses use sockets that don't support it.
+fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
+    let idle = hyperactor_config::global::get(config::CHANNEL_TCP_KEEPALIVE_IDLE);
+
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(idle)
+        .with_interval(TCP_KEEPALIVE_INTERVAL)
+        .with_retries(TCP_KEEPALIVE_RETRIES);
+
+    let sock = socket2::SockRef::from(stream);
+    if let Err(err) = sock.set_tcp_keepalive(&ka) {
+        tracing::warn!(?err, "failed to set TCP keepalive on stream");
+    }
+}
 
 pub(crate) enum LinkStatus {
     NeverConnected,
@@ -269,22 +396,47 @@ fn log_send_error(
             );
             true
         }
-        session::SendLoopError::OversizedFrame(reason) => {
-            tracing::error!(dest = %dest, session_id, mode, "oversized frame: {reason}; {link_status}");
+        session::SendLoopError::OversizedFrame { size, max } => {
+            tracing::error!(
+                dest = %dest,
+                session_id,
+                mode,
+                "oversized frame: len={size} > max={max}; {link_status}"
+            );
             true
         }
     }
 }
 
+/// Map a terminal [`session::SendLoopError`] to a typed [`CloseReason`] for
+/// the `TxStatus` watcher. Variants that callers want to branch on (e.g.
+/// `DialMailboxRouter` keys cache eviction on `SequenceMismatch`) get their
+/// own typed reason; the rest flatten to `Other` carrying the same
+/// `{log_id}: {e}` text used previously for logging.
+fn classify_send_loop_error(error: &session::SendLoopError, log_id: &str) -> CloseReason {
+    match error {
+        session::SendLoopError::Rejected(reason) if reason.contains("out-of-sequence message") => {
+            CloseReason::SequenceMismatch(reason.clone())
+        }
+        session::SendLoopError::OversizedFrame { size, max } => CloseReason::OversizedFrame {
+            size: *size,
+            max: *max,
+        },
+        _ => CloseReason::Other(format!("{log_id}: {error}")),
+    }
+}
+
 /// Establish a simplex (send-only) session over the given link. Returns a send handle.
-pub(crate) fn spawn<M: RemoteMessage>(link: impl Link) -> NetTx<M> {
-    spawn_inner(link)
+pub(crate) fn spawn<M: RemoteMessage>(link: impl Link) -> super::ChannelTx<M> {
+    spawn_inner::<M>(link)
 }
 
 /// Establish a multi-stream (unordered) simplex session over N
 /// links sharing the same `SessionId`. Returns a single send handle
 /// that distributes frames across streams.
-pub(crate) fn spawn_unordered<M: RemoteMessage>(links: Vec<impl Link + 'static>) -> NetTx<M> {
+pub(crate) fn spawn_unordered<M: RemoteMessage>(
+    links: Vec<impl Link + 'static>,
+) -> super::ChannelTx<M> {
     assert!(!links.is_empty());
     if links.len() == 1 {
         return spawn(links.into_iter().next().unwrap());
@@ -294,7 +446,7 @@ pub(crate) fn spawn_unordered<M: RemoteMessage>(links: Vec<impl Link + 'static>)
     let dest = links[0].dest();
     let session_id = links[0].link_id();
     let (notify, status) = watch::channel(TxStatus::Active);
-    let tx = NetTx {
+    let tx = super::ChannelTx {
         sender,
         dest: dest.clone(),
         status,
@@ -370,7 +522,11 @@ pub(crate) fn spawn_unordered<M: RemoteMessage>(links: Vec<impl Link + 'static>)
                                                     let mut guard = unacked.lock().await;
                                                     // Remove all entries with seq <= ack.
                                                     let retain: std::collections::BTreeMap<u64, session::QueuedMessage<M>> = guard.split_off(&(ack + 1));
-                                                    drop(std::mem::replace(&mut *guard, retain));
+                                                    let accepted = std::mem::replace(&mut *guard, retain);
+                                                    drop(guard);
+                                                    accepted.into_values().for_each(|queued| {
+                                                        queued.completion.accept();
+                                                    });
                                                 }
                                                 NetRxResponse::Reject(reason) => {
                                                     return Err(session::SendLoopError::Rejected(reason));
@@ -395,7 +551,7 @@ pub(crate) fn spawn_unordered<M: RemoteMessage>(links: Vec<impl Link + 'static>)
                                         seq,
                                         message,
                                         received_at,
-                                        return_channel,
+                                        completion,
                                     } = pending;
                                     let frame = Frame::Message(seq, message);
                                     let serialized = match serde_multipart::serialize_bincode(&frame) {
@@ -404,9 +560,7 @@ pub(crate) fn spawn_unordered<M: RemoteMessage>(links: Vec<impl Link + 'static>)
                                             tracing::error!(
                                                 "{log_id}: serialization error: {e}"
                                             );
-                                            // Drops return_channel; sender perceives success
-                                            // (preserving prior behavior of the dispatcher-side
-                                            // serialize path).
+                                            completion.accept();
                                             continue;
                                         }
                                     };
@@ -415,7 +569,7 @@ pub(crate) fn spawn_unordered<M: RemoteMessage>(links: Vec<impl Link + 'static>)
                                         message: serialized,
                                         received_at,
                                         sent_at: None,
-                                        return_channel,
+                                        completion,
                                     };
                                     let framed = queued.message.clone().framed();
                                     stream.write(framed).drive().await.map_err(|e| {
@@ -465,6 +619,7 @@ pub(crate) fn spawn_unordered<M: RemoteMessage>(links: Vec<impl Link + 'static>)
             }));
         }
 
+        let cleanup_rx = queue_rx.clone();
         // Drop our local receiver clone so the queue closes once the
         // dispatcher's sender (queue_tx) is dropped at shutdown.
         drop(queue_rx);
@@ -479,16 +634,17 @@ pub(crate) fn spawn_unordered<M: RemoteMessage>(links: Vec<impl Link + 'static>)
             "multi-stream dispatcher started"
         );
 
-        while let Some((message, return_channel, received_at)) = receiver.recv().await {
+        while let Some((message, completion, received_at)) = receiver.recv().await {
             let pending = session::PendingMessage {
                 seq: next_seq,
                 message,
                 received_at,
-                return_channel,
+                completion,
             };
             next_seq += 1;
 
-            if queue_tx.send(pending).await.is_err() {
+            if let Err(async_channel::SendError(pending)) = queue_tx.send(pending).await {
+                pending.completion.accept();
                 // All writers are gone.
                 break;
             }
@@ -499,20 +655,30 @@ pub(crate) fn spawn_unordered<M: RemoteMessage>(links: Vec<impl Link + 'static>)
         for handle in writer_handles {
             let _ = handle.await;
         }
+        while let Ok(pending) = cleanup_rx.try_recv() {
+            pending.completion.accept();
+        }
+        for queued in Arc::into_inner(unacked)
+            .expect("writer handles should drop their unacked clones")
+            .into_inner()
+            .into_values()
+        {
+            queued.completion.accept();
+        }
 
         let reason = format!("{log_id}: dispatcher closed");
-        let _ = notify.send(TxStatus::Closed(reason.into()));
+        let _ = notify.send(TxStatus::Closed(CloseReason::Other(reason)));
     });
 
     tx
 }
 
-fn spawn_inner<M: RemoteMessage>(link: impl Link) -> NetTx<M> {
+fn spawn_inner<M: RemoteMessage>(link: impl Link) -> super::ChannelTx<M> {
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let dest = link.dest();
     let session_id = link.link_id();
     let (notify, status) = watch::channel(TxStatus::Active);
-    let tx = NetTx {
+    let tx = super::ChannelTx {
         sender,
         dest: dest.clone(),
         status,
@@ -536,12 +702,16 @@ fn spawn_inner<M: RemoteMessage>(link: impl Link) -> NetTx<M> {
                         error = %err,
                         "failed to push message to outbox"
                     );
-                    let _ = notify.send(TxStatus::Closed("failed to push to outbox".into()));
+                    let _ = notify.send(TxStatus::Closed(CloseReason::Other(
+                        "failed to push to outbox".into(),
+                    )));
                     return;
                 }
             }
             None => {
-                let _ = notify.send(TxStatus::Closed("sender dropped".into()));
+                let _ = notify.send(TxStatus::Closed(CloseReason::Other(
+                    "sender dropped".into(),
+                )));
                 return;
             }
         }
@@ -556,7 +726,7 @@ fn spawn_inner<M: RemoteMessage>(link: impl Link) -> NetTx<M> {
 
         let mut link_status = LinkStatus::NeverConnected;
 
-        let reason: String = 'outer: loop {
+        let reason: CloseReason = 'outer: loop {
             let connected = match deliveries.expiry_time() {
                 Some(deadline) => match session.connect_by(deadline).await {
                     Ok(s) => s,
@@ -574,12 +744,12 @@ fn spawn_inner<M: RemoteMessage>(link: impl Link) -> NetTx<M> {
                         tracing::error!(
                             dest = %dest, session_id = session_id.0, "{}", error_msg
                         );
-                        break 'outer format!("{log_id}: {error_msg}");
+                        break 'outer CloseReason::Other(format!("{log_id}: {error_msg}"));
                     }
                 },
                 None => match session.connect().await {
                     Ok(s) => s,
-                    Err(_) => break 'outer "session shut down".into(),
+                    Err(_) => break 'outer CloseReason::Other("session shut down".into()),
                 },
             };
 
@@ -637,7 +807,7 @@ fn spawn_inner<M: RemoteMessage>(link: impl Link) -> NetTx<M> {
                 }
                 Err(ref e) => {
                     if log_send_error(e, &dest, session_id.0, "simplex", &link_status) {
-                        break 'outer format!("{log_id}: {e}");
+                        break 'outer classify_send_loop_error(e, &log_id);
                     }
                     // Recoverable error — reconnect after backoff.
                     if let Some(delay) = reconnect_backoff.next_backoff() {
@@ -655,26 +825,33 @@ fn spawn_inner<M: RemoteMessage>(link: impl Link) -> NetTx<M> {
         };
 
         tracing::info!(
-            dest = %dest, session_id = session_id.0, "NetTx closing: {reason}"
+            dest = %dest, session_id = session_id.0, "ChannelTx closing: {reason}"
         );
 
+        let send_error_reason = match &reason {
+            CloseReason::OversizedFrame { size, max } => Some(SendErrorReason::OversizedFrame {
+                len: *size,
+                max: *max,
+            }),
+            _ => Some(SendErrorReason::Other(reason.to_string())),
+        };
         receiver.close();
         deliveries
             .unacked
             .deque
             .drain(..)
             .chain(deliveries.outbox.deque.drain(..))
-            .for_each(|queued| queued.try_return(Some(reason.clone())));
-        while let Ok((msg, return_channel, _)) = receiver.try_recv() {
-            let _ = return_channel.send(SendError {
+            .for_each(|queued| queued.try_return(send_error_reason.clone()));
+        while let Ok((msg, completion, _)) = receiver.try_recv() {
+            completion.reject(SendError {
                 error: ChannelError::Closed,
                 message: msg,
-                reason: Some(reason.clone()),
+                reason: send_error_reason.clone(),
             });
         }
 
-        let _ = notify.send(TxStatus::Closed(reason.into()));
-    });
+        let _ = notify.send(TxStatus::Closed(reason));
+    }.instrument(tracing::debug_span!("net tx loop")));
     tx
 }
 
@@ -685,27 +862,56 @@ pub(crate) enum NetLink {
     Tcp(tcp::TcpLink),
     Unix(unix::UnixLink),
     Tls(tls::TlsLink),
+    Quic(quic::QuicLink),
+    Local(local::stream::LocalLink),
 }
 
 /// Create a link for the given channel address with the given
 /// `session_id` and `stream_id`. Single-stream callers pass a fresh
 /// `SessionId::random()` and `stream_id = 0`.
+/// Tagged with the protocol kind the client intends to speak.
 pub(crate) fn link(
     addr: ChannelAddr,
     session_id: SessionId,
     stream_id: u8,
+    kind: ProtocolKind,
 ) -> Result<NetLink, ClientError> {
     match addr {
-        ChannelAddr::Tcp(socket_addr) => {
-            Ok(NetLink::Tcp(tcp::link(socket_addr, session_id, stream_id)))
+        ChannelAddr::Tcp(socket_addr) => Ok(NetLink::Tcp(tcp::link(
+            socket_addr,
+            session_id,
+            stream_id,
+            kind,
+        ))),
+        ChannelAddr::Unix(unix_addr) => Ok(NetLink::Unix(unix::link(
+            unix_addr, session_id, stream_id, kind,
+        ))),
+        ChannelAddr::Local(port) => {
+            local::stream::check(port)?;
+            Ok(NetLink::Local(local::stream::link(
+                port, session_id, stream_id, kind,
+            )))
         }
-        ChannelAddr::Unix(unix_addr) => {
-            Ok(NetLink::Unix(unix::link(unix_addr, session_id, stream_id)))
-        }
-        ChannelAddr::Tls(tls_addr) => Ok(NetLink::Tls(tls::link(tls_addr, session_id, stream_id)?)),
-        ChannelAddr::MetaTls(meta_addr) => {
-            Ok(NetLink::Tls(meta::link(meta_addr, session_id, stream_id)?))
-        }
+        ChannelAddr::Tls(tls_addr) => Ok(NetLink::Tls(tls::link(
+            tls_addr, session_id, stream_id, kind,
+        )?)),
+        ChannelAddr::MetaTls(meta_addr) => Ok(NetLink::Tls(meta::link(
+            meta_addr, session_id, stream_id, kind,
+        )?)),
+        ChannelAddr::Quic(quic_addr) => Ok(NetLink::Quic(quic::link(
+            quic_addr,
+            quic::QuicAddrType::Quic,
+            session_id,
+            stream_id,
+            kind,
+        )?)),
+        ChannelAddr::MetaQuic(meta_addr) => Ok(NetLink::Quic(quic::link(
+            meta_addr,
+            quic::QuicAddrType::MetaQuic,
+            session_id,
+            stream_id,
+            kind,
+        )?)),
         other => Err(ClientError::Connect(
             other,
             std::io::Error::other("unsupported transport"),
@@ -723,6 +929,8 @@ impl Link for NetLink {
             Self::Tcp(l) => l.dest(),
             Self::Unix(l) => l.dest(),
             Self::Tls(l) => l.dest(),
+            Self::Quic(l) => l.dest(),
+            Self::Local(l) => l.dest(),
         }
     }
 
@@ -731,6 +939,8 @@ impl Link for NetLink {
             Self::Tcp(l) => l.link_id(),
             Self::Unix(l) => l.link_id(),
             Self::Tls(l) => l.link_id(),
+            Self::Quic(l) => l.link_id(),
+            Self::Local(l) => l.link_id(),
         }
     }
 
@@ -739,6 +949,8 @@ impl Link for NetLink {
             Self::Tcp(l) => Ok(Box::new(l.next().await?)),
             Self::Unix(l) => Ok(Box::new(l.next().await?)),
             Self::Tls(l) => Ok(Box::new(l.next().await?)),
+            Self::Quic(l) => Ok(Box::new(l.next().await?)),
+            Self::Local(l) => Ok(Box::new(l.next().await?)),
         }
     }
 }
@@ -764,6 +976,8 @@ pub(crate) trait Listener: Send + Unpin + 'static {
 pub(crate) enum NetListener {
     Tcp(tcp::TcpSocketListener),
     Unix(unix::UnixSocketListener),
+    Quic(quic::QuicSocketListener),
+    Local(local::stream::LocalListener),
 }
 
 #[async_trait]
@@ -777,6 +991,14 @@ impl Listener for NetListener {
                 Ok((Box::new(stream), addr))
             }
             Self::Unix(l) => {
+                let (stream, addr) = l.accept().await?;
+                Ok((Box::new(stream), addr))
+            }
+            Self::Quic(l) => {
+                let (stream, addr) = l.accept().await?;
+                Ok((Box::new(stream), addr))
+            }
+            Self::Local(l) => {
                 let (stream, addr) = l.accept().await?;
                 Ok((Box::new(stream), addr))
             }
@@ -840,6 +1062,10 @@ pub(crate) fn listen_with_prebound(
             };
             Ok((NetListener::Unix(listener), ChannelAddr::Unix(bound_addr)))
         }
+        ChannelAddr::Local(_) => {
+            let (listener, addr) = local::stream::listen(addr, prebound)?;
+            Ok((NetListener::Local(listener), addr))
+        }
         addr @ (ChannelAddr::Tls(_) | ChannelAddr::MetaTls(_)) => {
             let is_meta = matches!(addr, ChannelAddr::MetaTls(_));
             let tls_addr = match addr {
@@ -890,18 +1116,37 @@ pub(crate) fn listen_with_prebound(
                 make_channel_addr(&hostname, local_addr.port()),
             ))
         }
-        other => Err(ServerError::Listen(
-            other.clone(),
-            std::io::Error::other(format!("unsupported transport: {}", other)),
-        )),
+        addr @ (ChannelAddr::Quic(_) | ChannelAddr::MetaQuic(_)) => {
+            if prebound.is_some() {
+                return Err(ServerError::Listen(
+                    addr,
+                    std::io::Error::other("pre-opened listener not supported for QUIC transport"),
+                ));
+            }
+            let addr_type = match addr {
+                ChannelAddr::Quic(_) => quic::QuicAddrType::Quic,
+                ChannelAddr::MetaQuic(_) => quic::QuicAddrType::MetaQuic,
+                _ => unreachable!(),
+            };
+            let tls_addr = match addr {
+                ChannelAddr::Quic(a) | ChannelAddr::MetaQuic(a) => a,
+                _ => unreachable!(),
+            };
+            let (listener, bound_addr) = quic::listen(tls_addr, addr_type)?;
+            Ok((NetListener::Quic(listener), bound_addr))
+        }
+        ChannelAddr::Alias { dial_to, bind_to } => {
+            // Bind the socket on `bind_to` (e.g. a wildcard interface), but
+            // advertise `dial_to` as the canonical address. Callers refer to
+            // this server by its dial address; the listener merely needs to
+            // accept the connections that `dial_to` is routed to (e.g. via
+            // NAT). The alias is fully consumed here -- everything downstream,
+            // including the proc namespace derived from this address, uses
+            // `dial_to`, which is what remote peers independently construct.
+            let (listener, _bound_addr) = listen_with_prebound(*bind_to, prebound)?;
+            Ok((listener, *dial_to))
+        }
     }
-}
-
-/// Bind a listener for the given channel address. Returns the listener
-/// and the canonical address callers should advertise (which encodes
-/// the transport — e.g. `ChannelAddr::Tls` for TLS).
-pub(crate) fn listen(addr: ChannelAddr) -> Result<(NetListener, ChannelAddr), ServerError> {
-    listen_with_prebound(addr, None)
 }
 
 /// Frames are the messages sent between clients and servers over sessions.
@@ -914,7 +1159,7 @@ pub(super) enum Frame<M> {
 #[derive(Debug, Serialize, Deserialize, EnumAsInner)]
 pub(super) enum NetRxResponse {
     Ack(u64),
-    /// This session is rejected with the given reason. NetTx should stop reconnecting.
+    /// This session is rejected with the given reason. ChannelTx should stop reconnecting.
     Reject(String),
     /// This channel is closed.
     Closed,
@@ -930,80 +1175,6 @@ pub(super) fn deserialize_response(
     data: Bytes,
 ) -> Result<NetRxResponse, bincode::error::DecodeError> {
     bincode::serde::decode_from_slice(&data, bincode::config::legacy()).map(|(v, _)| v)
-}
-
-/// A Tx implemented on top of a Link. The Tx manages the link state,
-/// reconnections, etc.
-pub(crate) struct NetTx<M: RemoteMessage> {
-    sender: mpsc::UnboundedSender<(M, oneshot::Sender<SendError<M>>, Instant)>,
-    dest: ChannelAddr,
-    status: watch::Receiver<TxStatus>,
-}
-
-#[async_trait]
-impl<M: RemoteMessage> Tx<M> for NetTx<M> {
-    fn addr(&self) -> ChannelAddr {
-        self.dest.clone()
-    }
-
-    fn status(&self) -> &watch::Receiver<TxStatus> {
-        &self.status
-    }
-
-    fn do_post(&self, message: M, return_channel: Option<oneshot::Sender<SendError<M>>>) {
-        tracing::trace!(
-            name = "post",
-            dest = %self.dest,
-            "sending message"
-        );
-
-        let return_channel = return_channel.unwrap_or_else(|| oneshot::channel().0);
-        if let Err(mpsc::error::SendError((message, return_channel, _))) =
-            self.sender
-                .send((message, return_channel, tokio::time::Instant::now()))
-        {
-            let reason = self.status.borrow().as_closed().map(|r| r.to_string());
-            let _ = return_channel.send(SendError {
-                error: ChannelError::Closed,
-                message,
-                reason,
-            });
-        }
-    }
-}
-
-pub struct NetRx<M: RemoteMessage>(mpsc::Receiver<M>, ChannelAddr, ServerHandle);
-
-#[async_trait]
-impl<M: RemoteMessage> Rx<M> for NetRx<M> {
-    async fn recv(&mut self) -> Result<M, ChannelError> {
-        tracing::trace!(
-            name = "recv",
-            dest = %self.1,
-            "receiving message"
-        );
-        self.0.recv().await.ok_or(ChannelError::Closed)
-    }
-
-    fn addr(&self) -> ChannelAddr {
-        self.1.clone()
-    }
-
-    /// Gracefully shut down the channel server, waiting for pending
-    /// acks to be flushed before returning.
-    async fn join(mut self) {
-        self.2
-            .stop(&format!("NetRx joined; channel address: {}", self.1));
-        let _ = (&mut self.2).await;
-        // Drop will call stop() again which is harmless (token already cancelled).
-    }
-}
-
-impl<M: RemoteMessage> Drop for NetRx<M> {
-    fn drop(&mut self) {
-        self.2
-            .stop(&format!("NetRx dropped; channel address: {}", self.1));
-    }
 }
 
 /// Error returned during server operations.
@@ -1027,6 +1198,8 @@ pub enum ServerError {
 pub enum ClientError {
     #[error("connection to {0} failed: {1}: {2}")]
     Connect(ChannelAddr, std::io::Error, String),
+    #[error("connection to {0} failed after {1:?} of retries: {2}")]
+    ConnectTimeout(ChannelAddr, Duration, #[source] std::io::Error),
     #[error("unable to resolve address: {0}")]
     Resolve(ChannelAddr),
     #[error("io: {0} {1}")]
@@ -1041,13 +1214,16 @@ pub enum ClientError {
 /// from local transports.
 #[cfg(test)]
 pub(super) fn is_net_addr(addr: &ChannelAddr) -> bool {
-    match addr.transport() {
-        ChannelTransport::Tcp(_) => true,
-        ChannelTransport::MetaTls(_) => true,
-        ChannelTransport::Tls => true,
-        ChannelTransport::Unix => true,
-        _ => false,
-    }
+    matches!(
+        addr.transport(),
+        ChannelTransport::Tcp(_)
+            | ChannelTransport::MetaTls(_)
+            | ChannelTransport::Tls
+            | ChannelTransport::Quic
+            | ChannelTransport::MetaQuic(_)
+            | ChannelTransport::Unix
+            | ChannelTransport::Local
+    )
 }
 
 pub(crate) mod unix {
@@ -1068,6 +1244,7 @@ pub(crate) mod unix {
         pub(super) addr: SocketAddr,
         pub(super) session_id: SessionId,
         pub(super) stream_id: u8,
+        pub(super) kind: ProtocolKind,
     }
 
     #[async_trait]
@@ -1103,7 +1280,7 @@ pub(crate) mod unix {
                             .map_err(|err| ClientError::Io(self.dest(), err))?;
                         let mut stream = UnixStream::from_std(std_stream)
                             .map_err(|err| ClientError::Io(self.dest(), err))?;
-                        write_link_init(&mut stream, session_id, self.stream_id)
+                        write_link_init(&mut stream, session_id, self.stream_id, self.kind)
                             .await
                             .map_err(|err| ClientError::Io(self.dest(), err))?;
                         return Ok(stream);
@@ -1143,11 +1320,17 @@ pub(crate) mod unix {
     }
 
     /// Create a unix link to the given socket address.
-    pub(crate) fn link(addr: SocketAddr, session_id: SessionId, stream_id: u8) -> UnixLink {
+    pub(crate) fn link(
+        addr: SocketAddr,
+        session_id: SessionId,
+        stream_id: u8,
+        kind: ProtocolKind,
+    ) -> UnixLink {
         UnixLink {
             addr,
             session_id,
             stream_id,
+            kind,
         }
     }
 
@@ -1361,6 +1544,7 @@ pub(crate) mod tcp {
         pub(super) addr: SocketAddr,
         pub(super) session_id: SessionId,
         pub(super) stream_id: u8,
+        pub(super) kind: ProtocolKind,
     }
 
     #[async_trait]
@@ -1377,12 +1561,14 @@ pub(crate) mod tcp {
 
         async fn next(&mut self) -> Result<Self::Stream, ClientError> {
             let session_id = self.session_id;
+            let reconnect_timeout =
+                hyperactor_config::global::get(config::CHANNEL_RECONNECT_TIMEOUT);
             let mut backoff = ExponentialBackoffBuilder::new()
                 .with_initial_interval(Duration::from_millis(1))
                 .with_multiplier(2.0)
                 .with_randomization_factor(0.1)
                 .with_max_interval(Duration::from_millis(1000))
-                .with_max_elapsed_time(None)
+                .with_max_elapsed_time(Some(reconnect_timeout))
                 .build();
             loop {
                 match TcpStream::connect(&self.addr).await {
@@ -1394,15 +1580,23 @@ pub(crate) mod tcp {
                                 "cannot disable Nagle algorithm".to_string(),
                             )
                         })?;
-                        write_link_init(&mut stream, session_id, self.stream_id)
+                        set_tcp_keepalive(&stream);
+                        write_link_init(&mut stream, session_id, self.stream_id, self.kind)
                             .await
                             .map_err(|err| ClientError::Io(self.dest(), err))?;
                         return Ok(stream);
                     }
                     Err(err) => {
                         tracing::debug!(error = %err, "tcp connect failed, backing off");
-                        if let Some(delay) = backoff.next_backoff() {
-                            tokio::time::sleep(delay).await;
+                        match backoff.next_backoff() {
+                            Some(delay) => tokio::time::sleep(delay).await,
+                            None => {
+                                return Err(ClientError::ConnectTimeout(
+                                    self.dest(),
+                                    reconnect_timeout,
+                                    err,
+                                ));
+                            }
                         }
                     }
                 }
@@ -1430,16 +1624,23 @@ pub(crate) mod tcp {
             stream
                 .set_nodelay(true)
                 .map_err(|err| ServerError::Io(ChannelAddr::Tcp(self.addr), err))?;
+            set_tcp_keepalive(&stream);
             Ok((stream, ChannelAddr::Tcp(peer_addr)))
         }
     }
 
     /// Create a TCP link to the given socket address.
-    pub(crate) fn link(addr: SocketAddr, session_id: SessionId, stream_id: u8) -> TcpLink {
+    pub(crate) fn link(
+        addr: SocketAddr,
+        session_id: SessionId,
+        stream_id: u8,
+        kind: ProtocolKind,
+    ) -> TcpLink {
         TcpLink {
             addr,
             session_id,
             stream_id,
+            kind,
         }
     }
 }
@@ -1510,8 +1711,9 @@ pub(crate) mod meta {
 
     /// Creates a TLS acceptor by looking for necessary certs and keys in a Meta server environment.
     pub(crate) fn tls_acceptor(enforce_client_tls: bool) -> Result<TlsAcceptor> {
-        let bundle = get_server_pem_bundle();
-        tls::tls_acceptor_from_bundle(&bundle, enforce_client_tls)
+        Ok(TlsAcceptor::from(Arc::new(server_config(
+            enforce_client_tls,
+        )?)))
     }
 
     /// Try to create a TLS connector for Meta environments.
@@ -1526,30 +1728,24 @@ pub(crate) mod meta {
     /// Creates a TLS connector by looking for necessary certs and keys in a Meta server environment.
     /// Supports optional client authentication (unlike the tls module which always requires it).
     fn tls_connector() -> Result<TlsConnector> {
-        // Ensure ring is installed as the process-level crypto provider.
-        // No-op when already installed (e.g. under Buck with native-tls).
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        Ok(TlsConnector::from(Arc::new(client_config()?)))
+    }
 
-        let ca_path = std::env::var_os(THRIFT_TLS_SRV_CA_PATH_ENV)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_SRV_CA_PATH));
-        let ca_pem = Pem::File(ca_path);
-        let root_store = tls::build_root_store(&ca_pem)?;
+    pub(super) fn server_config(enforce_client_tls: bool) -> Result<rustls::ServerConfig> {
+        let bundle = get_server_pem_bundle();
+        tls::server_config_from_bundle(&bundle, enforce_client_tls)
+    }
 
-        // If client certs are available, use mutual TLS; otherwise, no client auth
-        let config = rustls::ClientConfig::builder().with_root_certificates(Arc::new(root_store));
-
-        let config = if let Some(bundle) = get_client_pem_bundle() {
-            let certs = tls::load_certs(&bundle.cert)?;
-            let key = tls::load_key(&bundle.key)?;
-            config
-                .with_client_auth_cert(certs, key)
-                .map_err(|e| anyhow::anyhow!("load client certs: {}", e))?
+    pub(super) fn client_config() -> Result<rustls::ClientConfig> {
+        Ok(if let Some(bundle) = get_client_pem_bundle() {
+            tls::client_config_from_bundle(&bundle)?
         } else {
-            config.with_no_client_auth()
-        };
-
-        Ok(TlsConnector::from(Arc::new(config)))
+            let ca_path = std::env::var_os(THRIFT_TLS_SRV_CA_PATH_ENV)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_SRV_CA_PATH));
+            let ca_pem = Pem::File(ca_path);
+            tls::client_config_from_ca(&ca_pem)?
+        })
     }
 
     /// Create a MetaTLS link to the given address.
@@ -1557,6 +1753,7 @@ pub(crate) mod meta {
         addr: TlsAddr,
         session_id: SessionId,
         stream_id: u8,
+        kind: ProtocolKind,
     ) -> Result<tls::TlsLink, ClientError> {
         let connector = tls_connector().map_err(|e| {
             ClientError::Connect(
@@ -1573,6 +1770,7 @@ pub(crate) mod meta {
             addr_type: tls::TlsAddrType::MetaTls,
             session_id,
             stream_id,
+            kind,
         })
     }
 }
@@ -1585,7 +1783,9 @@ pub(crate) mod tls {
 
     use anyhow::Context;
     use anyhow::Result;
+    use rustls::ClientConfig;
     use rustls::RootCertStore;
+    use rustls::ServerConfig;
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::PrivateKeyDer;
     use rustls::pki_types::ServerName;
@@ -1657,7 +1857,7 @@ pub(crate) mod tls {
     }
 
     /// Get the PEM bundle from configuration.
-    fn get_pem_bundle() -> PemBundle {
+    pub(super) fn get_pem_bundle() -> PemBundle {
         PemBundle {
             ca: hyperactor_config::global::get_cloned(TLS_CA),
             cert: hyperactor_config::global::get_cloned(TLS_CERT),
@@ -1665,21 +1865,25 @@ pub(crate) mod tls {
         }
     }
 
-    /// Creates a TLS acceptor using certificates from the provided PEM bundle.
-    /// If `enforce_client_tls` is true, requires client certificates for mutual TLS.
-    pub(super) fn tls_acceptor_from_bundle(
-        bundle: &PemBundle,
-        enforce_client_tls: bool,
-    ) -> Result<TlsAcceptor> {
+    fn install_default_crypto_provider() {
         // Ensure ring is installed as the process-level crypto provider.
         // No-op when already installed (e.g. under Buck with native-tls).
         let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    /// Creates a Rustls server config using certificates from the provided PEM bundle.
+    /// If `enforce_client_tls` is true, requires client certificates for mutual TLS.
+    pub(super) fn server_config_from_bundle(
+        bundle: &PemBundle,
+        enforce_client_tls: bool,
+    ) -> Result<ServerConfig> {
+        install_default_crypto_provider();
 
         let certs = load_certs(&bundle.cert).context("load TLS certificate")?;
         let key = load_key(&bundle.key).context("load TLS key")?;
         let root_store = build_root_store(&bundle.ca).context("build root cert store")?;
 
-        let config = rustls::ServerConfig::builder();
+        let config = ServerConfig::builder();
         let config = if enforce_client_tls {
             // Build server config with mutual TLS (require client certs)
             let client_verifier =
@@ -1692,6 +1896,16 @@ pub(crate) mod tls {
         }
         .with_single_cert(certs, key)?;
 
+        Ok(config)
+    }
+
+    /// Creates a TLS acceptor using certificates from the provided PEM bundle.
+    /// If `enforce_client_tls` is true, requires client certificates for mutual TLS.
+    pub(super) fn tls_acceptor_from_bundle(
+        bundle: &PemBundle,
+        enforce_client_tls: bool,
+    ) -> Result<TlsAcceptor> {
+        let config = server_config_from_bundle(bundle, enforce_client_tls)?;
         Ok(TlsAcceptor::from(Arc::new(config)))
     }
 
@@ -1700,21 +1914,35 @@ pub(crate) mod tls {
         tls_acceptor_from_bundle(&get_pem_bundle(), true)
     }
 
-    /// Creates a TLS connector using certificates from the provided PEM bundle.
-    pub(super) fn tls_connector_from_bundle(bundle: &PemBundle) -> Result<TlsConnector> {
-        // Ensure ring is installed as the process-level crypto provider.
-        // No-op when already installed (e.g. under Buck with native-tls).
-        let _ = rustls::crypto::ring::default_provider().install_default();
+    /// Creates a Rustls client config using only CA roots.
+    pub(super) fn client_config_from_ca(ca_pem: &Pem) -> Result<ClientConfig> {
+        install_default_crypto_provider();
+
+        let root_store = build_root_store(ca_pem).context("build root cert store")?;
+        Ok(ClientConfig::builder()
+            .with_root_certificates(Arc::new(root_store))
+            .with_no_client_auth())
+    }
+
+    /// Creates a Rustls client config using certificates from the provided PEM bundle.
+    pub(super) fn client_config_from_bundle(bundle: &PemBundle) -> Result<ClientConfig> {
+        install_default_crypto_provider();
 
         let certs = load_certs(&bundle.cert).context("load TLS certificate")?;
         let key = load_key(&bundle.key).context("load TLS key")?;
         let root_store = build_root_store(&bundle.ca).context("build root cert store")?;
 
-        let config = rustls::ClientConfig::builder()
+        let config = ClientConfig::builder()
             .with_root_certificates(Arc::new(root_store))
             .with_client_auth_cert(certs, key)
             .context("configure client auth")?;
 
+        Ok(config)
+    }
+
+    /// Creates a TLS connector using certificates from the provided PEM bundle.
+    pub(super) fn tls_connector_from_bundle(bundle: &PemBundle) -> Result<TlsConnector> {
+        let config = client_config_from_bundle(bundle)?;
         Ok(TlsConnector::from(Arc::new(config)))
     }
 
@@ -1731,6 +1959,7 @@ pub(crate) mod tls {
         pub(crate) addr_type: TlsAddrType,
         pub(crate) session_id: SessionId,
         pub(crate) stream_id: u8,
+        pub(crate) kind: ProtocolKind,
     }
 
     impl std::fmt::Debug for TlsLink {
@@ -1768,12 +1997,14 @@ pub(crate) mod tls {
                     "invalid server name".to_string(),
                 )
             })?;
+            let reconnect_timeout =
+                hyperactor_config::global::get(config::CHANNEL_RECONNECT_TIMEOUT);
             let mut backoff = ExponentialBackoffBuilder::new()
                 .with_initial_interval(Duration::from_millis(1))
                 .with_multiplier(2.0)
                 .with_randomization_factor(0.1)
                 .with_max_interval(Duration::from_millis(1000))
-                .with_max_elapsed_time(None)
+                .with_max_elapsed_time(Some(reconnect_timeout))
                 .build();
             loop {
                 let mut addrs = (self.hostname.as_ref(), self.port)
@@ -1789,6 +2020,7 @@ pub(crate) mod tls {
                                 "cannot disable Nagle algorithm".to_string(),
                             )
                         })?;
+                        set_tcp_keepalive(&stream);
                         let mut tls_stream = self
                             .connector
                             .connect(server_name.clone(), stream)
@@ -1805,15 +2037,22 @@ pub(crate) mod tls {
                                     format!("cannot establish TLS connection to {:?}", server_name),
                                 )
                             })?;
-                        write_link_init(&mut tls_stream, session_id, self.stream_id)
+                        write_link_init(&mut tls_stream, session_id, self.stream_id, self.kind)
                             .await
                             .map_err(|err| ClientError::Io(self.dest(), err))?;
                         return Ok(tls_stream);
                     }
                     Err(err) => {
                         tracing::debug!(error = %err, "tls connect failed, backing off");
-                        if let Some(delay) = backoff.next_backoff() {
-                            tokio::time::sleep(delay).await;
+                        match backoff.next_backoff() {
+                            Some(delay) => tokio::time::sleep(delay).await,
+                            None => {
+                                return Err(ClientError::ConnectTimeout(
+                                    self.dest(),
+                                    reconnect_timeout,
+                                    err,
+                                ));
+                            }
                         }
                     }
                 }
@@ -1826,6 +2065,7 @@ pub(crate) mod tls {
         addr: TlsAddr,
         session_id: SessionId,
         stream_id: u8,
+        kind: ProtocolKind,
     ) -> Result<TlsLink, ClientError> {
         let connector = tls_connector().map_err(|e| {
             ClientError::Connect(
@@ -1842,6 +2082,7 @@ pub(crate) mod tls {
             addr_type: TlsAddrType::Tls,
             session_id,
             stream_id,
+            kind,
         })
     }
 
@@ -1850,8 +2091,13 @@ pub(crate) mod tls {
         use timed_test::async_timed_test;
 
         use super::*;
+        use crate::channel::ChannelTx;
         use crate::channel::Rx;
+        use crate::channel::Tx;
+        use crate::channel::dial;
         use crate::channel::net::server;
+        use crate::channel::serve;
+        use crate::channel::unordered;
         use crate::config::Pem;
         use crate::config::TLS_CA;
         use crate::config::TLS_CERT;
@@ -1955,7 +2201,7 @@ u19txmtkiMEH+aNmekk=
                 server::serve::<u64>(ChannelAddr::Tls(addr), None).expect("failed to serve");
 
             // Dial the server
-            let tx: super::NetTx<u64> = super::spawn(
+            let tx: ChannelTx<u64> = super::spawn(
                 link(
                     match &local_addr {
                         ChannelAddr::Tls(addr) => addr.clone(),
@@ -1963,6 +2209,7 @@ u19txmtkiMEH+aNmekk=
                     },
                     SessionId::random(),
                     0,
+                    super::ProtocolKind::Simplex,
                 )
                 .expect("failed to create link"),
             );
@@ -1973,6 +2220,56 @@ u19txmtkiMEH+aNmekk=
             // Receive the message
             let received = rx.recv().await.expect("failed to receive");
             assert_eq!(received, 42u64);
+        }
+
+        #[async_timed_test(timeout_secs = 30)]
+        async fn test_quic_basic() {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+
+            let config = hyperactor_config::global::lock();
+            let _guard_cert =
+                config.override_key(TLS_CERT, Pem::Value(TEST_SERVER_CERT.as_bytes().to_vec()));
+            let _guard_key =
+                config.override_key(TLS_KEY, Pem::Value(TEST_SERVER_KEY.as_bytes().to_vec()));
+            let _guard_ca =
+                config.override_key(TLS_CA, Pem::Value(TEST_CA_CERT.as_bytes().to_vec()));
+
+            let (addr, mut rx) =
+                serve::<u64>(ChannelAddr::Quic(TlsAddr::new("localhost", 0))).unwrap();
+            let tx = dial::<u64>(addr).unwrap();
+
+            tx.post(42u64);
+
+            let received = rx.recv().await.expect("failed to receive");
+            assert_eq!(received, 42u64);
+        }
+
+        #[async_timed_test(timeout_secs = 30)]
+        async fn test_quic_unordered_basic() {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+
+            let config = hyperactor_config::global::lock();
+            let _guard_cert =
+                config.override_key(TLS_CERT, Pem::Value(TEST_SERVER_CERT.as_bytes().to_vec()));
+            let _guard_key =
+                config.override_key(TLS_KEY, Pem::Value(TEST_SERVER_KEY.as_bytes().to_vec()));
+            let _guard_ca =
+                config.override_key(TLS_CA, Pem::Value(TEST_CA_CERT.as_bytes().to_vec()));
+
+            let (addr, mut rx) =
+                unordered::serve::<u64>(ChannelAddr::Quic(TlsAddr::new("localhost", 0))).unwrap();
+            let tx = unordered::dial::<u64>(addr, 2).unwrap();
+
+            for i in 0..8 {
+                tx.post(i);
+            }
+
+            let mut received = Vec::new();
+            for _ in 0..8 {
+                received.push(rx.recv().await.expect("failed to receive"));
+            }
+            received.sort();
+            assert_eq!(received, (0..8).collect::<Vec<_>>());
         }
 
         #[async_timed_test(timeout_secs = 30)]
@@ -1992,7 +2289,7 @@ u19txmtkiMEH+aNmekk=
 
             let (local_addr, mut rx) =
                 server::serve::<String>(ChannelAddr::Tls(addr), None).expect("failed to serve");
-            let tx: super::NetTx<String> = super::spawn(
+            let tx: ChannelTx<String> = super::spawn(
                 link(
                     match &local_addr {
                         ChannelAddr::Tls(addr) => addr.clone(),
@@ -2000,6 +2297,7 @@ u19txmtkiMEH+aNmekk=
                     },
                     SessionId::random(),
                     0,
+                    super::ProtocolKind::Simplex,
                 )
                 .expect("failed to create link"),
             );
@@ -2177,6 +2475,9 @@ pub fn try_tls_connector() -> Option<tokio_rustls::TlsConnector> {
     if let Ok(connector) = tls::tls_connector_from_bundle(&oss_bundle) {
         return Some(connector);
     }
+    if let Ok(config) = tls::client_config_from_ca(&oss_bundle.ca) {
+        return Some(tokio_rustls::TlsConnector::from(Arc::new(config)));
+    }
     tracing::debug!("OSS TLS connector failed, trying Meta paths");
 
     if let Ok(connector) = meta::try_tls_connector() {
@@ -2189,7 +2490,13 @@ pub fn try_tls_connector() -> Option<tokio_rustls::TlsConnector> {
 
 #[cfg(test)]
 mod tests {
-    use std::assert_matches::assert_matches;
+
+    #![expect(
+        clippy::await_holding_invalid_type,
+        reason = "tracing_test::traced_test macro expansion holds tracing::span::Entered across awaits; can't be fixed in our code"
+    )]
+
+    use std::assert_matches;
     use std::collections::VecDeque;
     use std::marker::PhantomData;
     use std::sync::Arc;
@@ -2209,16 +2516,20 @@ mod tests {
     use rand::distr::Alphanumeric;
     use rand::rngs::SysRng;
     use timed_test::async_timed_test;
+    use tokio::io::AsyncRead;
     use tokio::io::AsyncWrite;
     use tokio::io::DuplexStream;
     use tokio::io::ReadHalf;
     use tokio::io::WriteHalf;
     use tokio::task::JoinHandle;
+    use tokio::time::Instant;
     use tokio_util::sync::CancellationToken;
 
     use super::server;
     use super::*;
     use crate::channel;
+    use crate::channel::ChannelRx;
+    use crate::channel::ChannelTx;
     use crate::channel::net::framed::FrameReader;
     use crate::channel::net::framed::FrameWrite;
     use crate::channel::net::server::AcceptorLink;
@@ -2258,8 +2569,8 @@ mod tests {
         // It is important to keep Tx alive until all expected messages are
         // received. Otherwise, the channel would be closed when Tx is dropped.
         // Although the messages are sent to the server's buffer before the
-        // channel was closed, NetRx could still error out before taking them
-        // out of the buffer because NetRx could not ack through the closed
+        // channel was closed, ChannelRx could still error out before taking them
+        // out of the buffer because ChannelRx could not ack through the closed
         // channel.
         {
             let tx: ChannelTx<u64> = channel::dial::<u64>(addr.clone()).unwrap();
@@ -2282,11 +2593,9 @@ mod tests {
             let tx = channel::dial::<u64>(addr).unwrap();
             drop(rx);
 
-            let (return_tx, return_rx) = oneshot::channel();
-            tx.try_post(123, return_tx);
             assert_matches!(
-                return_rx.await,
-                Ok(SendError {
+                tx.try_post(123).await,
+                Err(SendError {
                     error: ChannelError::Closed,
                     message: 123,
                     ..
@@ -2357,11 +2666,9 @@ mod tests {
             let tx = channel::dial::<u64>(addr).unwrap();
             drop(rx);
 
-            let (return_tx, return_rx) = oneshot::channel();
-            tx.try_post(123, return_tx);
             assert_matches!(
-                return_rx.await,
-                Ok(SendError {
+                tx.try_post(123).await,
+                Err(SendError {
                     error: ChannelError::Closed,
                     message: 123,
                     ..
@@ -2370,8 +2677,42 @@ mod tests {
         }
     }
 
+    #[async_timed_test(timeout_secs = 20)]
+    #[cfg_attr(not(fbcode_build), ignore)]
+    async fn test_tcp_unreachable_peer_surfaces_closed() {
+        // With a bounded reconnect timeout, dialing an unreachable peer must
+        // surface as TxStatus::Closed — not loop forever. The
+        // `async_timed_test` timeout above is the only failure backstop; the
+        // body itself is purely event-driven on the status watch.
+        let config = hyperactor_config::global::lock();
+        // `connect_by` retries `link.next()` until MESSAGE_DELIVERY_TIMEOUT
+        // when an outbound message is pending. Bound both so the test surfaces
+        // Closed within a few seconds rather than the 30s default.
+        let _g1 = config.override_key(config::CHANNEL_RECONNECT_TIMEOUT, Duration::from_secs(1));
+        let _g2 = config.override_key(config::MESSAGE_DELIVERY_TIMEOUT, Duration::from_secs(3));
+
+        // Bind a listener to grab a free local port, then drop it so connects
+        // get ECONNREFUSED.
+        let (addr, rx) =
+            server::serve::<u64>(ChannelAddr::Tcp("[::1]:0".parse().unwrap()), None).unwrap();
+        drop(rx);
+
+        let tx = channel::dial::<u64>(addr.clone()).unwrap();
+        tx.post(123); // primes the send loop so the connect path runs
+
+        let mut status = tx.status().clone();
+        while !status.borrow_and_update().is_closed() {
+            status.changed().await.unwrap();
+        }
+    }
+
     // The message size is limited by CODEC_MAX_FRAME_LENGTH.
-    #[async_timed_test(timeout_secs = 5)]
+    //
+    // Sends a payload of `default_size_in_bytes` (100 MiB) over a TCP
+    // loopback. Real-time wall clock on a loaded build host can take
+    // several seconds; the 30s timeout is comfortable headroom while
+    // still surfacing genuine hangs.
+    #[async_timed_test(timeout_secs = 30)]
     // TODO: OSS: called `Result::unwrap()` on an `Err` value: Listen(Tcp([::1]:0), Os { code: 99, kind: AddrNotAvailable, message: "Cannot assign requested address" })
     #[cfg_attr(not(fbcode_build), ignore)]
     async fn test_tcp_message_size() {
@@ -2394,10 +2735,8 @@ mod tests {
         }
         // Bigger than the default size will fail.
         {
-            let (return_channel, return_receiver) = oneshot::channel();
             let message = "a".repeat(default_size_in_bytes + 1024);
-            tx.try_post(message.clone(), return_channel);
-            let returned = return_receiver.await.unwrap();
+            let returned = tx.try_post(message.clone()).await.unwrap_err();
             assert_eq!(message, returned.message);
         }
     }
@@ -2417,13 +2756,10 @@ mod tests {
         let (addr, mut net_rx) =
             server::serve::<u64>(ChannelAddr::Tcp("[::1]:0".parse().unwrap()), None).unwrap();
         let net_tx = channel::dial::<u64>(addr.clone()).unwrap();
-        let (tx, rx) = oneshot::channel();
-        net_tx.try_post(1, tx);
+        let receipt = net_tx.try_post(1);
         assert_eq!(net_rx.recv().await.unwrap(), 1);
         drop(net_rx);
-        // Using `is_err` to confirm the message is delivered/acked is confusing,
-        // but is correct. See how send is implemented: https://fburl.com/code/ywt8lip2
-        assert!(rx.await.is_err());
+        assert!(receipt.await.is_ok());
     }
 
     #[async_timed_test(timeout_secs = 60)]
@@ -2459,11 +2795,9 @@ mod tests {
             let tx = channel::dial::<u64>(local_addr).unwrap();
             drop(rx);
 
-            let (return_tx, return_rx) = oneshot::channel();
-            tx.try_post(123, return_tx);
             assert_matches!(
-                return_rx.await,
-                Ok(SendError {
+                tx.try_post(123).await,
+                Err(SendError {
                     error: ChannelError::Closed,
                     message: 123,
                     ..
@@ -2736,7 +3070,7 @@ mod tests {
             // Write LinkInit on server_relay so it's readable from `server`.
             // This simulates the client sending LinkInit over the wire before
             // the frame-level relay begins.
-            write_link_init(&mut server_relay, session_id, 0)
+            write_link_init(&mut server_relay, session_id, 0, ProtocolKind::Simplex)
                 .await
                 .map_err(|err| ClientError::Io(self.dest(), err))?;
 
@@ -2756,7 +3090,7 @@ mod tests {
                 server_reader,
                 client_writer,
                 task_coordination_token.clone(),
-                self.debug_log_sampling_rate.clone(),
+                self.debug_log_sampling_rate,
                 /*is_from_client*/ false,
             ));
             let _client_relay_task_handle = tokio::spawn(relay_message::<M>(
@@ -2767,7 +3101,7 @@ mod tests {
                 client_reader,
                 server_writer,
                 task_coordination_token,
-                self.debug_log_sampling_rate.clone(),
+                self.debug_log_sampling_rate,
                 /*is_from_client*/ true,
             ));
 
@@ -3076,8 +3410,7 @@ mod tests {
         let config = hyperactor_config::global::lock();
         let _guard = config.override_key(config::MESSAGE_DELIVERY_TIMEOUT, Duration::from_secs(1));
         let mut tx_receiver = tx.status().clone();
-        let (return_channel, _return_receiver) = oneshot::channel();
-        tx.try_post(123, return_channel);
+        let _receipt = tx.try_post(123);
         verify_tx_closed(&mut tx_receiver, "failed to deliver message within timeout").await;
     }
 
@@ -3119,7 +3452,7 @@ mod tests {
         }
     }
 
-    async fn net_tx_send(tx: &NetTx<u64>, msgs: &[u64]) {
+    async fn net_tx_send(tx: &ChannelTx<u64>, msgs: &[u64]) {
         for msg in msgs {
             tx.post(*msg);
         }
@@ -3161,7 +3494,7 @@ mod tests {
                 .map_err(|(_, e)| e)
                 .unwrap();
             }
-            // Wait for the acks to be processed by NetTx.
+            // Wait for the acks to be processed by ChannelTx.
             tokio::time::sleep(Duration::from_secs(3)).await;
             // Drop both halves to break the in-memory connection (parity with old drop of DuplexStream).
             drop(reader);
@@ -3224,7 +3557,7 @@ mod tests {
                     .await
                     .map_err(|(_, e)| e)
                     .unwrap();
-                    // Wait for the acks to be processed by NetTx.
+                    // Wait for the acks to be processed by ChannelTx.
                     tokio::time::sleep(Duration::from_secs(3)).await;
                 }
                 // client DuplexStream is dropped here. This breaks the connection.
@@ -3306,7 +3639,7 @@ mod tests {
                     .await
                     .map_err(|(_, e)| e)
                     .unwrap();
-                    // Wait for the acks to be processed by NetTx.
+                    // Wait for the acks to be processed by ChannelTx.
                     tokio::time::sleep(Duration::from_secs(3)).await;
                 }
                 // client DuplexStream is dropped here. This breaks the connection.
@@ -3346,7 +3679,7 @@ mod tests {
                     .await
                     .map_err(|(_, e)| e)
                     .unwrap();
-                    // Wait for the acks to be processed by NetTx.
+                    // Wait for the acks to be processed by ChannelTx.
                     tokio::time::sleep(Duration::from_secs(3)).await;
                 }
                 // client DuplexStream is dropped here. This breaks the connection.
@@ -3384,8 +3717,7 @@ mod tests {
 
         // Verify sent-and-ack a message. This is necessary for the test to
         // trigger a connection.
-        let (return_channel_tx, return_channel_rx) = oneshot::channel();
-        net_tx.try_post(100, return_channel_tx);
+        let receipt = net_tx.try_post(100);
         let (mut reader, mut writer) = take_receiver(&receiver_storage).await;
         verify_stream(&mut reader, &[(0u64, 100u64)], None, line!()).await;
         // ack it
@@ -3399,10 +3731,7 @@ mod tests {
         .map_err(|(_, e)| e)
         .unwrap();
         // confirm Tx received ack
-        //
-        // Using `is_err` to confirm the message is delivered/acked is confusing,
-        // but is correct. See how send is implemented: https://fburl.com/code/ywt8lip2
-        assert!(return_channel_rx.await.is_err());
+        assert!(receipt.await.is_ok());
 
         // Now fake an unknown delivery for Tx:
         // Although Tx did not actually send seq=1, we still ack it from Rx to
@@ -3418,17 +3747,14 @@ mod tests {
         .map_err(|(_, e)| e)
         .unwrap();
 
-        let (return_channel_tx, return_channel_rx) = oneshot::channel();
-        net_tx.try_post(101, return_channel_tx);
+        let receipt = net_tx.try_post(101);
         // Verify the message is sent to Rx.
         verify_message(&mut reader, (1u64, 101u64), line!()).await;
         // although we did not ack the message after it is sent, since we already
         // acked it previously, Tx will treat it as acked, and considered the
         // message delivered successfully.
         //
-        // Using `is_err` to confirm the message is delivered/acked is confusing,
-        // but is correct. See how send is implemented: https://fburl.com/code/ywt8lip2
-        assert!(return_channel_rx.await.is_err());
+        assert!(receipt.await.is_ok());
     }
 
     async fn verify_ack_exceeded_limit(disconnect_before_ack: bool) {
@@ -3517,7 +3843,7 @@ mod tests {
         let receiver_storage = link.receiver_storage();
         let listener = MockLinkListener::new(receiver_storage.clone(), link.dest());
         let local_addr = listener.channel_addr.clone();
-        let (_, mut nx): (ChannelAddr, NetRx<u64>) =
+        let (_, mut nx): (ChannelAddr, ChannelRx<u64>) =
             super::server::serve_with_listener(listener, local_addr).unwrap();
         let tx = spawn::<u64>(link);
         let messages: Vec<_> = (0..10001).collect();
@@ -3526,13 +3852,13 @@ mod tests {
         // side concurrently.
         let send_task_handle = tokio::spawn(async move {
             for message in messages_clone {
-                // Add a small delay between messages to give NetRx time to ack.
+                // Add a small delay between messages to give ChannelRx time to ack.
                 // Technically, this test still can pass without this delay. But
                 // the test will need a might larger timeout. The reason is
                 // fairly convoluted:
                 //
                 // MockLink uses the number of delivery to calculate the disconnection
-                // probability. If NetRx sends messages much faster than NetTx
+                // probability. If ChannelRx sends messages much faster than ChannelTx
                 // can ack them, there is a higher chance that the messages are
                 // not acked before reconnect. Then those message would be redelivered.
                 // The repeated redelivery increases the total time of sending
@@ -3540,7 +3866,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_micros(rand::random::<u64>() % 100)).await;
                 tx.post(message);
             }
-            tracing::debug!("NetTx sent all messages");
+            tracing::debug!("ChannelTx sent all messages");
             // It is important to return tx instead of dropping it here, because
             // Rx might not receive all messages yet.
             tx
@@ -3548,11 +3874,11 @@ mod tests {
 
         for message in &messages {
             if message % sampling_rate == 0 {
-                tracing::debug!("NetRx received a message: {message}");
+                tracing::debug!("ChannelRx received a message: {message}");
             }
             assert_eq!(nx.recv().await.unwrap(), *message);
         }
-        tracing::debug!("NetRx received all messages");
+        tracing::debug!("ChannelRx received all messages");
 
         let send_result = send_task_handle.await;
         assert!(send_result.is_ok());
@@ -3561,7 +3887,7 @@ mod tests {
             "MockLink disconnected {} times.",
             disconnected_count.load(Ordering::SeqCst)
         );
-        // TODO(pzhang) after the return_handle work in NetTx is done, add a
+        // TODO(pzhang) after the return_handle work in ChannelTx is done, add a
         // check here to verify the messages are acked correctly.
     }
 
@@ -3594,7 +3920,7 @@ mod tests {
         let receiver_storage = link.receiver_storage();
         let listener = MockLinkListener::new(receiver_storage.clone(), link.dest());
         let local_addr = listener.channel_addr.clone();
-        let (_, mut nx): (ChannelAddr, NetRx<u64>) =
+        let (_, mut nx): (ChannelAddr, ChannelRx<u64>) =
             super::server::serve_with_listener(listener, local_addr).unwrap();
         let tx = spawn::<u64>(link);
         let messages: Vec<_> = (0..20001).collect();
@@ -3607,14 +3933,14 @@ mod tests {
                 tx.post(message);
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
-            tracing::debug!("NetTx sent all messages");
+            tracing::debug!("ChannelTx sent all messages");
             tx
         });
 
         for message in &messages {
             assert_eq!(nx.recv().await.unwrap(), *message);
         }
-        tracing::debug!("NetRx received all messages");
+        tracing::debug!("ChannelRx received all messages");
 
         let send_result = send_task_handle.await;
         assert!(send_result.is_ok());
@@ -3721,7 +4047,7 @@ mod tests {
             .await
             .map_err(|(_, e)| e);
 
-            // Wait for response to be processed by NetTx before dropping reader/writer. Otherwise
+            // Wait for response to be processed by ChannelTx before dropping reader/writer. Otherwise
             // the channel will be closed and we will get the wrong error.
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
         }
@@ -3771,22 +4097,27 @@ mod tests {
             ChannelAddr::Tcp(a) => a,
             _ => panic!("unexpected channel type"),
         };
-        let tx: NetTx<u64> = spawn(tcp::link(socket_addr, SessionId::random(), 0));
-        // NetTx will not establish a connection until it sends the 1st message.
-        // Without a live connection, NetTx cannot received the Closed message
-        // from NetRx. Therefore, we need to send a message to establish the
+        let tx: ChannelTx<u64> = spawn(tcp::link(
+            socket_addr,
+            SessionId::random(),
+            0,
+            ProtocolKind::Simplex,
+        ));
+        // ChannelTx will not establish a connection until it sends the 1st message.
+        // Without a live connection, ChannelTx cannot received the Closed message
+        // from ChannelRx. Therefore, we need to send a message to establish the
         //connection.
         tx.send(100).await.unwrap();
         assert_eq!(rx.recv().await.unwrap(), 100);
-        // Drop rx will close the NetRx server.
-        rx.2.stop("testing");
+        // Drop rx will close the ChannelRx server.
+        rx.server.stop("testing");
         assert!(rx.recv().await.is_err());
 
-        // NetTx will only read from the stream when it needs to send a message
+        // ChannelTx will only read from the stream when it needs to send a message
         // or wait for an ack. Therefore we need to send a message to trigger that.
         tx.post(101);
         let mut watcher = tx.status().clone();
-        // When NetRx exits, it should notify NetTx to exit as well.
+        // When ChannelRx exits, it should notify ChannelTx to exit as well.
         let _ = watcher.wait_for(|val| val.is_closed()).await;
         // wait_for could return Err due to race between when watch's sender was
         // dropped and when wait_for was called. So we still need to do an
@@ -3814,6 +4145,106 @@ mod tests {
         }
     }
 
+    /// Stream wrapper that gates writes (server-side terminal cleanup)
+    /// until the test releases the gate. Reads pass through. Used by
+    /// the mux drain-aware regression tests to make the dispatch's
+    /// final ack/Closed write blockable, so a cancel-only handle's
+    /// "join returns before cleanup" race is observable.
+    #[derive(Debug)]
+    pub(super) struct GatedWriteStream {
+        inner: DuplexStream,
+        gate: Arc<GateState>,
+    }
+
+    #[derive(Debug)]
+    pub(super) struct GateState {
+        open: AtomicBool,
+        waker: std::sync::Mutex<Option<std::task::Waker>>,
+    }
+
+    impl GateState {
+        pub(super) fn new() -> Arc<Self> {
+            Arc::new(Self {
+                open: AtomicBool::new(false),
+                waker: std::sync::Mutex::new(None),
+            })
+        }
+
+        /// Open the gate so any pending writes can proceed.
+        pub(super) fn open(&self) {
+            self.open.store(true, Ordering::Release);
+            if let Some(w) = self.waker.lock().unwrap().take() {
+                w.wake();
+            }
+        }
+    }
+
+    impl GatedWriteStream {
+        pub(super) fn new(inner: DuplexStream, gate: Arc<GateState>) -> Self {
+            Self { inner, gate }
+        }
+    }
+
+    impl AsyncRead for GatedWriteStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for GatedWriteStream {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if !self.gate.open.load(Ordering::Acquire) {
+                *self.gate.waker.lock().unwrap() = Some(cx.waker().clone());
+                if !self.gate.open.load(Ordering::Acquire) {
+                    return std::task::Poll::Pending;
+                }
+            }
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// `Listener` over a single pre-prepared `GatedWriteStream`. Used
+    /// to drive the mux drain-aware regression tests with a stream
+    /// whose terminal write is blockable.
+    struct GatedQueueListener {
+        streams: std::collections::VecDeque<GatedWriteStream>,
+        addr: ChannelAddr,
+    }
+
+    #[async_trait]
+    impl super::Listener for GatedQueueListener {
+        type Stream = GatedWriteStream;
+
+        async fn accept(&mut self) -> Result<(GatedWriteStream, ChannelAddr), ServerError> {
+            match self.streams.pop_front() {
+                Some(s) => Ok((s, self.addr.clone())),
+                None => std::future::pending().await,
+            }
+        }
+    }
+
     /// In-memory connection: server end goes into the listener; the
     /// test reads from `client_r`.
     struct PreparedConnection {
@@ -3826,16 +4257,20 @@ mod tests {
     }
 
     /// Write `LinkInit` and the framed `Frame::Message(seq, value)`
-    /// payloads on the client side; return both halves.
+    /// payloads on the client side; return both halves. The caller
+    /// chooses the [`ProtocolKind`] so simplex tests can stamp
+    /// `Simplex` and duplex tests can stamp `Duplex`, matching
+    /// production handshake validation.
     async fn prepare_connection(
         session_id: SessionId,
         stream_id: u8,
+        kind: super::ProtocolKind,
         messages: &[(u64, u64)],
     ) -> PreparedConnection {
         let (client_side, server_side) = tokio::io::duplex(8192);
         let (client_r, mut client_w) = tokio::io::split(client_side);
 
-        super::write_link_init(&mut client_w, session_id, stream_id)
+        super::write_link_init(&mut client_w, session_id, stream_id, kind)
             .await
             .unwrap();
         let max_len = hyperactor_config::global::get(config::CODEC_MAX_FRAME_LENGTH);
@@ -3893,7 +4328,15 @@ mod tests {
                 expected_messages.insert(*value);
             }
             expected_acks.push(plan.messages.iter().map(|(s, _)| *s).max().unwrap());
-            conns.push(prepare_connection(plan.session_id, plan.stream_id, &plan.messages).await);
+            conns.push(
+                prepare_connection(
+                    plan.session_id,
+                    plan.stream_id,
+                    super::ProtocolKind::Simplex,
+                    &plan.messages,
+                )
+                .await,
+            );
         }
 
         let addr = ChannelAddr::Local(u64::MAX);
@@ -4030,7 +4473,7 @@ mod tests {
     /// send three messages with disjoint seqs filling the contiguous
     /// range 0..=8. Each stream's cleanup reads `highest_uncommitted`
     /// and emits `Ack(8)` on its own wire so the peer's per-wire
-    /// NetTx sees an ack for messages it sent there; the receiver
+    /// ChannelTx sees an ack for messages it sent there; the receiver
     /// discards duplicates. Every stream also emits its own `Closed`.
     #[async_timed_test(timeout_secs = 30)]
     async fn rx_join_flushes_pending_ack_shared_multi_stream_session() {
@@ -4055,7 +4498,15 @@ mod tests {
             for (_, v) in &messages {
                 expected_messages.insert(*v);
             }
-            conns.push(prepare_connection(session_id, stream_id, &messages).await);
+            conns.push(
+                prepare_connection(
+                    session_id,
+                    stream_id,
+                    super::ProtocolKind::Simplex,
+                    &messages,
+                )
+                .await,
+            );
         }
         let highest_seq = num_streams as u64 * msgs_per_stream - 1;
 
@@ -4157,6 +4608,32 @@ mod tests {
         );
     }
 
+    /// `duplex::serve_with_listener` (the test-only duplex server)
+    /// must enforce the same `ProtocolKind::Duplex` handshake check as
+    /// production `duplex::serve`. Otherwise the duplex ack-flush
+    /// tests below could pass with a wire header that the real server
+    /// would reject — weakening coverage exactly where shutdown
+    /// behavior is most sensitive.
+    #[async_timed_test(timeout_secs = 30)]
+    async fn duplex_test_listener_rejects_simplex_link_init() {
+        let conn =
+            prepare_connection(SessionId(1), 0, super::ProtocolKind::Simplex, &[(0, 123)]).await;
+        let addr = ChannelAddr::Local(u64::MAX);
+        let listener = QueueListener {
+            streams: std::collections::VecDeque::from([conn.server_side]),
+            addr: addr.clone(),
+        };
+
+        let mut server = super::duplex::serve_with_listener::<u64, u64, _>(listener, addr).unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), server.accept())
+                .await
+                .is_err(),
+            "duplex test server accepted a simplex LinkInit",
+        );
+    }
+
     /// Duplex analog of `rx_join_flushes_pending_ack_single_stream`.
     /// Three independent duplex sessions, each with three framed
     /// messages. Verifies every `dispatch_duplex_stream`'s terminal
@@ -4184,7 +4661,9 @@ mod tests {
                 expected_messages.insert(*v);
             }
             expected_acks.push(messages.iter().map(|(s, _)| *s).max().unwrap());
-            conns.push(prepare_connection(SessionId(sid), 0, &messages).await);
+            conns.push(
+                prepare_connection(SessionId(sid), 0, super::ProtocolKind::Duplex, &messages).await,
+            );
         }
 
         let addr = ChannelAddr::Local(u64::MAX);
@@ -4336,9 +4815,14 @@ mod tests {
         async fn next(&mut self) -> Result<DuplexStream, ClientError> {
             match self.streams.pop_front() {
                 Some(mut stream) => {
-                    super::write_link_init(&mut stream, self.session_id, 0)
-                        .await
-                        .map_err(|err| ClientError::Io(self.dest(), err))?;
+                    super::write_link_init(
+                        &mut stream,
+                        self.session_id,
+                        0,
+                        super::ProtocolKind::Duplex,
+                    )
+                    .await
+                    .map_err(|err| ClientError::Io(self.dest(), err))?;
                     Ok(stream)
                 }
                 None => Err(ClientError::Connect(
@@ -4368,7 +4852,7 @@ mod tests {
         let session_id = SessionId(1);
         let messages: Vec<(u64, u64)> = vec![(0, 100), (1, 200), (2, 300)];
         let expected_ack: u64 = 2;
-        let conn = prepare_connection(session_id, 0, &messages).await;
+        let conn = prepare_connection(session_id, 0, super::ProtocolKind::Duplex, &messages).await;
 
         let addr = ChannelAddr::Local(u64::MAX);
         let listener = QueueListener {
@@ -4445,13 +4929,276 @@ mod tests {
         server.join().await;
     }
 
-    /// [`DuplexClient::join`] cancels the recv/send loop's
-    /// cancellation token. The `select!`s observe cancel and the
-    /// loop exits via the flush + `Closed` + break path. Verifies
-    /// the cumulative ack and the terminal `Closed` are written on
+    /// Wire-level regression for the mux per-half drain-aware
+    /// `ServerHandle`. After `DuplexServer::stop()` is called on the
+    /// mux's duplex half, `DuplexServer::join()` must wait for every
+    /// dispatched session's terminal cleanup (final ack flush +
+    /// `Closed` emit) to reach the wire — not merely for the
+    /// cancellation token to fire. Adversarial test #4 from the AI
+    /// review's coverage gap. Prior to the drain-aware handle
+    /// (`cancel_only_handle`), `join` could report shutdown complete
+    /// before the dispatch's flush reached the wire.
+    #[async_timed_test(timeout_secs = 30)]
+    async fn mux_duplex_join_flushes_pending_ack_for_session() {
+        let config = hyperactor_config::global::lock();
+        let _g_msg = config.override_key(config::MESSAGE_ACK_EVERY_N_MESSAGES, 1_000_000);
+        let _g_time =
+            config.override_key(config::MESSAGE_ACK_TIME_INTERVAL, Duration::from_secs(3600));
+
+        let session_id = SessionId(1);
+        let messages: Vec<(u64, u64)> = vec![(0, 100), (1, 200), (2, 300)];
+        let expected_ack: u64 = 2;
+        let conn = prepare_connection(session_id, 0, super::ProtocolKind::Duplex, &messages).await;
+
+        let addr = ChannelAddr::Local(u64::MAX);
+        let listener = QueueListener {
+            streams: std::collections::VecDeque::from([conn.server_side]),
+            addr: addr.clone(),
+        };
+
+        let mut parts =
+            super::mux::serve_with_listener::<u64, u64, u64, _>(listener, addr).unwrap();
+
+        // Accept the duplex session and drain the inbound messages.
+        // Hold `_server_tx` alive across the shutdown so the dispatch
+        // is parked on the cancel branch (not `AppClosed`); the
+        // adversarial path is precisely the cancel-driven cleanup.
+        let (mut server_rx, _server_tx) = parts.duplex.accept().await.unwrap();
+        for _ in &messages {
+            server_rx.recv().await.unwrap();
+        }
+
+        // No spontaneous ack expected before shutdown.
+        let max_len = hyperactor_config::global::get(config::CODEC_MAX_FRAME_LENGTH);
+        let mut reader = FrameReader::new(conn.client_r, max_len);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        match tokio::time::timeout(Duration::from_millis(10), reader.next()).await {
+            Err(_) => {} // timeout expected.
+            Ok(Err(e)) => panic!("mux: frame reader error before shutdown: {e}"),
+            Ok(Ok(None)) => panic!("mux: wire closed before shutdown"),
+            Ok(Ok(Some((_, bytes)))) => {
+                let resp = super::deserialize_response(bytes).unwrap();
+                panic!("mux: unexpectedly received {resp:?} before shutdown");
+            }
+        }
+
+        // `DuplexServer::stop` fires the shared cancel; `join`
+        // awaits the per-half handle's join_handle. With the
+        // drain-aware handle, that resolves only after the
+        // coordinator signals `drained` — i.e., after the
+        // dispatch's terminal cleanup has reached the wire.
+        parts.duplex.stop("test mux duplex join flush");
+        parts.duplex.join().await;
+
+        let bytes = tokio::time::timeout(Duration::from_millis(100), reader.next())
+            .await
+            .unwrap_or_else(|_| panic!("mux: produced no Ack frame within 100ms after join"))
+            .expect("frame reader error")
+            .expect("frame reader returned None");
+        let acked = super::deserialize_response(bytes.1)
+            .unwrap()
+            .into_ack()
+            .unwrap_or_else(|other| panic!("mux: expected Ack, got {other:?}"));
+        assert_eq!(
+            acked, expected_ack,
+            "mux: ack should cover the highest seq received"
+        );
+
+        let bytes = tokio::time::timeout(Duration::from_millis(100), reader.next())
+            .await
+            .unwrap_or_else(|_| panic!("mux: produced no Closed frame within 100ms after join"))
+            .expect("frame reader error")
+            .expect("frame reader returned None");
+        assert!(
+            super::deserialize_response(bytes.1).unwrap().is_closed(),
+            "mux: expected Closed terminal frame after Ack"
+        );
+
+        // Tear down the listener after asserting on the wire.
+        let _ = parts.simplex;
+        let _ = parts.join_handle.await;
+    }
+
+    /// Strict adversarial regression for the mux per-half drain-aware
+    /// `ServerHandle`. Uses a [`GatedWriteStream`] to block the
+    /// dispatch's terminal write so that — under the old
+    /// `cancel_only_handle` behavior — `DuplexServer::join()` after
+    /// `DuplexServer::stop()` would return *before* the Ack reached
+    /// the wire. With the drain-aware handle, `join` waits for the
+    /// listener's accept-loop to drain, which awaits the dispatch's
+    /// blocked write; thus `join` is pinned `Pending` until the test
+    /// opens the gate.
+    #[async_timed_test(timeout_secs = 30)]
+    async fn mux_duplex_join_blocks_until_terminal_write_completes() {
+        let config = hyperactor_config::global::lock();
+        let _g_msg = config.override_key(config::MESSAGE_ACK_EVERY_N_MESSAGES, 1_000_000);
+        let _g_time =
+            config.override_key(config::MESSAGE_ACK_TIME_INTERVAL, Duration::from_secs(3600));
+
+        let session_id = SessionId(1);
+        let messages: Vec<(u64, u64)> = vec![(0, 100), (1, 200), (2, 300)];
+        let expected_ack: u64 = 2;
+        let conn = prepare_connection(session_id, 0, super::ProtocolKind::Duplex, &messages).await;
+
+        // Wrap the server side so its writes (the dispatch's terminal
+        // ack/Closed) are gated.
+        let gate = GateState::new();
+        let server_side_gated = GatedWriteStream::new(conn.server_side, gate.clone());
+
+        let addr = ChannelAddr::Local(u64::MAX);
+        let listener = GatedQueueListener {
+            streams: std::collections::VecDeque::from([server_side_gated]),
+            addr: addr.clone(),
+        };
+
+        let mut parts =
+            super::mux::serve_with_listener::<u64, u64, u64, _>(listener, addr).unwrap();
+
+        let (mut server_rx, _server_tx) = parts.duplex.accept().await.unwrap();
+        for _ in &messages {
+            server_rx.recv().await.unwrap();
+        }
+
+        // Stop + spawn join. With the drain-aware handle, join
+        // should be pinned Pending until the gate opens. With a
+        // `cancel_only_handle`, join would return immediately on
+        // cancel — observable here as a non-Pending poll despite
+        // the blocked write.
+        parts
+            .duplex
+            .stop("test mux duplex join blocks until terminal write");
+        let mut join_task = tokio::spawn(async move { parts.duplex.join().await });
+
+        let blocked = tokio::time::timeout(Duration::from_millis(200), &mut join_task).await;
+        assert!(
+            blocked.is_err(),
+            "duplex.join() returned before the gated terminal write could complete"
+        );
+
+        // Open the gate so dispatch's Ack/Closed writes proceed; join
+        // should resolve once the accept loop drains.
+        gate.open();
+
+        tokio::time::timeout(Duration::from_secs(5), join_task)
+            .await
+            .expect("duplex.join() did not resolve after gate opened")
+            .expect("join task panicked");
+
+        // Verify the wire actually received Ack and Closed.
+        let max_len = hyperactor_config::global::get(config::CODEC_MAX_FRAME_LENGTH);
+        let mut reader = FrameReader::new(conn.client_r, max_len);
+
+        let bytes = tokio::time::timeout(Duration::from_millis(200), reader.next())
+            .await
+            .expect("no Ack frame")
+            .expect("frame reader error")
+            .expect("frame reader returned None");
+        let acked = super::deserialize_response(bytes.1)
+            .unwrap()
+            .into_ack()
+            .unwrap_or_else(|other| panic!("expected Ack, got {other:?}"));
+        assert_eq!(acked, expected_ack);
+
+        let bytes = tokio::time::timeout(Duration::from_millis(200), reader.next())
+            .await
+            .expect("no Closed frame")
+            .expect("frame reader error")
+            .expect("frame reader returned None");
+        assert!(super::deserialize_response(bytes.1).unwrap().is_closed());
+    }
+
+    /// Wire-level regression for the per-half `ServerHandle`'s
+    /// drain-aware contract. Calling `ChannelRx::join()` on the mux's
+    /// simplex half must wait for the dispatch's terminal cleanup
+    /// (final ack flush + `Closed` emit) to reach the wire — not
+    /// merely for the cancellation token to fire. Adversarial test
+    /// #2 from the AI review.
+    #[async_timed_test(timeout_secs = 30)]
+    async fn mux_split_simplex_join_flushes_final_ack() {
+        let config = hyperactor_config::global::lock();
+        let _g_msg = config.override_key(config::MESSAGE_ACK_EVERY_N_MESSAGES, 1_000_000);
+        let _g_time =
+            config.override_key(config::MESSAGE_ACK_TIME_INTERVAL, Duration::from_secs(3600));
+
+        let session_id = SessionId(1);
+        let messages: Vec<(u64, u64)> = vec![(0, 100), (1, 200), (2, 300)];
+        let expected_ack: u64 = 2;
+        let conn = prepare_connection(session_id, 0, super::ProtocolKind::Simplex, &messages).await;
+
+        let addr = ChannelAddr::Local(u64::MAX);
+        let listener = QueueListener {
+            streams: std::collections::VecDeque::from([conn.server_side]),
+            addr: addr.clone(),
+        };
+
+        let mut parts =
+            super::mux::serve_with_listener::<u64, u64, u64, _>(listener, addr).unwrap();
+
+        // Drain inbound through the simplex half.
+        for _ in &messages {
+            parts.simplex.recv().await.unwrap();
+        }
+
+        // No spontaneous ack expected.
+        let max_len = hyperactor_config::global::get(config::CODEC_MAX_FRAME_LENGTH);
+        let mut reader = FrameReader::new(conn.client_r, max_len);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        match tokio::time::timeout(Duration::from_millis(10), reader.next()).await {
+            Err(_) => {}
+            Ok(Err(e)) => panic!("mux split: frame reader error before join: {e}"),
+            Ok(Ok(None)) => panic!("mux split: wire closed before join"),
+            Ok(Ok(Some((_, bytes)))) => {
+                let resp = super::deserialize_response(bytes).unwrap();
+                panic!("mux split: unexpectedly received {resp:?} before join");
+            }
+        }
+
+        // `ChannelRx::join` consumes the `ChannelRx`; with the drain-aware
+        // handle it must wait for the dispatch's terminal cleanup.
+        // Once join returns, the Ack and Closed frames must already
+        // be on the wire.
+        parts.simplex.join().await;
+
+        let bytes = tokio::time::timeout(Duration::from_millis(100), reader.next())
+            .await
+            .unwrap_or_else(|_| panic!("mux split: produced no Ack frame within 100ms after join"))
+            .expect("frame reader error")
+            .expect("frame reader returned None");
+        let acked = super::deserialize_response(bytes.1)
+            .unwrap()
+            .into_ack()
+            .unwrap_or_else(|other| panic!("mux split: expected Ack, got {other:?}"));
+        assert_eq!(
+            acked, expected_ack,
+            "mux split: simplex.join must flush the final ack before returning"
+        );
+
+        let bytes = tokio::time::timeout(Duration::from_millis(100), reader.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("mux split: produced no Closed frame within 100ms after join")
+            })
+            .expect("frame reader error")
+            .expect("frame reader returned None");
+        assert!(
+            super::deserialize_response(bytes.1).unwrap().is_closed(),
+            "mux split: expected Closed terminal frame after Ack"
+        );
+
+        // Tear down the listener after asserting on the wire.
+        let _ = parts.duplex;
+        parts.cancel.cancel();
+        let _ = parts.join_handle.await;
+    }
+
+    /// [`DuplexClient::stop`] cancels the recv/send loop's
+    /// cancellation token, and [`DuplexClient::join`] waits for the
+    /// spawned task to finish. The `select!`s observe cancel and the
+    /// loop exits via the flush + `Closed` + break path. Verifies the
+    /// cumulative ack and the terminal `Closed` are written on
     /// `ACCEPTOR_TO_INITIATOR` before the spawned task ends.
     #[async_timed_test(timeout_secs = 30)]
-    async fn duplex_client_join_flushes_pending_ack() {
+    async fn duplex_client_stop_then_join_flushes_pending_ack() {
         let config = hyperactor_config::global::lock();
         let _g_msg = config.override_key(config::MESSAGE_ACK_EVERY_N_MESSAGES, 1_000_000);
         let _g_time =
@@ -4521,11 +5268,10 @@ mod tests {
             }
         }
 
-        // Trigger graceful shutdown via the structured-concurrency
-        // join handle. Cancel propagates into the spawn loop's
-        // `select!`s; the loop exits via Cancelled (terminal) and
-        // the flush logic writes the cumulative ack and the
-        // `Closed` terminal frame before the task ends.
+        // Trigger graceful shutdown. `stop` propagates cancellation
+        // into the spawn loop's `select!`s; `join` waits until the
+        // loop exits via Cancelled (terminal) and the flush logic
+        // writes the cumulative ack and the `Closed` terminal frame.
         dial_client.join().await;
 
         let bytes = tokio::time::timeout(Duration::from_millis(100), reader.next())
@@ -4561,12 +5307,13 @@ mod tests {
 
     /// Verifies that an in-progress [`DuplexRx::recv`] on the
     /// receiver returned by [`DuplexClient::take_rx`] resolves with
-    /// [`ChannelError::Closed`] when [`DuplexClient::join`] is
-    /// called concurrently. Structured concurrency guarantees the
-    /// spawned task drops `inbound_tx` before `join` returns, so
-    /// the receiver observes the close deterministically.
+    /// [`ChannelError::Closed`] when [`DuplexClient::stop`] is called
+    /// and [`DuplexClient::join`] waits concurrently. Structured
+    /// concurrency guarantees the spawned task drops `inbound_tx`
+    /// before `join` returns, so the receiver observes the close
+    /// deterministically.
     #[async_timed_test(timeout_secs = 30)]
-    async fn duplex_client_join_terminates_in_progress_recv() {
+    async fn duplex_client_stop_then_join_terminates_in_progress_recv() {
         let session_id = SessionId(123);
         let (client_side, server_side) = tokio::io::duplex(8192);
         let (mut test_r, _test_w) = tokio::io::split(server_side);
@@ -4585,8 +5332,8 @@ mod tests {
 
         // Park a recv() in a separate task; the dial-side hasn't
         // forwarded any inbound frames so this future will sit in
-        // `inbound_rx.recv().await` indefinitely until `join`
-        // drops the spawned task's `inbound_tx`.
+        // `inbound_rx.recv().await` indefinitely until stop/join
+        // makes the spawned task drop its `inbound_tx`.
         let recv_handle: tokio::task::JoinHandle<Result<u64, ChannelError>> =
             tokio::spawn(async move { dial_rx.recv().await });
 

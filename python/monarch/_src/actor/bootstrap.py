@@ -18,7 +18,7 @@ from monarch._rust_bindings.monarch_hyperactor.host_mesh import HostMesh as HyHo
 from monarch._rust_bindings.monarch_hyperactor.pytokio import PythonTask
 from monarch._rust_bindings.monarch_hyperactor.shape import Extent
 from monarch._src.actor.actor_mesh import _Lazy
-from monarch._src.actor.future import _Unawaited, Future
+from monarch._src.actor.future import Future
 from monarch._src.actor.host_mesh import HostMesh
 
 PrivateKey = Union[bytes, Path, None]
@@ -34,12 +34,14 @@ def _as_python_task(s: str | Future[str]) -> "PythonTask[str]":
 
         return PythonTask.from_coroutine(just())
     else:
-        assert isinstance(s._status, _Unawaited)
-        return s._status.coro
+        return s._take_inner()
 
 
 def run_worker_loop_forever(
-    *, private_key: PrivateKey = None, ca: CA, address: str
+    *,
+    private_key: PrivateKey = None,
+    ca: CA,
+    address: str,
 ) -> None:
     """
     Start a monarch server at "address" capable of letting this machine participate in
@@ -52,6 +54,17 @@ def run_worker_loop_forever(
         ipc://some_unique_string - unix sockets
         inproc://3423 - connection only accessible within the process
 
+    To bind to one interface but advertise a different one, append the bind
+    address after ``@``:
+
+        tcp://worker-fqdn:4444@tcp://0.0.0.0:4444
+
+    The server binds to ``tcp://0.0.0.0:4444`` so any local interface can
+    accept connections (e.g. ``localhost`` for ``kubectl port-forward``)
+    while peers still address the worker by its routable FQDN. Without the
+    ``@``-suffix, bind address equals advertised address. The ``@`` form is
+    only for serving: after the worker starts, its host identity is the
+    advertised address to the left of ``@``.
 
     The server will accept a connection to a new root client and enable it to
     use this machine as a host. If the client disconnects or cannot be contacted, this server
@@ -96,6 +109,12 @@ def attach_to_workers(
     used to decide if we have successfully connected to all hosts. Workers are specified with the same zmq-style
     specifier strings described in `run_worker_loop_forever`. They may be specified as monarch.actor.Future objects
     so that an implementation can do some asynchronous work to discover where to connect.
+
+    If a worker string uses the alias form ``dial_to@bind_to``,
+    ``attach_to_workers`` treats it as a reference to an already-serving
+    worker and stores only ``dial_to`` in the host mesh. The ``bind_to`` half
+    is a serve-side detail and is not part of the host, proc, or actor
+    identity.
 
 
     private_key is a tls private key file loaded as bytes used to establish secure connections.

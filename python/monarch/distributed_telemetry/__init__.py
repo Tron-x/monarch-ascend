@@ -7,17 +7,19 @@
 # pyre-strict
 
 """
-Distributed Telemetry - SQL queries over distributed MemTable databases.
+Distributed Telemetry - SQL queries over sidecar telemetry tables.
 
-Three-component architecture:
+Sidecar architecture:
 1. DatabaseScanner (Rust): Local MemTable operations with child stream merging
-2. DistributedTelemetryActor (Python): Orchestrates children, wraps DatabaseScanner
+2. TelemetryActor (Python): Sidecar-owned actor that wraps DatabaseScanner
 3. QueryEngine (Rust): DataFusion query execution
 
 Usage:
-    from monarch.distributed_telemetry.actor import start_telemetry
+    from monarch.job import ProcessJob, TelemetryConfig
 
-    engine, telemetry_url, scanner = start_telemetry()
+    state = ProcessJob({"hosts": 1}).enable_telemetry(TelemetryConfig()).state()
+    client = state.query_engine_client
+    assert client is not None
     # ... spawn procs, they're automatically tracked ...
-    result = engine.query("SELECT * FROM metrics")
+    result = client.query("SELECT * FROM metrics")
 """

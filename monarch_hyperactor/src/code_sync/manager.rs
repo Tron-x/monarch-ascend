@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use anyhow::Context as _;
 use anyhow::Result;
@@ -23,11 +24,10 @@ use futures::try_join;
 use hyperactor as reference;
 use hyperactor::Actor;
 use hyperactor::ActorHandle;
-use hyperactor::Bind;
 use hyperactor::Context;
+use hyperactor::Endpoint as _;
 use hyperactor::Handler;
 use hyperactor::RemoteSpawn;
-use hyperactor::Unbind;
 use hyperactor::context;
 use hyperactor::handle;
 use hyperactor_config::Flattrs;
@@ -146,7 +146,11 @@ pub struct WorkspaceConfig {
     pub shape: WorkspaceShape,
 }
 
-#[derive(Handler, Clone, Serialize, Deserialize, Debug, Named, Bind, Unbind)]
+#[derive(Handler, Clone, Serialize, Deserialize, Debug, Named)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "actor message enum with handler-generated call sites; boxing fields ripples into handlers"
+)]
 pub enum CodeSyncMessage {
     Sync {
         workspace: WorkspaceLocation,
@@ -164,7 +168,7 @@ pub enum CodeSyncMessage {
 }
 wirevalue::register_type!(CodeSyncMessage);
 
-#[derive(Clone, Serialize, Deserialize, Debug, Named, Bind, Unbind)]
+#[derive(Clone, Serialize, Deserialize, Debug, Named)]
 pub struct SetActorMeshMessage {
     pub actor_mesh: hyperactor_mesh::ActorMeshRef<CodeSyncManager>,
 }
@@ -177,8 +181,8 @@ wirevalue::register_type!(CodeSyncManagerParams);
 #[derive(Debug)]
 #[hyperactor::export(
     handlers = [
-        CodeSyncMessage { cast = true },
-        SetActorMeshMessage { cast = true }
+        CodeSyncMessage,
+        SetActorMeshMessage
     ],
 )]
 #[hyperactor::spawnable]
@@ -186,8 +190,8 @@ pub struct CodeSyncManager {
     rsync: OnceCell<ActorHandle<RsyncActor>>,
     auto_reload: OnceCell<ActorHandle<AutoReloadActor>>,
     conda_sync: OnceCell<ActorHandle<CondaSyncActor>>,
-    self_mesh: once_cell::sync::OnceCell<hyperactor_mesh::ActorMeshRef<CodeSyncManager>>,
-    rank: once_cell::sync::OnceCell<usize>,
+    self_mesh: OnceLock<hyperactor_mesh::ActorMeshRef<CodeSyncManager>>,
+    rank: OnceLock<usize>,
 }
 
 impl Actor for CodeSyncManager {}
@@ -201,8 +205,8 @@ impl RemoteSpawn for CodeSyncManager {
             rsync: OnceCell::new(),
             auto_reload: OnceCell::new(),
             conda_sync: OnceCell::new(),
-            self_mesh: once_cell::sync::OnceCell::new(),
-            rank: once_cell::sync::OnceCell::new(),
+            self_mesh: OnceLock::new(),
+            rank: OnceLock::new(),
         })
     }
 }
@@ -213,7 +217,7 @@ impl CodeSyncManager {
         cx: &Context<'a, Self>,
     ) -> Result<&'a ActorHandle<RsyncActor>> {
         self.rsync
-            .get_or_try_init(async move { RsyncActor::default().spawn(cx) })
+            .get_or_try_init(async move { Ok(cx.spawn(RsyncActor::default())) })
             .await
     }
 
@@ -222,7 +226,7 @@ impl CodeSyncManager {
         cx: &Context<'a, Self>,
     ) -> Result<&'a ActorHandle<AutoReloadActor>> {
         self.auto_reload
-            .get_or_try_init(async move { AutoReloadActor::new().await?.spawn(cx) })
+            .get_or_try_init(async move { Ok(cx.spawn(AutoReloadActor::new().await?)) })
             .await
     }
 
@@ -231,7 +235,7 @@ impl CodeSyncManager {
         cx: &Context<'a, Self>,
     ) -> Result<&'a ActorHandle<CondaSyncActor>> {
         self.conda_sync
-            .get_or_try_init(async move { CondaSyncActor::default().spawn(cx) })
+            .get_or_try_init(async move { Ok(cx.spawn(CondaSyncActor::default())) })
             .await
     }
 }
@@ -253,14 +257,14 @@ impl CodeSyncMessageHandler for CodeSyncManager {
                     // Forward rsync connection port to the RsyncActor, which will do the actual
                     // connection and run the client.
                     let (tx, mut rx) = cx.open_port::<Result<RsyncResult, String>>();
-                    self.get_rsync_actor(cx).await?.send(
+                    self.get_rsync_actor(cx).await?.post(
                         cx,
                         RsyncMessage {
                             connect,
                             result: tx.bind(),
                             workspace,
                         },
-                    )?;
+                    );
                     // Observe any errors.
                     let _ = rx.recv().await?.map_err(anyhow::Error::msg)?;
                 }
@@ -271,7 +275,7 @@ impl CodeSyncMessageHandler for CodeSyncManager {
                     // Forward rsync connection port to the RsyncActor, which will do the actual
                     // connection and run the client.
                     let (tx, mut rx) = cx.open_port::<Result<CondaSyncResult, String>>();
-                    self.get_conda_sync_actor(cx).await?.send(
+                    self.get_conda_sync_actor(cx).await?.post(
                         cx,
                         CondaSyncMessage {
                             connect,
@@ -279,7 +283,7 @@ impl CodeSyncMessageHandler for CodeSyncManager {
                             workspace,
                             path_prefix_replacements,
                         },
-                    )?;
+                    );
                     // Observe any errors.
                     let _ = rx.recv().await?.map_err(anyhow::Error::msg)?;
                 }
@@ -319,17 +323,17 @@ impl CodeSyncMessageHandler for CodeSyncManager {
             anyhow::Ok(())
         }
         .await;
-        result.send(
+        result.post(
             cx,
             res.map_err(|e| {
                 format!(
                     "{:#?}",
                     Err::<(), _>(e)
-                        .with_context(|| format!("code sync from {}", cx.self_id()))
+                        .with_context(|| format!("code sync from {}", cx.self_addr()))
                         .unwrap_err()
                 )
             }),
-        )?;
+        );
         Ok(())
     }
 
@@ -350,22 +354,22 @@ impl CodeSyncMessageHandler for CodeSyncManager {
             let (tx, mut rx) = cx.open_port::<Result<(), String>>();
             self.get_auto_reload_actor(cx)
                 .await?
-                .send(cx, AutoReloadMessage { result: tx.bind() })?;
+                .post(cx, AutoReloadMessage { result: tx.bind() });
             rx.recv().await?.map_err(anyhow::Error::msg)?;
             anyhow::Ok(())
         }
         .await;
-        result.send(
+        result.post(
             cx,
             res.map_err(|e| {
                 format!(
                     "{:#?}",
                     Err::<(), _>(e)
-                        .with_context(|| format!("module reload from {}", cx.self_id()))
+                        .with_context(|| format!("module reload from {}", cx.self_addr()))
                         .unwrap_err()
                 )
             }),
-        )?;
+        );
         Ok(())
     }
 }
@@ -376,7 +380,7 @@ impl Handler<SetActorMeshMessage> for CodeSyncManager {
         let mesh = self.self_mesh.get_or_init(|| msg.actor_mesh);
         self.rank.get_or_init(|| {
             mesh.iter()
-                .find(|(_, actor)| *actor.actor_id() == *cx.self_id())
+                .find(|(_, actor)| *actor.actor_addr() == *cx.self_addr())
                 .unwrap()
                 .0
                 .rank()
@@ -419,7 +423,7 @@ pub async fn code_sync_mesh(
             let daemon =
                 RsyncDaemon::spawn(TcpListener::bind(&addrs[..]).await?, &local_workspace).await?;
 
-            let daemon_addr = daemon.addr().clone();
+            let daemon_addr = *daemon.addr();
             let (rsync_conns_tx, rsync_conns_rx) = instance.open_port::<Connect>();
             (
                 Method::Rsync {
@@ -433,8 +437,8 @@ pub async fn code_sync_mesh(
                         .err_into::<anyhow::Error>()
                         .try_for_each_concurrent(None, |connect| async move {
                             let (mut local, mut stream) = try_join!(
-                                TcpStream::connect(daemon_addr.clone()).err_into(),
-                                accept(instance, instance.self_id().clone().into(), connect),
+                                TcpStream::connect(daemon_addr).err_into(),
+                                accept(instance, instance.self_addr().clone(), connect),
                             )?;
                             tokio::io::copy_bidirectional(&mut local, &mut stream).await?;
                             Ok(())
@@ -462,7 +466,7 @@ pub async fn code_sync_mesh(
                         .err_into::<anyhow::Error>()
                         .try_for_each_concurrent(None, |connect| async {
                             let (mut read, mut write) =
-                                accept(instance, instance.self_id().clone().into(), connect)
+                                accept(instance, instance.self_addr().clone(), connect)
                                     .await?
                                     .into_split();
                             let res = sender(&local_workspace, &mut read, &mut write).await;
@@ -615,7 +619,13 @@ mod tests {
         // Set up actor mesh with CodeSyncManager actors
         let mut host_mesh = test_utils::local_host_mesh(2).await;
         let proc_mesh = host_mesh
-            .spawn(instance, "code_sync_test", ndslice::Extent::unity(), None)
+            .spawn(
+                instance,
+                "code_sync_test",
+                ndslice::Extent::unity(),
+                None,
+                None,
+            )
             .await
             .unwrap();
 

@@ -59,20 +59,22 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use clap::Arg;
 use clap::Command as ClapCommand;
-use hyperactor as reference;
 use hyperactor::Actor;
-use hyperactor::Bind;
+use hyperactor::ActorRef;
 use hyperactor::Context;
+use hyperactor::Endpoint as _;
 use hyperactor::Handler;
 use hyperactor::Instance;
+use hyperactor::OncePortRef;
 use hyperactor::RemoteSpawn;
-use hyperactor::Unbind;
 use hyperactor::channel::ChannelAddr;
+use hyperactor::context::Mailbox;
 use hyperactor::id::Label;
 use hyperactor::supervision::ActorSupervisionEvent;
 use hyperactor_config::Flattrs;
 use hyperactor_mesh::ActorMesh;
 use hyperactor_mesh::Bootstrap;
+use hyperactor_mesh::HostBootstrapReady;
 use hyperactor_mesh::HostMeshRef;
 use hyperactor_mesh::ProcMesh;
 use hyperactor_mesh::context;
@@ -82,10 +84,13 @@ use monarch_rdma::IbvConfig;
 use monarch_rdma::RdmaManagerActor;
 use monarch_rdma::RdmaManagerMessageClient;
 use monarch_rdma::RdmaRemoteBuffer;
-use monarch_rdma::backend::ibverbs::manager_actor::IbvManagerMessageClient;
+use monarch_rdma::backend::ibverbs::device_selection::IbvDeviceTarget;
+use monarch_rdma::backend::ibverbs::manager_actor::RawQueuePair;
+use monarch_rdma::backend::ibverbs::primitives::IbvQpInfo;
+use monarch_rdma::backend::ibverbs::queue_pair::legacy::IbvQueuePair;
 use monarch_rdma::cu_check;
-use monarch_rdma::local_memory::RdmaLocalMemory;
-use monarch_rdma::local_memory::UnsafeLocalMemory;
+use monarch_rdma::local_memory::Keepalive;
+use monarch_rdma::local_memory::KeepaliveLocalMemory;
 use ndslice::Extent;
 use ndslice::ViewExt;
 use serde::Deserialize;
@@ -140,6 +145,31 @@ pub fn ping_pong(
     let result = unsafe { launchPingPong(params, iterations, initial_length, device_id) };
 
     if result == 0 { Ok(()) } else { Err(result) }
+}
+
+// HACK — `NoKeepalive` keeps nothing alive. The CUDA allocation
+// for this actor's device buffer is leaked for the lifetime of the
+// process; the actor's `Drop` does not free it.
+//
+// We tolerate the lie here *temporarily* because the actual implementation
+// logic is unchanged from the pre-`Keepalive` version. If it was correct
+// before, it's still correct now.
+//
+// TODO(samlurye): replace `NoKeepalive` with a real `CudaAllocation`
+// keepalive (or equivalent) and arrange for the buffer to be released
+// while the CUDA context is still live, e.g., via an explicit
+// shutdown handler on the actor.
+struct NoKeepalive {
+    addr: usize,
+    size: usize,
+}
+impl Keepalive for NoKeepalive {
+    fn addr(&self) -> usize {
+        self.addr
+    }
+    fn size(&self) -> usize {
+        self.size
+    }
 }
 
 // Constants for default values
@@ -251,6 +281,8 @@ impl CliConfig {
 #[hyperactor::export(
     handlers = [
         InitializeBuffer,
+        CreateRawQp,
+        ConnectRawQp,
         PerformPingPong,
         VerifyBuffer,
         GetBufferHandle,
@@ -265,7 +297,10 @@ pub struct CudaRdmaActor {
     // RDMA buffer handle for the CUDA memory
     rdma_buffer_handle: Option<RdmaRemoteBuffer>,
     // Reference to the RDMA manager actor
-    rdma_manager: reference::ActorRef<RdmaManagerActor>,
+    rdma_manager: ActorRef<RdmaManagerActor>,
+    // Legacy queue pair for the GPU doorbell ping-pong, created via
+    // `CreateRawQp` and connected via `ConnectRawQp` before `PerformPingPong`.
+    raw_qp: Option<IbvQueuePair>,
 }
 
 #[async_trait]
@@ -286,7 +321,7 @@ impl Actor for CudaRdmaActor {
 
 #[async_trait]
 impl RemoteSpawn for CudaRdmaActor {
-    type Params = (reference::ActorRef<RdmaManagerActor>, usize, usize);
+    type Params = (ActorRef<RdmaManagerActor>, usize, usize);
 
     async fn new(params: Self::Params, _environment: Flattrs) -> Result<Self, anyhow::Error> {
         let (rdma_manager, device_id, buffer_size) = params;
@@ -297,6 +332,10 @@ impl RemoteSpawn for CudaRdmaActor {
         // For this example, we'll use a regular Rust allocation as a placeholder
         // The actual CUDA allocation would be handled by the monarch_rdma library
         unsafe {
+            // rdmaxcel only adopts an already-loaded driver, so load it first.
+            if rdmaxcel_sys::ensure_cuda_driver_loaded() != 0 {
+                anyhow::bail!("failed to load the CUDA driver");
+            }
             cu_check!(rdmaxcel_sys::rdmaxcel_cuInit(0));
             let mut dptr: rdmaxcel_sys::CUdeviceptr = std::mem::zeroed();
             let mut handle: rdmaxcel_sys::CUmemGenericAllocationHandle = std::mem::zeroed();
@@ -379,6 +418,7 @@ impl RemoteSpawn for CudaRdmaActor {
                 cu_ptr: dptr as usize,
                 rdma_buffer_handle: None,
                 rdma_manager,
+                raw_qp: None,
             })
         }
     }
@@ -386,21 +426,30 @@ impl RemoteSpawn for CudaRdmaActor {
 
 // Message to initialize the buffer with data
 #[derive(Debug, Serialize, Deserialize, Named, Clone)]
-struct InitializeBuffer(pub u8, pub reference::OncePortRef<bool>);
+struct InitializeBuffer(pub u8, pub OncePortRef<bool>);
 
 // Message to perform an RDMA ping-pong operation with another actor
 #[derive(Debug, Serialize, Deserialize, Named, Clone)]
 struct PerformPingPong(
-    pub reference::ActorRef<CudaRdmaActor>,
+    pub ActorRef<CudaRdmaActor>,
     pub RdmaRemoteBuffer,
     pub i32,
     pub i32,
-    pub reference::OncePortRef<bool>,
+    pub OncePortRef<bool>,
 );
+
+// Message to create a fresh, unconnected legacy queue pair on this actor's RDMA
+// device (held in `raw_qp`) and return its endpoint info.
+#[derive(Debug, Serialize, Deserialize, Named, Clone)]
+struct CreateRawQp(pub OncePortRef<IbvQpInfo>);
+
+// Message to connect the held queue pair to the peer's endpoint info.
+#[derive(Debug, Serialize, Deserialize, Named, Clone)]
+struct ConnectRawQp(pub IbvQpInfo, pub OncePortRef<bool>);
 
 // Message to verify the buffer contents
 #[derive(Debug, Serialize, Deserialize, Named, Clone)]
-struct VerifyBuffer(pub Box<[u8]>, pub reference::OncePortRef<bool>);
+struct VerifyBuffer(pub Box<[u8]>, pub OncePortRef<bool>);
 
 #[async_trait]
 impl Handler<InitializeBuffer> for CudaRdmaActor {
@@ -432,8 +481,8 @@ impl Handler<InitializeBuffer> for CudaRdmaActor {
         if self.rdma_buffer_handle.is_none() {
             let addr = self.cu_ptr;
             let size = self.cpu_buffer.len();
-            let local_memory: Arc<dyn RdmaLocalMemory> =
-                Arc::new(UnsafeLocalMemory::new(addr, size));
+            // See the module-level note on `NoKeepalive`.
+            let local_memory = KeepaliveLocalMemory::new(Arc::new(NoKeepalive { addr, size }));
             let handle = self
                 .rdma_manager
                 .downcast_handle(cx)
@@ -442,7 +491,7 @@ impl Handler<InitializeBuffer> for CudaRdmaActor {
             self.rdma_buffer_handle = Some(buffer_handle);
         }
 
-        reply.send(cx, true)?;
+        reply.post(cx, true);
         Ok(())
     }
 }
@@ -479,6 +528,67 @@ pub async fn validate_execution_context() -> Result<(), anyhow::Error> {
 }
 
 #[async_trait]
+impl Handler<CreateRawQp> for CudaRdmaActor {
+    /// Create a fresh, unconnected legacy queue pair on this actor's RDMA
+    /// device, hold it in `raw_qp`, and reply with its endpoint info.
+    async fn handle(
+        &mut self,
+        cx: &Context<Self>,
+        CreateRawQp(reply): CreateRawQp,
+    ) -> Result<(), anyhow::Error> {
+        let local_buffer = self
+            .rdma_buffer_handle
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Local buffer not initialized"))?;
+        let local_ctx = local_buffer
+            .resolve_mlx()
+            .ok_or_else(|| anyhow::anyhow!("Mellanox backend not found for local buffer"))?;
+        let manager_handle = local_ctx
+            .manager
+            .downcast_handle(cx)
+            .ok_or_else(|| anyhow::anyhow!("local IbvManagerActor is not in this process"))?;
+        let (reply_handle, reply_rx) = cx
+            .mailbox()
+            .open_once_port::<Result<IbvQueuePair, String>>();
+        manager_handle.try_post(
+            cx,
+            RawQueuePair {
+                self_device: local_ctx.buffer.device_name.clone(),
+                reply: reply_handle,
+            },
+        )?;
+        let mut qp = reply_rx
+            .recv()
+            .await
+            .map_err(|e| anyhow::anyhow!("RawQueuePair reply channel closed: {e}"))?
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let info = qp.get_qp_info()?;
+        self.raw_qp = Some(qp);
+        reply.post(cx, info);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<ConnectRawQp> for CudaRdmaActor {
+    /// Connect the held queue pair (from [`CreateRawQp`]) to the peer's
+    /// endpoint info.
+    async fn handle(
+        &mut self,
+        cx: &Context<Self>,
+        ConnectRawQp(peer_info, reply): ConnectRawQp,
+    ) -> Result<(), anyhow::Error> {
+        let qp = self
+            .raw_qp
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("raw QP missing; CreateRawQp must run first"))?;
+        qp.connect(&peer_info)?;
+        reply.post(cx, true);
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl Handler<PerformPingPong> for CudaRdmaActor {
     /// Perform an RDMA write operation to transfer data to another actor using a provided remote buffer
     async fn handle(
@@ -503,28 +613,28 @@ impl Handler<PerformPingPong> for CudaRdmaActor {
             cu_check!(rdmaxcel_sys::rdmaxcel_cuCtxSetCurrent(context));
         }
 
-        // Resolve IbvManagerActor refs and IbvBuffers from backends
-        let (local_ibv_manager, local_ibv) = local_buffer
-            .resolve_ibv(cx)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("ibverbs backend not found for local buffer"))??;
-        let (remote_ibv_manager, remote_ibv) = remote_buffer
-            .resolve_ibv(cx)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("ibverbs backend not found for remote buffer"))??;
+        // Resolve the local/remote buffer transport details for the ping-pong.
+        let local_ibv = local_buffer
+            .resolve_mlx()
+            .ok_or_else(|| anyhow::anyhow!("Mellanox backend not found for local buffer"))?
+            .buffer;
+        let remote_ibv = remote_buffer
+            .resolve_mlx()
+            .ok_or_else(|| anyhow::anyhow!("Mellanox backend not found for remote buffer"))?
+            .buffer;
 
-        let qp = local_ibv_manager
-            .request_queue_pair(
-                cx,
-                remote_ibv_manager.clone(),
-                local_ibv.device_name.clone(),
-                remote_ibv.device_name.clone(),
-            )
-            .await?
-            .map_err(|e| anyhow::anyhow!(e))?;
+        // The queue pair was created by `CreateRawQp` and connected by
+        // `ConnectRawQp` before this message; drive the doorbell on it.
+        let qp = self.raw_qp.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("raw QP missing; CreateRawQp + ConnectRawQp must run first")
+        })?;
 
+        // SAFETY: `qp` is borrowed for the rest of this block; the
+        // pointer returned by `as_ptr` is used to fill `params` before
+        // we release the borrow, so the QP's `Drop` cannot run while
+        // any of these reads are in flight.
         unsafe {
-            let ibv_qp = qp.qp as *mut rdmaxcel_sys::ibv_qp;
+            let ibv_qp = qp.as_ptr() as *mut rdmaxcel_sys::ibv_qp;
             let dv_qp = qp.dv_qp as *mut rdmaxcel_sys::mlx5dv_qp;
             let dv_send_cq = qp.dv_send_cq as *mut rdmaxcel_sys::mlx5dv_cq;
             let dv_recv_cq = qp.dv_recv_cq as *mut rdmaxcel_sys::mlx5dv_cq;
@@ -564,7 +674,7 @@ impl Handler<PerformPingPong> for CudaRdmaActor {
                 }
             }
         }
-        reply.send(cx, true)?;
+        reply.post(cx, true);
         Ok(())
     }
 }
@@ -652,14 +762,14 @@ impl Handler<VerifyBuffer> for CudaRdmaActor {
             }
         }
 
-        reply.send(cx, all_match)?;
+        reply.post(cx, all_match);
         Ok(())
     }
 }
 
 // Message to get the buffer handle from an actor
-#[derive(Debug, Serialize, Deserialize, Named, Clone, Bind, Unbind)]
-struct GetBufferHandle(#[binding(include)] pub reference::OncePortRef<RdmaRemoteBuffer>);
+#[derive(Debug, Serialize, Deserialize, Named, Clone)]
+struct GetBufferHandle(pub OncePortRef<RdmaRemoteBuffer>);
 
 #[async_trait]
 impl Handler<GetBufferHandle> for CudaRdmaActor {
@@ -674,7 +784,7 @@ impl Handler<GetBufferHandle> for CudaRdmaActor {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Buffer not initialized"))?;
 
-        reply.send(cx, buffer.clone())?;
+        reply.post(cx, buffer.clone());
         Ok(())
     }
 }
@@ -703,7 +813,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
     let expected_data_values = expected_buffer[0..start].to_vec().into_boxed_slice();
 
     // Get all available RDMA devices
-    let devices = monarch_rdma::get_all_devices();
+    let devices = monarch_rdma::backend::ibverbs::device::list_all_devices();
     // Configure RDMA for the two actors
     // For H100 machines, we use different devices for better performance
     let device_1_ibv_config: IbvConfig;
@@ -713,13 +823,13 @@ pub async fn run() -> Result<(), anyhow::Error> {
     if devices.len() > 4 {
         // Use separate backend devices for H100 configuration
         device_1_ibv_config = IbvConfig {
-            device: devices.clone().into_iter().next().unwrap(),
+            target: Some(IbvDeviceTarget::nic(devices[0].name().clone())),
             ..Default::default()
         };
         // The second device used is the 3rd. Main reason is because 0 and 3 are both backend
         // devices on gtn H100 devices.
         device_2_ibv_config = IbvConfig {
-            device: devices.clone().into_iter().nth(3).unwrap(),
+            target: Some(IbvDeviceTarget::nic(devices[3].name().clone())),
             ..Default::default()
         };
     } else {
@@ -737,10 +847,13 @@ pub async fn run() -> Result<(), anyhow::Error> {
 
     let host_addrs = [free_localhost_addr(), free_localhost_addr()];
     let mut children = Vec::new();
+    let mut ready = Vec::new();
     for host in host_addrs.iter() {
+        let callback = HostBootstrapReady::new(host.clone())?;
         let mut cmd = Command::new(program.clone());
         let boot = Bootstrap::Host {
             addr: host.clone(),
+            callback_addr: callback.callback_addr(),
             command: None,
             config: None,
             exit_on_shutdown: false,
@@ -748,24 +861,28 @@ pub async fn run() -> Result<(), anyhow::Error> {
         boot.to_env(&mut cmd);
         cmd.kill_on_drop(true);
         children.push(cmd.spawn().unwrap());
+        ready.push(callback);
+    }
+    for callback in ready {
+        callback.wait().await?;
     }
 
     // Create separate host meshes for each device to maintain different configs
     let host_mesh_1 = HostMeshRef::from_hosts(
-        HostMeshId::unique(Label::new("cuda-ping-pong-host1").unwrap()),
+        HostMeshId::instance(Label::new("cuda-ping-pong-host1").unwrap()),
         vec![host_addrs[0].clone()],
     );
     let host_mesh_2 = HostMeshRef::from_hosts(
-        HostMeshId::unique(Label::new("cuda-ping-pong-host2").unwrap()),
+        HostMeshId::instance(Label::new("cuda-ping-pong-host2").unwrap()),
         vec![host_addrs[1].clone()],
     );
 
     // Create proc meshes (one proc per host mesh)
     let device_1_proc_mesh: ProcMesh = host_mesh_1
-        .spawn(&instance, "procs", Extent::unity(), None)
+        .spawn(&instance, "procs", Extent::unity(), None, None)
         .await?;
     let device_2_proc_mesh: ProcMesh = host_mesh_2
-        .spawn(&instance, "procs", Extent::unity(), None)
+        .spawn(&instance, "procs", Extent::unity(), None, None)
         .await?;
 
     // Create RDMA manager for the first device
@@ -811,26 +928,44 @@ pub async fn run() -> Result<(), anyhow::Error> {
     let device_1_actor = device_1_actor_mesh.values().next().unwrap();
     let device_2_actor = device_2_actor_mesh.values().next().unwrap();
     let (handle_1, receiver_1) = instance.open_once_port::<bool>();
-    device_1_actor.send(&instance, InitializeBuffer(DATA_VALUE, handle_1.bind()))?;
+    device_1_actor.post(&instance, InitializeBuffer(DATA_VALUE, handle_1.bind()));
     receiver_1.recv().await?;
 
     // Initialize device 2 buffer with 0
     let (handle_2, receiver_2) = instance.open_once_port::<bool>();
-    device_2_actor.send(&instance, InitializeBuffer(0, handle_2.bind()))?;
+    device_2_actor.post(&instance, InitializeBuffer(0, handle_2.bind()));
     receiver_2.recv().await?;
 
     // Get the remote buffer handle from device 1
     let (handle_remote, receiver_remote) = instance.open_once_port::<RdmaRemoteBuffer>();
-    device_1_actor.send(&instance, GetBufferHandle(handle_remote.bind()))?;
+    device_1_actor.post(&instance, GetBufferHandle(handle_remote.bind()));
     let buffer_1 = receiver_remote.recv().await?;
 
     let (handle_remote, receiver_remote) = instance.open_once_port::<RdmaRemoteBuffer>();
-    device_2_actor.send(&instance, GetBufferHandle(handle_remote.bind()))?;
+    device_2_actor.post(&instance, GetBufferHandle(handle_remote.bind()));
     let buffer_2 = receiver_remote.recv().await?;
+
+    // Bring up a connected legacy QP pair: create one on each actor (held in
+    // its `raw_qp`), exchange endpoint info, and connect each side to the
+    // other. `RawQueuePair` hands back an unconnected QP, so the driver does
+    // the handshake here.
+    let (qp_info_1_handle, qp_info_1_rx) = instance.open_once_port::<IbvQpInfo>();
+    device_1_actor.post(&instance, CreateRawQp(qp_info_1_handle.bind()));
+    let qp_info_1 = qp_info_1_rx.recv().await?;
+    let (qp_info_2_handle, qp_info_2_rx) = instance.open_once_port::<IbvQpInfo>();
+    device_2_actor.post(&instance, CreateRawQp(qp_info_2_handle.bind()));
+    let qp_info_2 = qp_info_2_rx.recv().await?;
+    let (connect_1_handle, connect_1_rx) = instance.open_once_port::<bool>();
+    device_1_actor.post(&instance, ConnectRawQp(qp_info_2, connect_1_handle.bind()));
+    connect_1_rx.recv().await?;
+    let (connect_2_handle, connect_2_rx) = instance.open_once_port::<bool>();
+    device_2_actor.post(&instance, ConnectRawQp(qp_info_1, connect_2_handle.bind()));
+    connect_2_rx.recv().await?;
+
     let (handle_1, receiver_1) = instance.open_once_port::<bool>();
 
     let (handle_2, receiver_2) = instance.open_once_port::<bool>();
-    device_2_actor.send(
+    device_2_actor.post(
         &instance,
         PerformPingPong(
             device_1_actor.clone(),
@@ -839,9 +974,9 @@ pub async fn run() -> Result<(), anyhow::Error> {
             config.initial_length,
             handle_2.bind(),
         ),
-    )?;
+    );
     receiver_2.recv().await?;
-    device_1_actor.send(
+    device_1_actor.post(
         &instance,
         PerformPingPong(
             device_2_actor.clone(),
@@ -850,21 +985,21 @@ pub async fn run() -> Result<(), anyhow::Error> {
             config.initial_length,
             handle_1.bind(),
         ),
-    )?;
+    );
     receiver_1.recv().await?;
 
     let (handle, receiver) = instance.open_once_port::<bool>();
-    device_2_actor.send(
+    device_2_actor.post(
         &instance,
         VerifyBuffer(expected_data_values.clone(), handle.bind()),
-    )?;
+    );
     let verification_result2 = receiver.recv().await?;
 
     let (handle, receiver) = instance.open_once_port::<bool>();
-    device_1_actor.send(
+    device_1_actor.post(
         &instance,
         VerifyBuffer(expected_data_values.clone(), handle.bind()),
-    )?;
+    );
     let verification_result1 = receiver.recv().await?;
 
     if !verification_result1 {

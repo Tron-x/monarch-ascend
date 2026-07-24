@@ -10,35 +10,32 @@ actor messaging. It provides:
 
 Monarch code imperatively describes how to create processes and actors using a simple python API:
 
-    from monarch.actor import Actor, endpoint, this_host
+```python
+from monarch.actor import Actor, endpoint, this_host
 
-    # spawn 8 trainer processes one for each gpu
-    training_procs = this_host().spawn_procs({"gpus": 8})
-
-
-    # define the actor to run on each process
-    class Trainer(Actor):
-        @endpoint
-        def train(self, step: int): ...
+# spawn 8 trainer processes one for each gpu
+training_procs = this_host().spawn_procs({"gpus": 8})
 
 
-    # create the trainers
-    trainers = training_procs.spawn("trainers", Trainer)
+# define the actor to run on each process
+class Trainer(Actor):
+    @endpoint
+    def train(self, step: int): ...
 
-    # tell all the trainers to take a step
-    fut = trainers.train.call(step=0)
 
-    # wait for all trainers to complete
-    fut.get()
+# create the trainers
+trainers = training_procs.spawn("trainers", Trainer)
 
-> ⚠️ **Early Development Warning** Monarch is currently in an experimental
-> stage. You should expect bugs, incomplete features, and APIs that may change
-> in future versions. The project welcomes bugfixes, but to make sure things are
-> well coordinated you should discuss any significant change before starting the
-> work. It's recommended that you signal your intention to contribute in the
-> issue tracker, either by filing a new issue or by claiming an existing one.
+# tell all the trainers to take a step
+fut = trainers.train.call(step=0)
 
-Note: Monarch is currently only supported on Linux systems
+# wait for all trainers to complete
+fut.get()
+```
+
+Note: Monarch runs on Linux and macOS.
+  - The CPU-only tensor engine works on macOS and on Linux hosts without a GPU
+  - GPU features require Linux with a supported GPU toolchain
 
 ## Getting Started
 
@@ -47,11 +44,12 @@ Here are some suggested steps to get started with Monarch:
 1. **Installation**: Check out the [Install guide](installation) for getting monarch installed.
 2. **Getting Started**: The [getting started](./generated/examples/getting_started) provides an introduction to Monarch's core API
 3. **Explore Examples**: Review the [Examples](./generated/examples/index) to see Monarch in action
-4. **Dive Deeper**: Explore the API Documentation for more detailed information:
+4. **Cookbook**: Browse the [Cookbook](cookbook) for short, task-oriented recipes.
+5. **Dive Deeper**: Explore the API Documentation for more detailed information:
     - [Python API](api/index)
     - [Rust API](rust-api)
-5. **Deep Understanding of Actors**: Gain comprehensive knowledge of [Actors](actors), the foundational building blocks of Monarch.
-6. **Monitoring Tools**: Inspect running meshes with the [Admin TUI](admin-tui) (terminal) or the [Monarch Dashboard](monarch-dashboard) (web GUI).
+6. **Deep Understanding of Actors**: Gain comprehensive knowledge of [Actors](actors), the foundational building blocks of Monarch.
+7. **Monitoring Tools**: Inspect running meshes with the [Admin TUI](admin-tui) (terminal) or the [Monarch Dashboard](monarch-dashboard) (web GUI).
 
 ```{toctree}
 :maxdepth: 2
@@ -60,6 +58,7 @@ Here are some suggested steps to get started with Monarch:
 installation
 ./generated/examples/getting_started
 ./generated/examples/index
+cookbook
 api/index
 rust-api
 actors

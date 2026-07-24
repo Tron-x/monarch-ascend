@@ -6,6 +6,7 @@
 
 # pyre-strict
 
+import asyncio
 from typing import (
     Any,
     final,
@@ -36,6 +37,7 @@ _T = TypeVar("_T")
 
 class Future(Generic[_T]):
     def get(self, timeout: Optional[float] = None) -> _T: ...
+    def as_asyncio(self) -> "asyncio.Future[_T]": ...
     def __await__(self) -> Generator[Any, Any, _T]: ...
 
 if TYPE_CHECKING:

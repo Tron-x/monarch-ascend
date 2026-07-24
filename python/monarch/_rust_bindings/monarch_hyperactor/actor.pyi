@@ -9,6 +9,7 @@
 from enum import Enum
 from typing import (
     Any,
+    Awaitable,
     final,
     Generic,
     Iterable,
@@ -117,6 +118,7 @@ class DroppingPort:
 
     def __init__(self) -> None: ...
     def send(self, obj: Any) -> None: ...
+    def resolve_and_send(self, obj: Any) -> Awaitable[None]: ...
     def exception(self, obj: BaseException) -> None: ...
     @property
     def return_undeliverable(self) -> bool: ...
@@ -133,6 +135,7 @@ class PythonMessage:
         self,
         kind: PythonMessageKind,
         message: FrozenBuffer,
+        refs: List[Any],
     ) -> None:
         """
         Create a PythonMessage.
@@ -140,14 +143,23 @@ class PythonMessage:
         Args:
             kind: The message kind specifying the method to call.
             message: The pickled arguments as a FrozenBuffer.
+            refs: Out-of-band mesh references carried alongside the payload
+                (empty if the payload contains none).
+        """
+        ...
+    def decode(self, local_state: List[Any] | None = None) -> Any:
+        """
+        Decode the payload, reuniting the out-of-band ``refs`` table so mesh
+        references reconstruct. This is the only way to read the payload; the
+        raw bytes are intentionally not exposed, so a decode cannot drop refs.
         """
         ...
     @property
-    def message(self) -> FrozenBuffer:
-        """The pickled arguments."""
-        ...
-    @property
     def kind(self) -> PythonMessageKind: ...
+    @property
+    def refs(self) -> List[Any]:
+        """Out-of-band mesh references carried alongside the message."""
+        ...
 
 @final
 class PythonActorHandle:
@@ -191,6 +203,7 @@ R = TypeVar("R")
 
 class PortProtocol(Generic[R], Protocol):
     def send(self, obj: R) -> None: ...
+    def resolve_and_send(self, obj: R) -> Awaitable[None]: ...
     def exception(self, obj: Any) -> None: ...
 
 class Actor(Protocol):
@@ -201,6 +214,7 @@ class Actor(Protocol):
         message: FrozenBuffer,
         panic_flag: PanicFlag,
         local_state: List[Any],
+        mesh_references: List[Any],
         response_port: PortProtocol[Any],
     ) -> None: ...
 
@@ -229,6 +243,11 @@ class QueuedMessage:
     @property
     def local_state(self) -> Any:
         """The local state for this message."""
+        ...
+
+    @property
+    def refs(self) -> List[Any]:
+        """Out-of-band mesh references carried alongside the message."""
         ...
 
     @property

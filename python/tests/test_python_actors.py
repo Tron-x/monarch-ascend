@@ -22,6 +22,7 @@ import threading
 import time
 import unittest
 import unittest.mock
+import warnings
 from tempfile import TemporaryDirectory
 from types import ModuleType
 from typing import Any, cast, Dict, Iterator, NamedTuple, Tuple
@@ -43,8 +44,15 @@ from monarch._rust_bindings.monarch_hyperactor.mailbox import (
 from monarch._rust_bindings.monarch_hyperactor.proc import ActorAddr
 from monarch._rust_bindings.monarch_hyperactor.pytokio import PythonTask, Shared
 from monarch._src.actor.actor_mesh import ActorMesh, Channel, context, Port
-from monarch._src.actor.future import Future
+from monarch._src.actor.future import (
+    disable_tokio_oracle,
+    enable_tokio_oracle,
+    Future,
+    reset_tokio_oracle,
+    tokio_oracle_records,
+)
 from monarch._src.actor.host_mesh import _spawn_admin, HostMesh, this_host, this_proc
+from monarch._src.actor.logging import _pending_flush_tasks
 from monarch._src.actor.proc_mesh import get_or_spawn_controller, HyProcMesh
 from monarch._src.job.job import LoginJob, ProcessState
 from monarch._src.job.process import ProcessJob
@@ -59,7 +67,8 @@ from monarch.actor import (
     ProcMesh,
 )
 from monarch.config import configure, configured, parametrize_config
-from monarch.tools.config import defaults
+from monarch.tools.config import Config
+from monarch.tools.config.workspace import Workspace
 from scoped_state import scoped_state
 from typing_extensions import assert_type
 
@@ -109,7 +118,7 @@ async def test_choose():
     assert result == result2
 
     v2 = proc.spawn("sync_counter", SyncCounter, v)
-    result3 = v2.value_sync_endpoint.choose().get()
+    result3 = await v2.value_sync_endpoint.choose()
     assert_type(result, int)
     assert result2 == result3
     await proc.stop()
@@ -231,7 +240,7 @@ async def test_rank_string():
     per_host = {"hosts": 1, "gpus": 2}
     proc = this_host().spawn_procs(per_host=per_host)
     r = proc.spawn("runit", RunIt)
-    vm = r.return_current_rank_str.call().get()
+    vm = await r.return_current_rank_str.call()
     r0 = vm.flatten("r").slice(r=0).item()
     r1 = vm.flatten("r").slice(r=1).item()
     assert r0 == "{'hosts': 0/1, 'gpus': 0/2}"
@@ -265,6 +274,40 @@ def test_sync_actor_sync_client() -> None:
     r = a.sync_endpoint.choose(c).get()
     assert r == 5
     proc.stop().get()
+
+
+class SyncContextActor(Actor):
+    @endpoint
+    def observe_sync_context(self, a_counter: Counter) -> Tuple[bool, bool, int]:
+        # A sync endpoint runs with no asyncio loop visible on its thread, so
+        # get_running_loop() raises and Future.get() blocks without the
+        # active-event-loop warning.
+        try:
+            asyncio.get_running_loop()
+            loop_visible = True
+        except RuntimeError:
+            loop_visible = False
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            value = a_counter.value.choose().get()
+        warned = any("active event loop" in str(w.message) for w in caught)
+        return loop_visible, warned, value
+
+
+@pytest.mark.timeout(60)
+@parametrize_config(actor_queue_dispatch={True, False})
+async def test_sync_endpoint_has_no_visible_loop_and_get_does_not_warn() -> None:
+    """A sync (`def`) endpoint runs without a visible asyncio loop:
+    `asyncio.get_running_loop()` raises inside it, and `Future.get()` therefore
+    takes the legal blocking path without the "active event loop" warning."""
+    proc = this_host().spawn_procs(per_host={"gpus": 1})
+    a = proc.spawn("actor", SyncContextActor)
+    c = proc.spawn("counter", Counter, 5)
+    loop_visible, warned, value = await a.observe_sync_context.choose(c)
+    assert loop_visible is False, "a sync endpoint should see no running loop"
+    assert warned is False, "Future.get() in a sync endpoint should not warn"
+    assert value == 5
+    await proc.stop()
 
 
 @pytest.mark.timeout(60)
@@ -600,7 +643,6 @@ def configured_with_redirected_stdio(
     """Apply config overrides and capture stdio for the duration of
     the block."""
     with (
-        # pyre-fixme[6]: These override types are checked by the function.
         configured(**config_overrides) as config,
         redirected_stdio(capture_stderr) as paths,
     ):
@@ -806,23 +848,37 @@ async def test_flush_called_only_once() -> None:
                 "monarch._src.actor.logging.flush_all_proc_mesh_logs"
             ) as mock_flush,
             unittest.mock.patch(
+                "monarch._src.actor.logging._flush_all_proc_mesh_logs_async"
+            ) as mock_flush_async,
+            unittest.mock.patch(
                 "monarch._src.actor.logging.LoggingManager.enable_fd_capture_if_in_ipython",
                 return_value=None,
             ),
         ):
+
+            async def _coro() -> None:
+                return None
+
+            mock_flush_async.return_value = _coro()
+
             # Create 2 proc meshes with a large aggregation window
             pm1 = this_host().spawn_procs(per_host={"gpus": 2})
             _ = this_host().spawn_procs(per_host={"gpus": 2})
             # flush not yet called unless post_run_cell
             assert mock_flush.call_count == 0
+            assert mock_flush_async.call_count == 0
             assert mock_ipython.events.registers == 0
             await pm1.logging_option(stream_to_client=True, aggregate_window_sec=600)
             assert mock_ipython.events.registers == 1
 
-            # now, flush should be called only once
+            # The callback fires inside the test's running asyncio loop, so it
+            # schedules the async flush rather than calling the sync one. Drain
+            # pending tasks so the scheduled coroutine actually runs.
             mock_ipython.events.trigger("post_run_cell", unittest.mock.MagicMock())
+            await asyncio.sleep(0)
 
-            assert mock_flush.call_count == 1
+            assert mock_flush.call_count == 0
+            assert mock_flush_async.call_count == 1
             await pm1.stop()
 
 
@@ -866,19 +922,18 @@ async def test_flush_logs_ipython() -> None:
                     await am1.print.call("ipython1 test log")
                     await am2.print.call("ipython2 test log")
 
-                # Trigger the post_run_cell event which should flush logs
+                # Trigger the post_run_cell event which should flush logs.
+                # Inside an async loop the callback schedules an async flush
+                # task rather than blocking, so wait for those tasks to finish
+                # before moving on (the next iteration / final assertions rely
+                # on the flush actually having happened).
                 mock_ipython.events.trigger("post_run_cell", unittest.mock.MagicMock())
+                if _pending_flush_tasks:
+                    await asyncio.gather(*list(_pending_flush_tasks))
 
         # We expect to register post_run_cell hook only once per notebook/ipython session
         assert mock_ipython.events.registers == 1
         assert len(mock_ipython.events.callbacks["post_run_cell"]) == 1
-
-        # Flush to ensure all output is written before reading
-        sys.stdout.flush()
-
-        # Read the captured output
-        with open(paths.stdout, "r") as f:
-            stdout_content = f.read()
 
         # We triggered post_run_cell three times; in the current
         # implementation that yields three aggregated groups per
@@ -886,6 +941,24 @@ async def test_flush_logs_ipython() -> None:
         # all 10).
         pattern1 = r"\[\d+ similar log lines\].*ipython1 test log"
         pattern2 = r"\[\d+ similar log lines\].*ipython2 test log"
+
+        # The rust flush task completes via the awaited future, but the
+        # aggregated bytes still have to flow through the FD pipe set up by
+        # enable_fd_capture_if_in_ipython and the pump thread before they
+        # land in the captured temp file. Poll until both patterns appear
+        # the expected number of times, with a deadline.
+        deadline = time.monotonic() + 10
+        stdout_content = ""
+        while time.monotonic() < deadline:
+            sys.stdout.flush()
+            with open(paths.stdout, "r") as f:
+                stdout_content = f.read()
+            if (
+                len(re.findall(pattern1, stdout_content)) >= 3
+                and len(re.findall(pattern2, stdout_content)) >= 3
+            ):
+                break
+            await asyncio.sleep(0.5)
 
         assert len(re.findall(pattern1, stdout_content)) >= 3, stdout_content
         assert len(re.findall(pattern2, stdout_content)) >= 3, stdout_content
@@ -988,6 +1061,51 @@ async def test_flush_on_disable_aggregation() -> None:
         await pm.stop()
 
 
+# oss_skip: same log-forwarding rig as the sibling flush tests (broken in GitHub
+# by D86994420; passes internally).
+@pytest.mark.oss_skip
+async def test_flush_async_drives_flush_on_asyncio_loop() -> None:
+    """`LoggingManager.flush_async` must actually drive the flush when awaited on
+    an asyncio loop.
+
+    Regression guard: `flush_async` awaits the flush and swallows exceptions. If
+    it awaited a bare PythonTask, the pytokio gate would raise under a running
+    asyncio loop and the `except` would eat it -- a silent no-op. Here we buffer
+    logs under a long aggregation window, `await flush_async()` directly on the
+    test's asyncio loop, and require the aggregated lines to appear. With the
+    silent-no-op bug this assertion fails (the lines stay buffered).
+    """
+    with configured_with_redirected_stdio(
+        capture_stderr=False,
+        enable_log_forwarding=True,
+        enable_file_capture=True,
+        tail_log_lines=100,
+    ) as (_, paths):
+        pm = this_host().spawn_procs(per_host={"gpus": 2})
+        am = pm.spawn("printer", Printer)
+
+        # Long window so nothing auto-flushes; only our explicit flush_async can.
+        await pm.logging_option(stream_to_client=True, aggregate_window_sec=60)
+        for _ in range(5):
+            await am.print.call("flush_async driven log line")
+        await asyncio.sleep(1)
+
+        # System under test: flush_async on the test's asyncio loop.
+        await pm._logging_manager.flush_async()
+
+        await asyncio.sleep(1)
+        sys.stdout.flush()
+        with open(paths.stdout, "r") as f:
+            stdout_content = f.read()
+
+        # 10 = 5 log lines * 2 procs; present only if flush_async actually drove
+        # the flush (otherwise still buffered under the 60s window).
+        assert re.search(
+            r"\[10 similar log lines\].*flush_async driven log line", stdout_content
+        ), stdout_content
+        await pm.stop()
+
+
 @pytest.mark.timeout(120)
 @parametrize_config(actor_queue_dispatch={True, False})
 @isolate_in_subprocess
@@ -1022,7 +1140,7 @@ async def test_multiple_ongoing_flushes_no_deadlock() -> None:
             )
 
         # The last flush should not block
-        futures[-1].get()
+        await futures[-1]
         await pm.stop()
 
 
@@ -1125,14 +1243,17 @@ async def test_sync_workspace() -> None:
         pm = host.spawn_procs(per_host={"gpus": 1})
         code_sync_mesh = host
 
-        config = defaults.config("slurm", workspace_src)
+        config = Config(
+            scheduler="slurm",
+            workspace=Workspace(dirs={workspace_src: ""}),
+        )
         await code_sync_mesh.sync_workspace(
             workspace=config.workspace, auto_reload=True
         )
 
         # no file in remote workspace initially
         am = pm.spawn("ls", LsActor, workspace_dst)
-        for item in list(am.ls.call().get()):
+        for item in list(await am.ls.call()):
             assert len(item[1]) == 0
 
         # write a file to local workspace
@@ -1143,7 +1264,7 @@ async def test_sync_workspace() -> None:
 
         # force a sync and it should populate on the dst workspace
         await code_sync_mesh.sync_workspace(config.workspace, auto_reload=True)
-        for item in list(am.ls.call().get()):
+        for item in list(await am.ls.call()):
             assert len(item[1]) == 1
             assert item[1][0] == "new_file"
             file_path = os.path.join(workspace_dst, item[1][0])
@@ -1270,7 +1391,8 @@ class UndeliverableMessageSender(Actor):
         buf.write(b"123")
         port_ref.send(
             actor_instance._as_rust(),
-            PythonMessage(PythonMessageKind.Result(None), buf.freeze()),
+            # pyrefly: ignore [bad-argument-count, bad-argument-type]
+            PythonMessage(PythonMessageKind.Result(None), buf.freeze(), []),
         )
 
 
@@ -1290,8 +1412,10 @@ class UndeliverableMessageSenderWithOverride(UndeliverableMessageSender):
 
 
 @pytest.mark.timeout(10)
+# Pinned to direct dispatch; this test assumes concurrent dispatch and isn't
+# compatible with the queue-based path.
+@parametrize_config(actor_queue_dispatch={False})
 @isolate_in_subprocess
-# Not compatible with queue dispatch, as it assumes concurrent dispatch
 async def test_undeliverable_message_with_override() -> None:
     pm = this_host().spawn_procs(per_host={"gpus": 1})
     receiver = pm.spawn("undeliverable_receiver", UndeliverableMessageReceiver)
@@ -1299,11 +1423,11 @@ async def test_undeliverable_message_with_override() -> None:
         "undeliverable_sender", UndeliverableMessageSenderWithOverride, receiver
     )
     sender.send_undeliverable.call()
-    sender, dest, error_msg = receiver.get_messages.call_one().get()
+    sender, dest, error_msg = await receiver.get_messages.call_one()
     assert sender != ""
     assert "bogus" in dest
     assert error_msg is not None
-    pm.stop().get()
+    await pm.stop()
 
 
 @pytest.mark.timeout(60)
@@ -1315,11 +1439,11 @@ async def test_undeliverable_message_without_override() -> None:
     monarch.actor.unhandled_fault_hook = lambda failure: None
     pm = this_host().spawn_procs(per_host={"gpus": 1})
     sender = pm.spawn("undeliverable_sender", UndeliverableMessageSender)
-    sender.send_undeliverable.call().get()
+    await sender.send_undeliverable.call()
     # Wait a few seconds to ensure that the undeliverable message is processed
     # without crashing anything
     await asyncio.sleep(5)
-    pm.stop().get()
+    await pm.stop()
 
 
 @parametrize_config(actor_queue_dispatch={True, False})
@@ -1428,6 +1552,7 @@ def test_simple_bootstrap():
             procs.append(proc)
             workers.append(addr)
 
+        # pyrefly: ignore [bad-argument-type]
         hosts = attach_to_workers(ca="trust_all_connections", workers=workers)
 
         hello = hosts.spawn_procs().spawn("hello", Hello)
@@ -1438,6 +1563,37 @@ def test_simple_bootstrap():
         for proc in procs:
             proc.kill()
             proc.wait()
+
+
+@isolate_in_subprocess
+def test_attach_fails_closed_on_unreachable_host():
+    """`attach_to_workers(...)` against an unreachable host raises a
+    Python exception whose message names the failing host. See HM-* in
+    `host_mesh.rs` for the underlying contract."""
+    # Tighten the per-host config-push timeout so the test doesn't
+    # wait the 10 s default.
+    with configured(mesh_attach_config_timeout="500ms"):
+        with TemporaryDirectory() as d:
+            unreachable = f"ipc://{d}/never_bound"
+
+            hosts = attach_to_workers(ca="trust_all_connections", workers=[unreachable])
+
+            with pytest.raises(Exception) as excinfo:
+                hosts.initialized.get()
+
+            msg = str(excinfo.value)
+
+            assert "attach failed: config push failed during attach" in msg, (
+                f"expected attach-time config-push failure shape, got: {msg}"
+            )
+
+            # `ipc://...` normalizes to `unix:...` in
+            # `ChannelAddr::Display`; match on the stable path
+            # component so the assertion isn't tied to scheme spelling.
+            expected_path = f"{d}/never_bound"
+            assert expected_path in msg, (
+                f"unreachable host path must appear in error, got: {msg}"
+            )
 
 
 @parametrize_config(actor_queue_dispatch={True, False})
@@ -1481,6 +1637,7 @@ def test_config_propagates_to_host_agent():
             procs.append(proc)
             workers.append(addr)
 
+        # pyrefly: ignore [bad-argument-type]
         hosts = attach_to_workers(ca="trust_all_connections", workers=workers)
 
         # _spawn_admin() spawns MeshAdminAgent on the caller's local
@@ -1536,6 +1693,7 @@ def test_fd_bootstrap():
         # The client connects to the real port, not the fd syntax.
         workers.append(f"tcp://127.0.0.1:{port}")
 
+    # pyrefly: ignore [bad-argument-type]
     hosts = attach_to_workers(ca="trust_all_connections", workers=workers)
     hello = hosts.spawn_procs().spawn("hello", Hello)
 
@@ -1738,6 +1896,7 @@ def test_instance_name():
     logs.logger.error("HUH")
     assert "actor=<root>" in logs.contents
     try:
+        # pyrefly: ignore [bad-assignment]
         monarch.actor.config.prefix_python_logs_with_actor = False
         logs = CaptureLogs()
         logs.logger.error("HUH")
@@ -1803,8 +1962,9 @@ class ActorWithAsyncCleanup(Actor):
     async def check(self) -> None:
         pass
 
-    # Cleanup should match the async-ness of the other endpoints.
-    async def __cleanup__(self, exc: Exception | None):
+    # Cleanup should match the async-ness of the other endpoints
+    # to exercise the async `__cleanup__` dispatch path.
+    async def __cleanup__(self, exc: Exception | None):  # type: ignore[override]
         self.logger.info(f"Calling __cleanup__ on {self}, {exc=}")
         await self.counter.incr.call_one()
 
@@ -1957,8 +2117,8 @@ async def test_run_forever_on_init():
     # Fake type, actually ActorMesh[Counter], but necessary for type-checking.
     send, recv = Channel[Counter].open()
     forever = pm.spawn("forever", RunForeverOnInitActor, pm, send)
-    counter = recv.recv().get()
-    assert counter.value.call_one().get() == 42
+    counter = await recv.recv()
+    assert await counter.value.call_one() == 42
     await cast(ActorMesh, forever).stop()
 
 
@@ -2015,9 +2175,7 @@ def test_graceful_shutdown_no_unacked_messages() -> None:
     env = os.environ.copy()
     env["HYPERACTOR_MESSAGE_DELIVERY_TIMEOUT"] = "2s"
     if "FB_XAR_INVOKED_NAME" in os.environ:
-        pytest.skip(  # pyre-ignore[29]: pytest.skip is callable
-            "fbcode subprocess doesn't work right..."
-        )
+        pytest.skip("fbcode subprocess doesn't work right...")
     result = subprocess.run(
         [sys.executable, "-c", _GRACEFUL_SHUTDOWN_WORKER],
         env=env,
@@ -2101,3 +2259,70 @@ async def test_del_runs_on_proc_mesh_stop() -> None:
             f"file {marker_path} should have contents 'finalized' if the finalizers were run"
         )
     os.unlink(marker_path)
+
+
+# ── Accumulator.accumulate characterization tests ──────────────────────────
+
+
+def _future_of(value):
+    """A real, single-use monarch Future resolving to value."""
+
+    async def _v():
+        return value
+
+    return Future(coro=_v())
+
+
+def _stream_endpoint(values):
+    """A fake Endpoint whose .stream() yields one real Future per value."""
+    ep = unittest.mock.MagicMock()
+    ep.stream.return_value = iter([_future_of(v) for v in values])
+    return ep
+
+
+def test_accumulate_folds_with_combine():
+    """accumulate reduces the per-rank stream through combine from identity."""
+    acc = Accumulator(_stream_endpoint([1, 2, 3]), 0, operator.add)
+    assert acc.accumulate().get() == 6
+
+
+def test_accumulate_empty_stream_returns_identity():
+    """With no streamed values, accumulate returns the identity seed."""
+    acc = Accumulator(_stream_endpoint([]), 42, operator.add)
+    assert acc.accumulate().get() == 42
+
+
+def test_accumulate_folds_left_to_right():
+    """combine is applied left-to-right over the stream, seeded by identity."""
+    acc = Accumulator(_stream_endpoint([1, 2, 3]), [], lambda a, r: a + [r])
+    assert acc.accumulate().get() == [1, 2, 3]
+
+
+def test_accumulate_forwards_args_to_stream():
+    """accumulate forwards its args/kwargs to endpoint.stream()."""
+    ep = _stream_endpoint([1])
+    Accumulator(ep, 0, operator.add).accumulate("a", k=1).get()
+    ep.stream.assert_called_once_with("a", k=1)
+
+
+def test_accumulate_produces_no_tokio():
+    """Gate A (accumulate cluster): accumulate produces no `_Tokio` state.
+
+    Drives accumulate with the record-only `_Tokio` oracle enabled and asserts
+    actor_mesh.py produced no `_Tokio` (no `await <Future>` on the tokio thread).
+    Before the `_take_inner()` migration this recorded the impl producer at 876;
+    after it, zero.
+    """
+    disable_tokio_oracle()
+    reset_tokio_oracle()
+    enable_tokio_oracle()
+    try:
+        acc = Accumulator(_stream_endpoint([1, 2, 3]), 0, operator.add)
+        assert acc.accumulate().get() == 6
+        records = [
+            r for r in tokio_oracle_records() if r.filename.endswith("actor_mesh.py")
+        ]
+        assert records == [], f"accumulate still produces _Tokio: {records}"
+    finally:
+        disable_tokio_oracle()
+        reset_tokio_oracle()

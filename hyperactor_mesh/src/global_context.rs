@@ -6,17 +6,24 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Process-global context, root client actor, and supervision bridge.
+//! Process-global context, root client actor, external-runtime registrations,
+//! and supervision bridge.
 //!
-//! This module provides the Rust equivalent of Python's `context()`,
-//! `this_host()`, and `this_proc()`. A singleton [`Host`] is lazily
-//! created with the [`GlobalClientActor`] on its `local_proc`:
+//! This module has two separate root-context roles:
+//!
+//! - Rust callers use the lazy [`GLOBAL_CONTEXT`] path, exposed through
+//!   [`context()`], [`this_host()`], and [`this_proc()`]. A singleton
+//!   [`Host`] is created with the [`GlobalClientActor`] on its `local_proc`.
+//! - External runtimes such as Python do not use [`GLOBAL_CONTEXT`]. They
+//!   may register their already-bootstrapped client root meshes through
+//!   [`register_client_host`] and [`register_client_proc`]. Registration
+//!   getters are non-bootstrapping and must not initialize [`GLOBAL_CONTEXT`].
 //!
 //! ```rust,ignore
 //! let cx = context().await;
 //! cx.actor_instance    // c.f. Python: context().actor_instance
 //! this_host().await    // c.f. Python: this_host()
-//! this_proc().await    // c.f Python: this_proc()
+//! this_proc().await    // c.f. Python: this_proc()
 //! ```
 //!
 //! ## Undeliverables → supervision
@@ -49,6 +56,17 @@
 //! If no sink has been installed yet (early/late binding),
 //! undeliverables are logged and dropped, preserving forward progress
 //! until a mesh becomes available.
+//!
+//! ## External runtime registration
+//!
+//! **GC-2 (external registration is non-bootstrapping):** External-runtime
+//! registration lookups must never initialize the lazy Rust [`GLOBAL_CONTEXT`].
+//! They read only already-initialized cells via `.get()` (`OnceCell::get` for
+//! `GLOBAL_CONTEXT`, `OnceLock::get` for the registration slots), never a
+//! `get_or_init`. In particular, [`try_registered_client_proc`] returns only
+//! the externally registered proc mesh and deliberately ignores any coexisting
+//! Rust global context; absence is reported as `None`, not filled by
+//! bootstrapping a Rust root.
 
 use std::sync::OnceLock;
 use std::sync::RwLock;
@@ -57,6 +75,7 @@ use async_trait::async_trait;
 use hyperactor::Actor;
 use hyperactor::ActorHandle;
 use hyperactor::Context;
+use hyperactor::Endpoint as _;
 use hyperactor::Handler;
 use hyperactor::Instance;
 use hyperactor::PortRef;
@@ -65,13 +84,17 @@ use hyperactor::actor::ActorErrorKind;
 use hyperactor::actor::ActorStatus;
 use hyperactor::actor::Signal;
 use hyperactor::id::Label;
-use hyperactor::mailbox::DeliveryError;
+use hyperactor::id::Uid;
+use hyperactor::mailbox::DeliveryFailure;
 use hyperactor::mailbox::MessageEnvelope;
-use hyperactor::mailbox::PortReceiver;
+use hyperactor::mailbox::TransportFailure;
+use hyperactor::mailbox::TransportFailureReason;
 use hyperactor::mailbox::Undeliverable;
+use hyperactor::mailbox::UndeliverableReason;
+use hyperactor::proc::ActorWorkReceiver;
 use hyperactor::proc::Proc;
-use hyperactor::proc::WorkCell;
 use hyperactor::supervision::ActorSupervisionEvent;
+use hyperactor_cast::cast_actor::CAST_ACTOR_NAME;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -81,7 +104,6 @@ use crate::host::LocalProcManager;
 use crate::host_mesh::host_agent::GetLocalProcClient;
 use crate::host_mesh::host_agent::HOST_MESH_AGENT_ACTOR_NAME;
 use crate::host_mesh::host_agent::HostAgent;
-use crate::host_mesh::host_agent::HostAgentMode;
 use crate::host_mesh::host_agent::ProcManagerSpawnFn;
 use crate::mesh_id::HostMeshId;
 use crate::mesh_id::ProcMeshId;
@@ -171,19 +193,19 @@ fn get_global_supervision_sink() -> Option<PortRef<ActorSupervisionEvent>> {
 #[hyperactor::export(handlers = [MeshFailure])]
 pub struct GlobalClientActor {
     /// Control signals for the actor's proc (shutdown, etc.).
-    signal_rx: PortReceiver<Signal>,
+    signal_rx: mpsc::UnboundedReceiver<Signal>,
     /// Supervision events delivered to this actor instance.
     ///
     /// The root client is a monitor, so it should process these
     /// events without crashing on routine routing/delivery failures
     /// it observes.
-    supervision_rx: PortReceiver<ActorSupervisionEvent>,
+    supervision_rx: mpsc::UnboundedReceiver<ActorSupervisionEvent>,
     /// Primary work queue for handler dispatch.
     ///
     /// Any bound handler message (e.g. `MeshFailure`,
     /// `Undeliverable<MessageEnvelope>`, introspection, etc.) is
     /// received here and executed via `WorkCell::handle`.
-    work_rx: mpsc::UnboundedReceiver<WorkCell<Self>>,
+    work_rx: ActorWorkReceiver<Self>,
 }
 
 impl GlobalClientActor {
@@ -195,21 +217,21 @@ impl GlobalClientActor {
                     work = self.work_rx.recv() => {
                         let work = work.expect("inconsistent work queue state");
                         if let Err(err) = work.handle(&mut self, instance).await {
-                            for supervision_event in self.supervision_rx.drain() {
+                            while let Ok(supervision_event) = self.supervision_rx.try_recv() {
                                 instance.handle_supervision_event(&mut self, supervision_event).await
                                     .expect("GlobalClientActor::handle_supervision_event is infallible");
                             }
                             let kind = ActorErrorKind::processing(err);
                             break ActorError {
-                                actor_id: Box::new(instance.self_id().clone()),
+                                actor_id: Box::new(instance.self_addr().clone()),
                                 kind: Box::new(kind),
                             };
                         }
                     }
-                    _ = self.signal_rx.recv() => {
+                    Some(_) = self.signal_rx.recv() => {
                         // TODO: do we need any signal handling for the root client?
                     }
-                    Ok(supervision_event) = self.supervision_rx.recv() => {
+                    Some(supervision_event) = self.supervision_rx.recv() => {
                         instance.handle_supervision_event(&mut self, supervision_event).await
                             .expect("GlobalClientActor::handle_supervision_event is infallible");
                     }
@@ -220,7 +242,7 @@ impl GlobalClientActor {
                 _ => {
                     let status = ActorStatus::generic_failure(err.kind.to_string());
                     ActorSupervisionEvent::new(
-                        instance.self_id().clone(),
+                        instance.self_addr().clone(),
                         Some("testclient".into()),
                         status,
                         None,
@@ -231,6 +253,72 @@ impl GlobalClientActor {
                 .proc()
                 .handle_unhandled_supervision_event(instance, event);
         })
+    }
+
+    async fn report_delivery_failure(
+        &mut self,
+        cx: &Instance<Self>,
+        undeliverable: Undeliverable<MessageEnvelope>,
+    ) -> Result<(), anyhow::Error> {
+        let mut env = match undeliverable {
+            Undeliverable::Returned(env) => env,
+            Undeliverable::Report(report) => {
+                let actor_ref = report.dest.actor_addr();
+                let error = report.error_msg().unwrap_or_default();
+                let event = ActorSupervisionEvent::new(
+                    actor_ref.clone(),
+                    None,
+                    ActorStatus::generic_failure(format!(
+                        "message not delivered to {}: {}",
+                        report.dest, error
+                    )),
+                    None,
+                );
+                match get_global_supervision_sink() {
+                    Some(sink) => {
+                        sink.post(cx, event);
+                    }
+                    None => {
+                        tracing::warn!(
+                            actor=%actor_ref,
+                            error=%error,
+                            "no supervision sink; delivery failure report logged but not forwarded"
+                        );
+                    }
+                }
+                return Ok(());
+            }
+        };
+        env.push_delivery_failure(DeliveryFailure::new(UndeliverableReason::Transport(
+            TransportFailure::new(
+                env.dest().clone(),
+                TransportFailureReason::LinkUnavailable(
+                    "message returned to global root client".to_string(),
+                ),
+            ),
+        )));
+        let actor_ref = env.dest().actor_addr();
+        let headers = env.headers().clone();
+        let event = ActorSupervisionEvent::new(
+            actor_ref.clone(),
+            None,
+            ActorStatus::generic_failure(format!("message not delivered: {}", env)),
+            Some(headers),
+        );
+
+        match get_global_supervision_sink() {
+            Some(sink) => {
+                sink.post(cx, event);
+            }
+            None => {
+                tracing::warn!(
+                    actor=%actor_ref,
+                    error=%env.error_msg().unwrap_or_default(),
+                    "no supervision sink; undeliverable message logged but not forwarded"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -264,42 +352,30 @@ impl Actor for GlobalClientActor {
         Ok(true)
     }
 
+    async fn handle_delivery_failure_event(
+        &mut self,
+        cx: &Instance<Self>,
+        undeliverable: Undeliverable<MessageEnvelope>,
+    ) -> Result<(), anyhow::Error> {
+        self.report_delivery_failure(cx, undeliverable).await
+    }
+
     async fn handle_undeliverable_message(
         &mut self,
         cx: &Instance<Self>,
-        Undeliverable(mut env): Undeliverable<MessageEnvelope>,
+        _reason: UndeliverableReason,
+        undeliverable: Undeliverable<MessageEnvelope>,
     ) -> Result<(), anyhow::Error> {
-        env.set_error(DeliveryError::BrokenLink(
-            "message returned to global root client".to_string(),
-        ));
-        let actor_ref = env.dest().actor_ref();
-        let headers = env.headers().clone();
-        let event = ActorSupervisionEvent::new(
-            actor_ref.clone(),
-            None,
-            ActorStatus::generic_failure(format!("message not delivered: {}", env)),
-            Some(headers),
-        );
+        self.report_delivery_failure(cx, undeliverable).await
+    }
 
-        match get_global_supervision_sink() {
-            Some(sink) => {
-                if let Err(e) = sink.send(cx, event) {
-                    tracing::warn!(
-                        %e,
-                        actor=%actor_ref,
-                        "failed to forward supervision event from undeliverable"
-                    );
-                }
-            }
-            None => {
-                tracing::warn!(
-                    actor=%actor_ref,
-                    error=?env.errors(),
-                    "no supervision sink; undeliverable message logged but not forwarded"
-                );
-            }
-        }
-        Ok(())
+    async fn handle_invalid_reference(
+        &mut self,
+        cx: &Instance<Self>,
+        _invalid: hyperactor::mailbox::InvalidReference,
+        undeliverable: Undeliverable<MessageEnvelope>,
+    ) -> Result<(), anyhow::Error> {
+        self.report_delivery_failure(cx, undeliverable).await
     }
 }
 
@@ -357,11 +433,23 @@ async fn bootstrap_host() -> GlobalState {
 
     // 3. Spawn HostAgent on system_proc (takes ownership of Host).
     let host_agent = system_proc
-        .spawn(
-            HOST_MESH_AGENT_ACTOR_NAME,
-            HostAgent::new(HostAgentMode::Local(host)),
+        .spawn_with_uid(
+            Uid::singleton(Label::new(HOST_MESH_AGENT_ACTOR_NAME).unwrap()),
+            HostAgent::new_local(host),
         )
         .expect("failed to spawn host agent");
+    HostAgent::wait_initialized(&host_agent)
+        .await
+        .expect("failed to initialize host agent");
+
+    let cast_handle = system_proc
+        .spawn_with_uid(
+            Uid::singleton(Label::strip(CAST_ACTOR_NAME)),
+            hyperactor_cast::cast_actor::CastActor::default(),
+        )
+        .expect("failed to spawn cast actor");
+
+    cast_handle.bind::<hyperactor_cast::cast_actor::CastActor>();
 
     // 4. Build HostMeshRef.
     let host_mesh = HostMeshRef::from_host_agent(
@@ -372,15 +460,13 @@ async fn bootstrap_host() -> GlobalState {
 
     // 5. Get local_proc via HostAgent (lazily boots ProcAgent).
     //
-    // We use a throwaway Proc::local() for the bootstrap request-reply
+    // We use a throwaway Proc::isolated() for the bootstrap request-reply
     // calls, matching Python's bootstrap_host() (host_mesh.rs:330-333).
     // This creates a temporary in-process-only proc context during init
     // — intentionally acceptable for cross-language symmetry and easier
     // reasoning about the bootstrap sequence.
-    let temp_proc = Proc::local();
-    let (bootstrap_cx, _guard) = temp_proc
-        .instance("bootstrap")
-        .expect("failed to create bootstrap instance");
+    let temp_proc = Proc::isolated();
+    let bootstrap_cx = temp_proc.client("bootstrap");
     let local_proc_agent: ActorHandle<ProcAgent> = host_agent
         .get_local_proc(&bootstrap_cx)
         .await
@@ -396,13 +482,22 @@ async fn bootstrap_host() -> GlobalState {
     let proc_mesh = ProcMeshRef::new_singleton(
         ProcMeshId::singleton(Label::new("local").unwrap()),
         ProcRef::new(
-            local_proc_agent.actor_id().proc_ref(),
+            local_proc_agent.actor_addr().proc_addr(),
             0,
             local_proc_agent.bind(),
         ),
-    );
+    )
+    .expect("failed to create proc mesh ref");
+    // Bind the client-root API on this program's one root ProcAgent and seed the
+    // root client's environment with the resulting capability. Descendants
+    // inherit it through the actor-environment propagation paths (CROOT-1).
+    let client_root = crate::client_root::ClientRootRef::bind(&local_proc_agent);
+    let mut root_env = hyperactor::ActorEnvironment::default();
+    root_env
+        .set(crate::client_root::CLIENT_ROOT, client_root)
+        .expect("failed to seed client-root capability");
     let actor_instance = local_proc
-        .actor_instance::<GlobalClientActor>("client")
+        .actor_instance_in_environment::<GlobalClientActor>("client", root_env)
         .expect("failed to create root client instance");
 
     let hyperactor::proc::ActorInstance {
@@ -491,7 +586,8 @@ static REGISTERED_CLIENT_HOST: std::sync::OnceLock<HostMeshRef> = std::sync::Onc
 
 /// Register the client host mesh from an external runtime (Python).
 /// Called by Python's `bootstrap_host()` so that `try_this_host()`
-/// can discover C for the A/C invariant.
+/// can discover C for the A/C invariant. First registration wins: a later
+/// call is silently ignored (the `OnceLock` is already set).
 pub fn register_client_host(host_mesh: HostMeshRef) {
     let _ = REGISTERED_CLIENT_HOST.set(host_mesh);
 }
@@ -507,17 +603,71 @@ pub fn try_this_host() -> Option<&'static HostMeshRef> {
         .or_else(|| REGISTERED_CLIENT_HOST.get())
 }
 
+/// Separate storage for the client *proc* mesh registered by non-Rust
+/// runtimes (e.g. Python's `bootstrap_host()`), mirroring
+/// `REGISTERED_CLIENT_HOST`. Read by `try_registered_client_proc()`.
+static REGISTERED_CLIENT_PROC: std::sync::OnceLock<ProcMeshRef> = std::sync::OnceLock::new();
+
+/// Register the client proc mesh from an external runtime (Python).
+/// Mirrors `register_client_host`; called from Python's `bootstrap_host()`
+/// so `try_registered_client_proc` can discover the client proc. First
+/// registration wins: a later call is silently ignored (the `OnceLock` is
+/// already set).
+pub fn register_client_proc(proc_mesh: ProcMeshRef) {
+    let _ = REGISTERED_CLIENT_PROC.set(proc_mesh);
+}
+
+/// Returns the externally-registered client proc mesh, or `None` if none
+/// was registered. Non-bootstrapping: reads only the registration
+/// (`.get()`, never `get_or_init`), so it never spins up `GLOBAL_CONTEXT`.
+/// This getter has a single source of truth: it reads only the external
+/// registration; a coexisting Rust `GLOBAL_CONTEXT` root is ignored, with no
+/// fallback (unlike `try_this_host`, which does consult `GLOBAL_CONTEXT`).
+pub fn try_registered_client_proc() -> Option<&'static ProcMeshRef> {
+    REGISTERED_CLIENT_PROC.get()
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use hyperactor::testing::ids::test_actor_id;
     use hyperactor_config::Flattrs;
+    #[cfg(fbcode_build)]
     use ndslice::view::Extent;
+    #[cfg(fbcode_build)]
     use timed_test::async_timed_test;
 
     use super::*;
+    #[cfg(fbcode_build)]
     use crate::testing;
+
+    /// GC-2: the lookup ignores an initialized Rust `GLOBAL_CONTEXT` root and
+    /// returns `None` when there is no external registration.
+    #[tokio::test]
+    async fn test_try_registered_client_proc_ignores_rust_global_context() {
+        let _ = context().await;
+        assert!(
+            GLOBAL_CONTEXT.get().is_some(),
+            "test must initialize the Rust global context",
+        );
+        assert!(
+            try_registered_client_proc().is_none(),
+            "registered-client-proc lookup must not fall back to Rust GLOBAL_CONTEXT",
+        );
+    }
+
+    /// CROOT-1 / CROOT-8: the Rust root bootstrap seeds the client-root
+    /// capability on the root client's environment, so `from_env` finds it.
+    #[tokio::test]
+    async fn test_bootstrap_seeds_client_root() {
+        let cx = context().await;
+        let environment = cx.actor_instance.actor_environment();
+        assert!(
+            crate::client_root::ClientRootRef::from_env(environment).is_ok(),
+            "bootstrap must seed the client-root capability on the root client",
+        );
+    }
 
     /// Helper: send an `Undeliverable<MessageEnvelope>` to the global
     /// root client's well-known undeliverable port via the runtime's
@@ -534,18 +684,16 @@ mod tests {
         dest_actor: hyperactor::ActorAddr,
     ) {
         let env = MessageEnvelope::new(
-            client.self_id().clone(),
-            dest_actor.port_ref(0.into()),
+            client.self_addr().clone(),
+            dest_actor.port_addr(0.into()),
             wirevalue::Any::serialize(&0u64).unwrap(),
             Flattrs::new(),
         );
         // Target the global root client's well-known Undeliverable port.
-        let client_actor_id: hyperactor::ActorAddr = client.self_id().clone();
+        let client_actor_id: hyperactor::ActorAddr = client.self_addr().clone();
         let undeliverable_port =
-            PortRef::<Undeliverable<MessageEnvelope>>::attest_message_port(&client_actor_id);
-        undeliverable_port
-            .send(client, Undeliverable(env))
-            .expect("inject_undeliverable: send failed");
+            PortRef::<Undeliverable<MessageEnvelope>>::attest_handler_port(&client_actor_id);
+        undeliverable_port.post(client, Undeliverable::Returned(env));
     }
 
     /// Verifies that creating a `ProcMesh` installs the
@@ -557,7 +705,7 @@ mod tests {
         let instance = testing::instance();
         let mut hm = testing::host_mesh(2).await;
         let _mesh = hm
-            .spawn(instance, "test", Extent::unity(), None)
+            .spawn(instance, "test", Extent::unity(), None, None)
             .await
             .unwrap();
         assert!(

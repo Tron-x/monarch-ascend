@@ -75,12 +75,43 @@ const ENTRY_HEADER_SIZE: usize = 12;
 /// Uses a single contiguous buffer with inline entry lengths.
 /// Each entry is `[key_hash: u64][len: u32][value: bytes]`.
 /// Linear scan is used for lookup, which is optimal for small N.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Flattrs {
     /// The buffer containing all entries.
     /// Format: [num_entries: u16][entries...]
     /// Each entry: [key_hash: u64][len: u32][value: bytes]
     buffer: BytesMut,
+}
+
+impl Default for Flattrs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A structural error in an encoded [`Flattrs`] buffer.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum FlattrsValidationError {
+    /// The buffer does not contain the complete entry-count header.
+    #[error("flattrs buffer is missing its entry-count header")]
+    MissingHeader,
+
+    /// The header count does not match the complete entries in the buffer.
+    #[error("flattrs declares {declared} entries but contains {parsed} complete entries")]
+    EntryCountMismatch {
+        /// The entry count stored in the header.
+        declared: usize,
+        /// The number of complete entries parsed from the buffer.
+        parsed: usize,
+    },
+
+    /// Bytes remain after the declared entries.
+    #[error("flattrs buffer has {trailing} trailing bytes")]
+    TrailingBytes {
+        /// The number of bytes after the declared entries.
+        trailing: usize,
+    },
 }
 
 impl Flattrs {
@@ -103,6 +134,39 @@ impl Flattrs {
     /// Returns a [`Part`] for zero-copy serialization through the multipart codec.
     pub fn to_part(&self) -> Part {
         Part::from(Bytes::copy_from_slice(&self.buffer))
+    }
+
+    /// Return the encoded buffer length without copying it.
+    pub fn encoded_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Validate the private wire structure without interpreting entry values.
+    ///
+    /// This checks for a complete count header, the declared number of complete
+    /// entries, and exact buffer consumption. Callers may layer additional
+    /// policy such as key uniqueness or size bounds on top.
+    pub fn validate_wire(&self) -> Result<(), FlattrsValidationError> {
+        if self.buffer.len() < HEADER_SIZE {
+            return Err(FlattrsValidationError::MissingHeader);
+        }
+
+        let declared = self.len();
+        let mut parsed = 0;
+        let mut parsed_bytes = HEADER_SIZE;
+        for (_, value) in self.iter() {
+            parsed += 1;
+            parsed_bytes += ENTRY_HEADER_SIZE + value.len();
+        }
+        if parsed != declared {
+            return Err(FlattrsValidationError::EntryCountMismatch { declared, parsed });
+        }
+        if parsed_bytes != self.buffer.len() {
+            return Err(FlattrsValidationError::TrailingBytes {
+                trailing: self.buffer.len().saturating_sub(parsed_bytes),
+            });
+        }
+        Ok(())
     }
 
     /// Serialize a value and store it.
@@ -440,6 +504,61 @@ mod tests {
     fn test_missing_key() {
         let attrs = Flattrs::new();
         assert_eq!(attrs.get::<u64>(TEST_U64), None);
+    }
+
+    #[test]
+    fn default_is_valid_and_mutable() {
+        let mut attrs = Flattrs::default();
+        assert_eq!(attrs.validate_wire(), Ok(()));
+        attrs.set(TEST_U64, 42u64);
+        assert_eq!(attrs.get(TEST_U64), Some(42u64));
+    }
+
+    #[test]
+    fn validate_wire_rejects_malformed_buffers() {
+        let mut valid = Flattrs::new();
+        valid.set(TEST_U64, 42u64);
+        assert_eq!(valid.validate_wire(), Ok(()));
+        assert_eq!(valid.encoded_len(), valid.to_part().len());
+
+        assert_eq!(
+            Flattrs::from_part(Part::from(Vec::<u8>::new())).validate_wire(),
+            Err(FlattrsValidationError::MissingHeader),
+        );
+        assert_eq!(
+            Flattrs::from_part(Part::from(vec![1, 0])).validate_wire(),
+            Err(FlattrsValidationError::EntryCountMismatch {
+                declared: 1,
+                parsed: 0,
+            }),
+        );
+        assert_eq!(
+            Flattrs::from_part(Part::from(vec![0, 0, 1])).validate_wire(),
+            Err(FlattrsValidationError::TrailingBytes { trailing: 1 }),
+        );
+
+        let mut truncated_value = 1u16.to_le_bytes().to_vec();
+        truncated_value.extend_from_slice(&TEST_U64.key_hash().to_le_bytes());
+        truncated_value.extend_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            Flattrs::from_part(Part::from(truncated_value)).validate_wire(),
+            Err(FlattrsValidationError::EntryCountMismatch {
+                declared: 1,
+                parsed: 0,
+            }),
+        );
+
+        let mut truncated_second_entry = 2u16.to_le_bytes().to_vec();
+        truncated_second_entry.extend_from_slice(&TEST_U64.key_hash().to_le_bytes());
+        truncated_second_entry.extend_from_slice(&0u32.to_le_bytes());
+        truncated_second_entry.extend_from_slice(&[0; 4]);
+        assert_eq!(
+            Flattrs::from_part(Part::from(truncated_second_entry)).validate_wire(),
+            Err(FlattrsValidationError::EntryCountMismatch {
+                declared: 2,
+                parsed: 1,
+            }),
+        );
     }
 
     #[test]

@@ -274,10 +274,10 @@
 //! - **MIT-67 (pyspy-dump-end-to-end):** Discover a proc via SQL
 //!   query, trigger a py-spy dump via `/v1/pyspy_dump`, then verify
 //!   the dump is stored and queryable via SQL.
-//! - **MIT-68 (query-no-dashboard-404):** `POST /v1/query` without a
-//!   configured dashboard returns 404 with `not_found` error code.
-//! - **MIT-69 (pyspy-dump-no-dashboard-404):** `POST /v1/pyspy_dump`
-//!   without a configured dashboard returns 404 with `not_found`
+//! - **MIT-68 (query-no-telemetry-404):** `POST /v1/query` without a
+//!   configured telemetry proxy returns 404 with `not_found` error code.
+//! - **MIT-69 (pyspy-dump-no-telemetry-404):** `POST /v1/pyspy_dump`
+//!   without a configured telemetry proxy returns 404 with `not_found`
 //!   error code.
 //! - **MIT-70 (query-malformed-body):** `POST /v1/query` with a
 //!   malformed JSON body (missing required `sql` field) returns a
@@ -310,12 +310,39 @@
 //!   with populated actor_id, proc_id, host, and url fields.
 //! - **MIT-76 (admin-schema):** `GET /v1/schema/admin` returns a
 //!   valid JSON Schema document.
+//!
+//! ### Inbound ordering API exposure
+//!
+//! - **MIT-77 (inbound-ordering API exposure):** `GET /v1/{actor}` for
+//!   a live actor built through `Instance::new` returns the three new
+//!   inbound-ordering fields (`instance_id`, `queue_depth`,
+//!   `inbound_ordering`). `inbound_ordering` is `Some` (IO-7),
+//!   `snapshot_complete` follows IO-4, `known_session_count` follows
+//!   IO-5, and the `returned_*` rollups follow IO-6. Identity-only
+//!   assertions; no workload-dependent values.
+//! - **MIT-78 (deterministic stalled inbound ordering API exposure):**
+//!   Spawning the `inbound_ordering_workload` binary and polling
+//!   `/v1/{stalled_receiver}` until convergence asserts both the IO-*
+//!   presentation invariants and the workload's deterministic content
+//!   totals: IO-4 (snapshot_complete derivation), IO-5
+//!   (known_session_count == sessions.len() + skipped_session_count,
+//!   == 3 for this workload: sender_a + sender_b + the workload's
+//!   bootstrap client session), IO-6 (returned_* rollups equal
+//!   recomputation over returned sessions), IO-7
+//!   (inbound_ordering.is_some()), plus returned_buffered_message_count
+//!   == 8 / returned_max_buffered_count == 5 and two distinct session
+//!   senders. Sister invariant to MIT-77 (happy-path transport): MIT-78
+//!   covers transport + presentation invariants + content against
+//!   manufactured deterministic state.
 
 mod admin;
 mod auth;
 mod config;
 mod dining;
+mod execution;
 mod harness;
+mod inbound_ordering;
+mod inbound_ordering_workload;
 mod openapi;
 mod pyspy;
 mod ref_check;
@@ -326,18 +353,37 @@ mod tree;
 
 // --- dining family ---
 
-/// MIT-13, MIT-14, MIT-15, MIT-75, MIT-76: dining-based
+/// MIT-13, MIT-14, MIT-15, MIT-75, MIT-76, MIT-77: dining-based
 /// endpoint assertions — Rust binary.
 #[tokio::test]
 async fn test_dining_endpoints_rust() {
     dining::run_dining_endpoints_rust().await;
 }
 
-/// MIT-13, MIT-14, MIT-15, MIT-75, MIT-76: dining-based
+/// MIT-13, MIT-14, MIT-15, MIT-75, MIT-76, MIT-77: dining-based
 /// endpoint assertions — Python binary.
 #[tokio::test]
 async fn test_dining_endpoints_python() {
     dining::run_dining_endpoints_python().await;
+}
+
+// --- inbound ordering family ---
+
+/// MIT-78: deterministic stalled inbound ordering — Python workload.
+#[tokio::test]
+async fn test_inbound_ordering_workload() {
+    inbound_ordering_workload::run_inbound_ordering_workload().await;
+}
+
+// --- execution surface family ---
+
+/// Execution surface, real Python hooks end-to-end: a Python workload
+/// driven by the stdin/stdout handshake proves the `_Actor.handle`
+/// bracket increments/decrements `execution` across direct and queue
+/// dispatch, visible over `GET /v1/{actor}`.
+#[tokio::test]
+async fn test_execution_workload() {
+    execution::run_execution_workload().await;
 }
 
 // --- pyspy family ---
@@ -446,10 +492,10 @@ async fn test_pyspy_dump_and_query() {
     telemetry::run_pyspy_dump_and_query().await;
 }
 
-/// MIT-68, MIT-69: /v1/query and /v1/pyspy_dump return 404 without dashboard.
+/// MIT-68, MIT-69: /v1/query and /v1/pyspy_dump return 404 without telemetry.
 #[tokio::test]
-async fn test_no_dashboard_returns_404() {
-    telemetry::run_no_dashboard_returns_404().await;
+async fn test_no_telemetry_returns_404() {
+    telemetry::run_no_telemetry_returns_404().await;
 }
 
 /// MIT-70: /v1/query with malformed body returns error.

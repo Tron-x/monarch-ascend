@@ -7,10 +7,11 @@
 """Production adapter: wraps the Monarch DataFusion QueryEngine.
 
 Unlike the SQLite-based db.py (local dev/testing), this connects directly
-to the live telemetry engine started by start_telemetry(). The QueryEngine
+to the live telemetry engine attached to a job state. The QueryEngine
 uses DataFusion as its SQL planner/executor and returns pyarrow Tables.
 """
 
+import threading
 from typing import Any
 
 from monarch.distributed_telemetry.engine import QueryEngine
@@ -23,21 +24,20 @@ class QueryEngineAdapter(DBAdapter):
     Provides the same query interface as db.py's _query() but backed by
     the distributed telemetry system instead of a local SQLite file.
 
-    Usage::
-
-        from monarch.distributed_telemetry.actor import start_telemetry
-        engine, _, _scanner = start_telemetry()
-        adapter = QueryEngineAdapter(engine)
-        rows = adapter.query("SELECT * FROM actors LIMIT 10")
+    The job sidecar constructs this adapter with the internal query engine
+    that backs the dashboard HTTP API.
     """
 
     def __init__(self, engine: QueryEngine) -> None:
         self._engine = engine
+        self._query_lock = threading.Lock()
 
     def query(self, sql: str) -> list[dict[str, Any]]:
         """Execute a SQL query and return rows as list of dicts."""
-        table = self._engine.query(sql)
-        return table.to_pylist()
+        # Flask serves dashboard requests concurrently, but the live query
+        # engine path is not reentrant.
+        with self._query_lock:
+            return self._engine.query(sql).to_pylist()
 
     def table_names(self) -> list[str]:
         """Return available table names from the telemetry engine."""
@@ -49,4 +49,10 @@ class QueryEngineAdapter(DBAdapter):
         """Store a py-spy dump result in the DataFusion pyspy tables."""
         self._engine._actor.store_pyspy_dump.call_one(
             dump_id, proc_ref, pyspy_result_json
+        ).get()
+
+    def ingest_snapshot_batch(self, table_name: str, arrow_ipc_bytes: bytes) -> None:
+        """Store one snapshot Arrow IPC stream in the DataFusion snapshot tables."""
+        self._engine._actor.ingest_snapshot_batch.call_one(
+            table_name, arrow_ipc_bytes
         ).get()

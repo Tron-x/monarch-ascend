@@ -7,6 +7,7 @@
  */
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -19,12 +20,10 @@ use hyperactor::accum::ReducerFactory;
 use hyperactor::accum::ReducerSpec;
 use hyperactor::mailbox::OncePortReceiver;
 use hyperactor::mailbox::PortReceiver;
-use hyperactor_mesh::sel;
 use hyperactor_mesh::value_mesh::ValueOverlay;
 use hyperactor_mesh::value_mesh::rle;
 use monarch_types::py_global;
 use ndslice::Extent;
-use ndslice::Selection;
 use ndslice::Shape;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -32,15 +31,16 @@ use pyo3::types::PyTuple;
 use serde_multipart::Part;
 use typeuri::Named;
 
+use crate::actor::MeshRef;
 use crate::actor::MethodSpecifier;
 use crate::actor::PythonActor;
 use crate::actor::PythonMessage;
 use crate::actor::PythonMessageKind;
 use crate::actor::PythonResponseMessage;
+use crate::actor_mesh::AllOrChoose;
 use crate::actor_mesh::PythonActorMesh;
 use crate::actor_mesh::SupervisableActorMesh;
-use crate::actor_mesh::to_hy_sel;
-use crate::buffers::FrozenBuffer;
+use crate::actor_mesh::to_all_or_choose;
 use crate::context::PyInstance;
 use crate::mailbox::EitherPortRef;
 use crate::mailbox::PythonOncePortRef;
@@ -60,9 +60,11 @@ use crate::metrics::ENDPOINT_STREAM_ERROR;
 use crate::metrics::ENDPOINT_STREAM_LATENCY_US_HISTOGRAM;
 use crate::metrics::ENDPOINT_STREAM_THROUGHPUT;
 use crate::pickle::PendingMessage;
-use crate::pickle::unpickle;
+use crate::pickle::PicklingState;
 use crate::pytokio::PyPythonTask;
 use crate::pytokio::PythonTask;
+use crate::runtime::GilSite;
+use crate::runtime::monarch_with_gil_blocking;
 use crate::shape::PyExtent;
 use crate::shape::PyShape;
 use crate::supervision::Supervisable;
@@ -81,15 +83,6 @@ py_global!(
     "_dispatch_actor_rref"
 );
 py_global!(make_future, "monarch._src.actor.future", "Future");
-
-fn unpickle_from_part<'py>(py: Python<'py>, part: Part) -> PyResult<Bound<'py, PyAny>> {
-    unpickle(
-        py,
-        FrozenBuffer {
-            inner: part.into_bytes(),
-        },
-    )
-}
 
 /// The type of endpoint operation being performed.
 ///
@@ -276,9 +269,9 @@ impl Drop for SpanGuard {
 
 fn supervision_error_to_pyerr(err: PyErr, qualified_endpoint_name: &Option<String>) -> PyErr {
     match qualified_endpoint_name {
-        Some(endpoint) => {
-            Python::attach(|py| SupervisionError::set_endpoint_on_err(py, err, endpoint.clone()))
-        }
+        Some(endpoint) => monarch_with_gil_blocking(GilSite::Supervise, |py| {
+            SupervisionError::set_endpoint_on_err(py, err, endpoint.clone())
+        }),
         None => err,
     }
 }
@@ -288,9 +281,9 @@ async fn collect_value(
     supervision_monitor: &Option<Arc<dyn Supervisable>>,
     instance: &Instance<PythonActor>,
     qualified_endpoint_name: &Option<String>,
-) -> PyResult<(Part, Option<usize>)> {
+) -> PyResult<(Part, Vec<MeshRef>, Option<usize>)> {
     enum RaceResult {
-        Message(PythonMessage),
+        Message(Box<PythonMessage>),
         SupervisionError(PyErr),
         RecvError(String),
     }
@@ -304,7 +297,7 @@ async fn collect_value(
                         Some(err) => RaceResult::SupervisionError(err),
                         None => {
                             match rx.recv().await {
-                                Ok(msg) => RaceResult::Message(msg),
+                                Ok(msg) => RaceResult::Message(Box::new(msg)),
                                 Err(e) => RaceResult::RecvError(e.to_string()),
                             }
                         }
@@ -312,33 +305,42 @@ async fn collect_value(
                 }
                 msg = rx.recv() => {
                     match msg {
-                        Ok(m) => RaceResult::Message(m),
+                        Ok(m) => RaceResult::Message(Box::new(m)),
                         Err(e) => RaceResult::RecvError(e.to_string()),
                     }
                 }
             }
         }
         _ => match rx.recv().await {
-            Ok(msg) => RaceResult::Message(msg),
+            Ok(msg) => RaceResult::Message(Box::new(msg)),
             Err(e) => RaceResult::RecvError(e.to_string()),
         },
     };
 
     match race_result {
-        RaceResult::Message(PythonMessage {
-            kind: PythonMessageKind::Result { rank, .. },
-            message,
-            ..
-        }) => Ok((message, rank)),
-        RaceResult::Message(PythonMessage {
-            kind: PythonMessageKind::Exception { .. },
-            message,
-            ..
-        }) => Python::attach(|py| Err(PyErr::from_value(unpickle_from_part(py, message)?))),
-        RaceResult::Message(msg) => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "unexpected message kind {:?}",
-            msg.kind
-        ))),
+        RaceResult::Message(boxed) => {
+            let PythonMessage {
+                kind,
+                message,
+                refs,
+            } = *boxed;
+            match kind {
+                PythonMessageKind::Result { rank, .. } => Ok((message, refs, rank)),
+                PythonMessageKind::Exception { .. } => {
+                    monarch_with_gil_blocking(GilSite::Traceback, |py| {
+                        let mesh_references: VecDeque<Option<MeshRef>> =
+                            refs.into_iter().map(Some).collect();
+                        let mut state =
+                            PicklingState::from_parts(message, VecDeque::new(), mesh_references);
+                        Err(PyErr::from_value(state.unpickle(py)?.into_bound(py)))
+                    })
+                }
+                other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unexpected message kind {:?}",
+                    other
+                ))),
+            }
+        }
         RaceResult::RecvError(e) => Err(pyo3::exceptions::PyEOFError::new_err(format!(
             "Port closed: {}",
             e
@@ -349,6 +351,7 @@ async fn collect_value(
     }
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn collect_valuemesh(
     extent: Extent,
     rx: OncePortReceiver<PythonMessage>,
@@ -369,7 +372,7 @@ async fn collect_valuemesh(
     );
 
     enum RaceResult {
-        Collected(PythonMessage),
+        Collected(Box<PythonMessage>),
         SupervisionError(PyErr),
         RecvError(String),
     }
@@ -388,47 +391,85 @@ async fn collect_valuemesh(
                 }
                 batch = rx.recv() => {
                     match batch {
-                        Ok(b) => RaceResult::Collected(b),
+                        Ok(b) => RaceResult::Collected(Box::new(b)),
                         Err(e) => RaceResult::RecvError(e.to_string()),
                     }
                 }
             }
         }
         None => match rx.recv().await {
-            Ok(batch) => RaceResult::Collected(batch),
+            Ok(batch) => RaceResult::Collected(Box::new(batch)),
             Err(e) => RaceResult::RecvError(e.to_string()),
         },
     };
 
     match race_result {
-        RaceResult::Collected(msg) => {
+        RaceResult::Collected(boxed) => {
+            let msg = *boxed;
             let overlay = msg.into_overlay().map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "failed to extract overlay from collected responses: {e}"
                 ))
             })?;
-            Python::attach(|py| {
-                Ok(PyValueMesh::build_from_parts(
-                    &extent,
-                    overlay.runs().try_fold(
-                        Vec::with_capacity(expected_count),
-                        |mut parts, (range, payload)| match payload {
-                            PythonResponseMessage::Result(part) => {
+            monarch_with_gil_blocking(GilSite::ReplyConvert, |py| {
+                // Out-of-band mesh refs reunite only while the `PicklingState` is
+                // live, i.e. during decode, so a ref-carrying response must be
+                // decoded here (eagerly, at accumulation): a lazy decode on access
+                // would have no state to reunite against, the REFS-1 failure. But
+                // decoding *every* response here would revert D96180139, which made
+                // valuemesh values unpickle lazily on access so a large
+                // OnceBuffer-accumulated `.call()` does not pay one big unpickle
+                // burst at the end of collection.
+                //
+                // Reconcile the two by gating on refs. A `.call()` fans one
+                // endpoint over the mesh, so the batch is uniform: either every
+                // response carries refs (the endpoint returns a mesh, the minority)
+                // or none does (plain values, the common case). With no refs we
+                // keep the raw parts and let them unpickle on access (D96180139,
+                // preserved); only with refs present do we decode eagerly to
+                // reunite them.
+                let has_refs = overlay.runs().any(|(_, payload)| {
+                    let (PythonResponseMessage::Result { refs, .. }
+                    | PythonResponseMessage::Exception { refs, .. }) = payload;
+                    !refs.is_empty()
+                });
+
+                if !has_refs {
+                    let mut parts = Vec::with_capacity(expected_count);
+                    for (range, payload) in overlay.runs() {
+                        match payload {
+                            PythonResponseMessage::Result { part, .. } => {
                                 parts.extend(range.clone().map(|_| part.clone()));
-                                Ok(parts)
                             }
-                            PythonResponseMessage::Exception(part) => {
+                            PythonResponseMessage::Exception { .. } => {
                                 record_guard.mark_error();
-                                Python::attach(|py| {
-                                    Err(PyErr::from_value(unpickle_from_part(py, part.clone())?))
-                                })
+                                return Err(PyErr::from_value(payload.decode(py)?.into_bound(py)));
                             }
-                        },
-                    )?,
-                )?
-                .into_pyobject(py)?
-                .into_any()
-                .unbind())
+                        }
+                    }
+                    return Ok(PyValueMesh::build_from_parts(&extent, parts)?
+                        .into_pyobject(py)?
+                        .into_any()
+                        .unbind());
+                }
+
+                let mut objects: Vec<Py<PyAny>> = Vec::with_capacity(expected_count);
+                for (range, payload) in overlay.runs() {
+                    match payload {
+                        PythonResponseMessage::Result { .. } => {
+                            let obj = payload.decode(py)?;
+                            objects.extend(range.clone().map(|_| obj.clone_ref(py)));
+                        }
+                        PythonResponseMessage::Exception { .. } => {
+                            record_guard.mark_error();
+                            return Err(PyErr::from_value(payload.decode(py)?.into_bound(py)));
+                        }
+                    }
+                }
+                Ok(PyValueMesh::build_from_objects(&extent, objects)?
+                    .into_pyobject(py)?
+                    .into_any()
+                    .unbind())
             })
         }
         RaceResult::RecvError(e) => {
@@ -468,9 +509,13 @@ fn value_collector(
         )
         .await
         {
-            Ok((message, _)) => {
-                Python::attach(|py| unpickle_from_part(py, message).map(|obj| obj.unbind()))
-            }
+            Ok((message, refs, _)) => monarch_with_gil_blocking(GilSite::ReplyConvert, |py| {
+                let mesh_references: VecDeque<Option<MeshRef>> =
+                    refs.into_iter().map(Some).collect();
+                let mut state =
+                    PicklingState::from_parts(message, VecDeque::new(), mesh_references);
+                state.unpickle(py)
+            }),
             Err(e) => {
                 record_guard.mark_error();
                 Err(e)
@@ -536,9 +581,13 @@ impl PyValueStream {
             )
             .await
             {
-                Ok((message, _)) => {
-                    Python::attach(|py| unpickle_from_part(py, message).map(|obj| obj.unbind()))
-                }
+                Ok((message, refs, _)) => monarch_with_gil_blocking(GilSite::ReplyConvert, |py| {
+                    let mesh_references: VecDeque<Option<MeshRef>> =
+                        refs.into_iter().map(Some).collect();
+                    let mut state =
+                        PicklingState::from_parts(message, VecDeque::new(), mesh_references);
+                    state.unpickle(py)
+                }),
                 Err(e) => {
                     record_guard.mark_error();
                     Err(e)
@@ -577,7 +626,7 @@ pub(crate) trait Endpoint {
         args: &Bound<'py, PyTuple>,
         kwargs: Option<&Bound<'py, PyDict>>,
         port_ref: Option<EitherPortRef>,
-        selection: Selection,
+        selection: AllOrChoose,
         instance: &Instance<PythonActor>,
     ) -> PyResult<()>;
 
@@ -591,7 +640,7 @@ pub(crate) trait Endpoint {
         args: &Bound<'py, PyTuple>,
         kwargs: Option<&Bound<'py, PyDict>>,
         port_ref: Option<EitherPortRef>,
-        selection: Selection,
+        selection: AllOrChoose,
         instance: &Instance<PythonActor>,
         _caller_headers: hyperactor_config::Flattrs,
     ) -> PyResult<()> {
@@ -661,6 +710,7 @@ pub(crate) trait Endpoint {
     }
 
     /// Call the endpoint on all actors and collect all responses into a ValueMesh.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn call<'py>(
         &self,
         py: Python<'py>,
@@ -668,7 +718,7 @@ pub(crate) trait Endpoint {
         kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Py<PyAny>> {
         let instance = self.get_current_instance(py)?;
-        let span_guard = self.enter_endpoint_span(EndpointAdverb::Call, instance.self_id());
+        let span_guard = self.enter_endpoint_span(EndpointAdverb::Call, instance.self_addr());
 
         let extent = self.get_extent(py)?;
         let method_name = self.get_method_name().to_string();
@@ -683,7 +733,7 @@ pub(crate) trait Endpoint {
             args,
             kwargs,
             Some(EitherPortRef::Once(port_ref)),
-            sel!(*),
+            AllOrChoose::All,
             &instance,
             caller_headers,
         )?;
@@ -714,7 +764,7 @@ pub(crate) trait Endpoint {
         kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Py<PyAny>> {
         let instance = self.get_current_instance(py)?;
-        let span_guard = self.enter_endpoint_span(EndpointAdverb::Choose, instance.self_id());
+        let span_guard = self.enter_endpoint_span(EndpointAdverb::Choose, instance.self_addr());
         let (port_ref, receiver) = self.open_response_port(&instance);
 
         let caller_headers = self.build_operation_context_headers(EndpointAdverb::Choose);
@@ -723,7 +773,7 @@ pub(crate) trait Endpoint {
             args,
             kwargs,
             Some(EitherPortRef::Unbounded(port_ref)),
-            sel!(?),
+            AllOrChoose::Choose,
             &instance,
             caller_headers,
         )?;
@@ -758,7 +808,7 @@ pub(crate) trait Endpoint {
         }
 
         let instance = self.get_current_instance(py)?;
-        let span_guard = self.enter_endpoint_span(EndpointAdverb::CallOne, instance.self_id());
+        let span_guard = self.enter_endpoint_span(EndpointAdverb::CallOne, instance.self_addr());
         let (port_ref, receiver) = self.open_response_port(&instance);
 
         let caller_headers = self.build_operation_context_headers(EndpointAdverb::CallOne);
@@ -767,7 +817,7 @@ pub(crate) trait Endpoint {
             args,
             kwargs,
             Some(EitherPortRef::Unbounded(port_ref)),
-            sel!(*),
+            AllOrChoose::All,
             &instance,
             caller_headers,
         )?;
@@ -804,7 +854,7 @@ pub(crate) trait Endpoint {
             args,
             kwargs,
             Some(EitherPortRef::Unbounded(port_ref)),
-            sel!(*),
+            AllOrChoose::All,
             &instance,
             caller_headers,
         )?;
@@ -848,7 +898,7 @@ pub(crate) trait Endpoint {
             "method" => method_name.to_string()
         );
 
-        match self.send_message(py, args, kwargs, None, sel!(*), &instance) {
+        match self.send_message(py, args, kwargs, None, AllOrChoose::All, &instance) {
             Ok(()) => {
                 ENDPOINT_BROADCAST_THROUGHPUT.add(1, attributes);
                 Ok(())
@@ -922,7 +972,7 @@ impl Endpoint for ActorEndpoint {
         args: &Bound<'py, PyTuple>,
         kwargs: Option<&Bound<'py, PyDict>>,
         port_ref: Option<EitherPortRef>,
-        selection: Selection,
+        selection: AllOrChoose,
         instance: &Instance<PythonActor>,
     ) -> PyResult<()> {
         let message = self.create_message(py, args, kwargs, port_ref)?;
@@ -935,7 +985,7 @@ impl Endpoint for ActorEndpoint {
         args: &Bound<'py, PyTuple>,
         kwargs: Option<&Bound<'py, PyDict>>,
         port_ref: Option<EitherPortRef>,
-        selection: Selection,
+        selection: AllOrChoose,
         instance: &Instance<PythonActor>,
         caller_headers: hyperactor_config::Flattrs,
     ) -> PyResult<()> {
@@ -1149,7 +1199,7 @@ impl ActorEndpoint {
         selection: &str,
     ) -> PyResult<()> {
         let instance = self.get_current_instance(py)?;
-        let sel = to_hy_sel(selection)?;
+        let sel = to_all_or_choose(selection)?;
         self.send_message(py, args, Some(kwargs), port, sel, &instance)
     }
 }
@@ -1183,7 +1233,7 @@ impl Endpoint for Remote {
         args: &Bound<'py, PyTuple>,
         kwargs: Option<&Bound<'py, PyDict>>,
         port_ref: Option<EitherPortRef>,
-        selection: Selection,
+        selection: AllOrChoose,
         _instance: &Instance<PythonActor>,
     ) -> PyResult<()> {
         let send_kwargs = PyDict::new(py);
@@ -1192,15 +1242,7 @@ impl Endpoint for Remote {
             None => send_kwargs.set_item("port", py.None())?,
         }
 
-        let selection_str = match selection {
-            Selection::All(inner) if matches!(*inner, Selection::True) => "all",
-            Selection::Any(inner) if matches!(*inner, Selection::True) => "choose",
-            _ => {
-                panic!("only sel!(*) and sel!(?) should be provided as selection for send_message")
-            }
-        };
-
-        send_kwargs.set_item("selection", selection_str)?;
+        send_kwargs.set_item("selection", selection.as_str())?;
 
         let kwargs_dict = kwargs.map_or_else(|| PyDict::new(py), |d| d.clone());
         self.inner
@@ -1218,7 +1260,7 @@ impl Endpoint for Remote {
     }
 
     fn enter_endpoint_span(&self, adverb: EndpointAdverb, actor_id: &ActorAddr) -> SpanGuard {
-        let call_name = Python::attach(|py| {
+        let call_name = monarch_with_gil_blocking(GilSite::DisplayName, |py| {
             self.inner
                 .call_method0(py, "_call_name")
                 .ok()
@@ -1494,7 +1536,7 @@ mod tests {
             _args: &Bound<'py, PyTuple>,
             _kwargs: Option<&Bound<'py, PyDict>>,
             _port_ref: Option<EitherPortRef>,
-            _selection: Selection,
+            _selection: AllOrChoose,
             _instance: &Instance<PythonActor>,
         ) -> PyResult<()> {
             unreachable!()

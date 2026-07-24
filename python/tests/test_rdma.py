@@ -43,19 +43,22 @@ def test_memoryview_addr_and_contiguity():
     and non-contiguous views are rejected."""
     import mmap
 
-    from monarch._src.rdma.rdma import _assert_1d_contiguous, _get_addr_and_size
+    from monarch._src.rdma.rdma import (
+        _assert_1d_contiguous,
+        _get_memoryview_addr_and_size,
+    )
 
     # bytearray-backed memoryview
     buf = bytearray(4096)
     mv = memoryview(buf)
-    addr, size = _get_addr_and_size(mv)
+    addr, size = _get_memoryview_addr_and_size(mv)
     assert size == 4096
     assert addr > 0
 
     # mmap-backed memoryview (small)
     mm = mmap.mmap(-1, 4096)
     mv = memoryview(mm)
-    addr, size = _get_addr_and_size(mv)
+    addr, size = _get_memoryview_addr_and_size(mv)
     assert size == 4096
     assert addr > 0
     del mv
@@ -64,7 +67,7 @@ def test_memoryview_addr_and_contiguity():
     # mmap-backed memoryview (large / potentially unfaulted pages)
     mm = mmap.mmap(-1, 1024 * 1024)
     mv = memoryview(mm)
-    addr, size = _get_addr_and_size(mv)
+    addr, size = _get_memoryview_addr_and_size(mv)
     assert size == 1024 * 1024
     assert addr > 0
     del mv
@@ -85,20 +88,24 @@ def test_host_memory_handle_read_write():
     handle = _make_local_memory_handle(data)
 
     # read_at
+    # pyrefly: ignore [missing-attribute]
     result = handle.read_at(1, 3)
     assert list(result) == [2, 3, 4]
 
     # write_at
+    # pyrefly: ignore [missing-attribute]
     handle.write_at(0, bytes([10, 20]))
     assert data[0].item() == 10
     assert data[1].item() == 20
 
     # out-of-bounds read
     with pytest.raises(RuntimeError):
+        # pyrefly: ignore [missing-attribute]
         handle.read_at(3, 5)
 
     # out-of-bounds write
     with pytest.raises(RuntimeError):
+        # pyrefly: ignore [missing-attribute]
         handle.write_at(4, bytes([1, 2, 3]))
 
 
@@ -111,20 +118,25 @@ def test_device_memory_handle_read_write():
     handle = _make_local_memory_handle(data)
 
     # read_at
+    # pyrefly: ignore [missing-attribute]
     result = handle.read_at(1, 3)
     assert list(result) == [20, 30, 40]
 
     # write_at
+    # pyrefly: ignore [missing-attribute]
     handle.write_at(0, bytes([99, 88]))
+    # pyrefly: ignore [missing-attribute]
     readback = handle.read_at(0, 5)
     assert list(readback) == [99, 88, 30, 40, 50]
 
     # out-of-bounds read
     with pytest.raises(RuntimeError):
+        # pyrefly: ignore [missing-attribute]
         handle.read_at(3, 5)
 
     # out-of-bounds write
     with pytest.raises(RuntimeError):
+        # pyrefly: ignore [missing-attribute]
         handle.write_at(4, bytes([1, 2, 3]))
 
 
@@ -245,7 +257,18 @@ async def test_rdma_buffer_drop():
         @endpoint
         async def drop_buffer(self) -> None:
             """Drop an RDMABuffer"""
+            # pyrefly: ignore [missing-attribute]
             await self.buffer.drop()
+            # Dropping the buffer means that the RDMA manager no longer
+            # forcibly keeps the allocation alive, but as long as the original
+            # tensor is still alive, the memory registration remains valid.
+            # So operations on the buffer would technically continue to succeed
+            # until the original tensor is deleted.
+            del self.data
+
+            import gc
+
+            gc.collect()
 
     class ConsumerActor(Actor):
         def __init__(self):
@@ -289,6 +312,98 @@ async def test_rdma_buffer_drop():
     )
 
     print(f"✓ Buffer operations failed after drop as expected: {error_result}")
+
+
+@rdma_backends
+async def test_read_into_remote_smaller_than_local():
+    """read_into when the remote buffer is smaller than the local tensor.
+
+    The transfer copies the whole remote buffer into the leading bytes of the
+    local tensor and leaves the trailing bytes untouched.
+    """
+    remote_proc = this_host().spawn_procs(per_host={"processes": 1})
+    local_proc = this_host().spawn_procs(per_host={"processes": 1})
+
+    class RemoteActor(Actor):
+        def __init__(self):
+            # Four floats; smaller than the local tensor below.
+            self.data = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float32)
+
+        @endpoint
+        async def buffer(self) -> RDMABuffer:
+            byte_tensor = self.data.view(torch.uint8).flatten()
+            return RDMABuffer(byte_tensor)
+
+    class LocalActor(Actor):
+        def __init__(self):
+            # Eight floats; the -1.0 sentinel marks bytes that must stay
+            # untouched by the read.
+            self.local = torch.full((8,), -1.0, dtype=torch.float32)
+
+        @endpoint
+        async def read(self, buffer: RDMABuffer) -> torch.Tensor:
+            byte_tensor = self.local.view(torch.uint8).flatten()
+            await buffer.read_into(byte_tensor)
+            return self.local
+
+    remote = remote_proc.spawn("remote", RemoteActor)
+    local = local_proc.spawn("local", LocalActor)
+
+    buffer = await remote.buffer.call_one()
+    result = await local.read.call_one(buffer)
+
+    # The leading floats hold the remote buffer's contents ...
+    assert torch.equal(result[:4], torch.tensor([1.0, 2.0, 3.0, 4.0]))
+    # ... and the trailing floats keep their sentinel value.
+    assert torch.equal(result[4:], torch.full((4,), -1.0))
+
+
+@rdma_backends
+async def test_write_from_local_smaller_than_remote():
+    """write_from when the local tensor is smaller than the remote buffer.
+
+    The transfer copies the whole local tensor into the leading bytes of the
+    remote buffer and leaves the trailing bytes untouched.
+    """
+    remote_proc = this_host().spawn_procs(per_host={"processes": 1})
+    local_proc = this_host().spawn_procs(per_host={"processes": 1})
+
+    class RemoteActor(Actor):
+        def __init__(self):
+            # Eight floats; the -1.0 sentinel marks bytes that must stay
+            # untouched by the write.
+            self.data = torch.full((8,), -1.0, dtype=torch.float32)
+
+        @endpoint
+        async def buffer(self) -> RDMABuffer:
+            byte_tensor = self.data.view(torch.uint8).flatten()
+            return RDMABuffer(byte_tensor)
+
+        @endpoint
+        async def get_data(self) -> torch.Tensor:
+            return self.data
+
+    class LocalActor(Actor):
+        def __init__(self):
+            # Four floats; smaller than the remote buffer above.
+            self.local = torch.tensor([5.0, 6.0, 7.0, 8.0], dtype=torch.float32)
+
+        @endpoint
+        async def write(self, buffer: RDMABuffer) -> None:
+            byte_tensor = self.local.view(torch.uint8).flatten()
+            await buffer.write_from(byte_tensor)
+
+    remote = remote_proc.spawn("remote", RemoteActor)
+    local = local_proc.spawn("local", LocalActor)
+
+    buffer = await remote.buffer.call_one()
+    await local.write.call_one(buffer)
+    result = await remote.get_data.call_one()
+
+    # The leading floats hold the local tensor's contents ...
+    assert torch.equal(result[:4], torch.tensor([5.0, 6.0, 7.0, 8.0]))
+    # ... and the trailing floats keep their sentinel value.
+    assert torch.equal(result[4:], torch.full((4,), -1.0))
 
 
 class TrainerActor(Actor):
@@ -395,6 +510,7 @@ async def test_rdma_concurrent_2gb_writes_in_order():
         @endpoint
         async def drop_buffer(self) -> None:
             """Drop an RDMABuffer"""
+            # pyrefly: ignore [missing-attribute]
             await self.rdma_buffer.drop()
 
         @endpoint
@@ -509,6 +625,7 @@ class ClientActor(Actor):
         self.data_b = torch.zeros(size, dtype=torch.float32)
         self.data_c = torch.zeros(size, dtype=torch.float32)
         self.action = None
+        # pyrefly: ignore [bad-assignment, bad-override]
         self.size = size
 
     @endpoint
@@ -522,17 +639,13 @@ class ClientActor(Actor):
 
         # Chain multiple operations across different remote actors
         # Read from buffer A into local data_a
-        action.read_into(buffer_a, self.data_a.view(torch.uint8).flatten())
+        action.read_remote(self.data_a.view(torch.uint8).flatten(), buffer_a)
 
         # # Write data_a to buffer B (modified data goes from A -> B)
-        action.write_from(buffer_b, self.data_b.view(torch.uint8).flatten())
+        action.write_remote(buffer_b, self.data_b.view(torch.uint8).flatten())
 
         # Read from buffer C into local data_c
-        action.read_into(buffer_c, self.data_c.view(torch.uint8).flatten())
-
-        # Let's read from buffer A into local data_a again; this covers edge case
-        # but will result in duplicate work for now; which is fine for now.
-        action.read_into(buffer_a, self.data_a.view(torch.uint8).flatten())
+        action.read_remote(self.data_c.view(torch.uint8).flatten(), buffer_c)
         self.action = action
 
     @endpoint
@@ -552,10 +665,10 @@ class ClientActor(Actor):
 
         # Chain multiple operations across different remote actors
         # Read from buffer A into local data_a
-        action.read_into(buffer_a, self.data_a.view(torch.uint8).flatten())
+        action.read_remote(self.data_a.view(torch.uint8).flatten(), buffer_a)
 
         # # Write data_a to buffer B (modified data goes from A -> B) - Data race!
-        action.write_from(buffer_b, self.data_a.view(torch.uint8).flatten())
+        action.write_remote(buffer_b, self.data_a.view(torch.uint8).flatten())
 
     @endpoint
     async def perform_data_race_w_slices(
@@ -568,10 +681,14 @@ class ClientActor(Actor):
 
         # Chain multiple operations across different remote actors
         # Read from buffer A into local data_a
-        action.read_into(buffer_a, self.data_a.view(torch.uint8)[0 : 100 * 4].flatten())
-        action.write_from(buffer_a, self.data_a.view(torch.uint8)[150 * 4 :].flatten())
-        action.read_into(
-            buffer_a, self.data_a.view(torch.uint8)[75 * 4 : 175 * 4].flatten()
+        action.read_remote(
+            self.data_a.view(torch.uint8)[0 : 100 * 4].flatten(), buffer_a
+        )
+        action.write_remote(
+            buffer_a, self.data_a.view(torch.uint8)[150 * 4 :].flatten()
+        )
+        action.read_remote(
+            self.data_a.view(torch.uint8)[75 * 4 : 175 * 4].flatten(), buffer_a
         )
 
     @endpoint
@@ -588,17 +705,19 @@ class ClientActor(Actor):
         self, buffer_a: RDMABuffer, buffer_b: RDMABuffer, buffer_c: RDMABuffer
     ) -> None:
         """Perform batched operations using RDMAAction across multiple remote actors"""
-        assert self.size == 250, "Size must be 100 for this test"
+        assert self.size == 250, "Size must be 250 for this test"
         # Create RDMAAction instance
         action = RDMAAction()
 
-        # Chain multiple operations across different remote actors
-        # Read from buffer A into local data_a
-        action.read_into(buffer_a, self.data_a.view(torch.uint8)[0 : 100 * 4].flatten())
-        action.read_into(buffer_a, self.data_a.view(torch.uint8)[150 * 4 :].flatten())
-        action.read_into(
-            buffer_a, self.data_a.view(torch.uint8)[50 * 4 : 150 * 4].flatten()
+        # Two `read_remote`s into disjoint slices of `data_a`. Verifies
+        # that slicing works as a `read_remote` destination; overlapping
+        # slices are not allowed because two writes to the same local
+        # range is a data race.
+        action.read_remote(
+            self.data_a.view(torch.uint8)[0 : 100 * 4].flatten(), buffer_a
         )
+        action.read_remote(self.data_a.view(torch.uint8)[150 * 4 :].flatten(), buffer_a)
+        # pyrefly: ignore [bad-assignment]
         self.action = action
 
     @endpoint
@@ -830,11 +949,10 @@ async def test_rdma_action_slicing():
     sum_a_initial = await server_a.get_sum.call_one()
     await client.perform_ok_w_slices.call_one(buffer_a, buffer_b, buffer_c)
     await client.run_action.call_one()
-    # Verify that server A received local values
+    # Two disjoint reads of `buffer_a` each fill 100 floats of `data_a`,
+    # leaving the middle 50 untouched.
     operation_results = await client.get_local_data_sums.call_one()
-    assert (
-        operation_results["data_a_sum"] == sum_a_initial * 2.5
-    )  # multi-filled from 100 to 250
+    assert operation_results["data_a_sum"] == sum_a_initial * 2
 
 
 @rdma_backends

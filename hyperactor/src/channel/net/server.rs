@@ -26,18 +26,16 @@ use tokio_util::sync::CancellationToken;
 use super::ClientError;
 use super::Link;
 use super::SessionId;
+#[cfg(test)]
 use super::read_link_init;
 use super::session;
 use super::session::Next;
 use super::session::Session;
 use crate::RemoteMessage;
 use crate::channel::ChannelAddr;
-use crate::channel::ChannelTransport;
-use crate::channel::net::NetRx;
+use crate::channel::ChannelRx;
 use crate::channel::net::ServerError;
 use crate::channel::net::Stream;
-use crate::channel::net::meta;
-use crate::channel::net::tls;
 use crate::config;
 use crate::metrics;
 
@@ -126,7 +124,7 @@ impl<S: Stream> StreamState<S> {
 /// If `link_init` is for a multi-stream connection (`stream_id > 0`),
 /// resolve (or create) the shared per-session state and return
 /// `Some((stream_id, state))`. Otherwise return `None`.
-fn resolve_stream<S: Stream>(
+pub(super) fn resolve_stream<S: Stream>(
     stream_state: &std::sync::Mutex<HashMap<SessionId, Arc<StreamState<S>>>>,
     link_init: &super::LinkInit,
 ) -> Option<(u8, Arc<StreamState<S>>)> {
@@ -155,6 +153,7 @@ fn resolve_stream<S: Stream>(
 /// channel and return immediately. [`accept_loop`] joins every
 /// dispatch in its `connections` `JoinSet`, so it finishes only
 /// after every recv-loop has finished.
+#[tracing::instrument(level = "debug", skip_all)]
 pub(super) async fn dispatch_stream<M: RemoteMessage, S: Stream>(
     session_id: SessionId,
     streams: Option<(u8, Arc<StreamState<S>>)>,
@@ -310,6 +309,7 @@ pub(super) async fn dispatch_stream<M: RemoteMessage, S: Stream>(
 /// [`dispatch_stream`]: first dispatch for a given (`session_id`,
 /// `stream_id`) runs the recv-loop inline; reconnects hand off via
 /// the per-stream channel and return.
+#[tracing::instrument(level = "debug", skip_all)]
 async fn dispatch_multi_stream<M: RemoteMessage, S: Stream>(
     session_id: SessionId,
     stream_id: u8,
@@ -390,7 +390,7 @@ async fn dispatch_multi_stream<M: RemoteMessage, S: Stream>(
         };
 
         // Each stream emits the cumulative watermark on its own wire
-        // so the peer's per-wire NetTx sees an ack for messages it
+        // so the peer's per-wire ChannelTx sees an ack for messages it
         // sent on this connection.
         let pending_ack = shared_state
             .ack_watermark
@@ -479,7 +479,7 @@ pub(super) async fn accept_loop<S, L, F, Fut, D, DFut>(
     dispatch: D,
 ) -> Result<(), ServerError>
 where
-    S: Stream,
+    S: Send + 'static,
     L: super::Listener,
     F: Fn(L::Stream, ChannelAddr) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<(super::LinkInit, S), anyhow::Error>> + Send + 'static,
@@ -633,10 +633,11 @@ impl Future for ServerHandle {
 /// Serve new connections on the given address, optionally using a pre-opened TCP listener.
 /// When `prebound_listener` is `Some`, it is used instead of binding a new socket.
 /// This is only supported for TCP-based transports (Tcp, Tls, MetaTls).
+#[tracing::instrument(level = "debug", skip_all)]
 pub(in crate::channel) fn serve<M: RemoteMessage>(
     addr: ChannelAddr,
     prebound_listener: Option<std::net::TcpListener>,
-) -> Result<(ChannelAddr, NetRx<M>), ServerError> {
+) -> Result<(ChannelAddr, ChannelRx<M>), ServerError> {
     let (mut listener, channel_addr) = super::listen_with_prebound(addr, prebound_listener)?;
 
     metrics::CHANNEL_CONNECTIONS.add(
@@ -651,33 +652,7 @@ pub(in crate::channel) fn serve<M: RemoteMessage>(
     let cancel_token = CancellationToken::new();
     let child_token = cancel_token.child_token();
 
-    let is_tls = matches!(
-        channel_addr.transport(),
-        ChannelTransport::Tls | ChannelTransport::MetaTls(_)
-    );
-    let dest = channel_addr.clone();
-    let prepare = move |stream: Box<dyn Stream>, source: ChannelAddr| {
-        let dest = dest.clone();
-        async move {
-            if is_tls {
-                let tls_acceptor = match dest.transport() {
-                    ChannelTransport::Tls => tls::tls_acceptor()?,
-                    _ => meta::tls_acceptor(true)?,
-                };
-                let mut tls_stream = tls_acceptor.accept(stream).await?;
-                let link_init = read_link_init(&mut tls_stream)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("LinkInit read failed from {}: {}", source, e))?;
-                Ok((link_init, Box::new(tls_stream) as Box<dyn Stream>))
-            } else {
-                let mut stream = stream;
-                let link_init = read_link_init(&mut stream)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("LinkInit read failed from {}: {}", source, e))?;
-                Ok((link_init, stream))
-            }
-        }
-    };
+    let prepare = super::preparer_for(channel_addr.clone(), Some(super::ProtocolKind::Simplex));
 
     let sessions: Arc<DashMap<SessionId, mpsc::UnboundedSender<Box<dyn Stream>>>> =
         Arc::new(DashMap::new());
@@ -725,17 +700,22 @@ pub(in crate::channel) fn serve<M: RemoteMessage>(
 
     Ok((
         server_handle.channel_addr.clone(),
-        NetRx(rx, channel_addr, server_handle),
+        ChannelRx {
+            receiver: rx,
+            dest: channel_addr,
+            server: server_handle,
+        },
     ))
 }
 
 /// Test-only variant that accepts an arbitrary `Listener`. Used by
-/// mock-link tests that cannot go through `net::listen()`.
+/// mock-link tests that cannot go through `net::listen_with_prebound`.
 #[cfg(test)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub(super) fn serve_with_listener<M, L>(
     mut listener: L,
     channel_addr: ChannelAddr,
-) -> Result<(ChannelAddr, NetRx<M>), ServerError>
+) -> Result<(ChannelAddr, ChannelRx<M>), ServerError>
 where
     M: RemoteMessage,
     L: super::Listener + 'static,
@@ -749,6 +729,13 @@ where
         let link_init = read_link_init(&mut stream)
             .await
             .map_err(|e| anyhow::anyhow!("LinkInit read failed from {}: {}", source, e))?;
+        if link_init.kind != super::ProtocolKind::Simplex {
+            return Err(anyhow::anyhow!(
+                "simplex server received {:?} client from {}",
+                link_init.kind,
+                source
+            ));
+        }
         Ok((link_init, stream))
     };
 
@@ -797,6 +784,10 @@ where
 
     Ok((
         server_handle.channel_addr.clone(),
-        NetRx(rx, channel_addr, server_handle),
+        ChannelRx {
+            receiver: rx,
+            dest: channel_addr,
+            server: server_handle,
+        },
     ))
 }

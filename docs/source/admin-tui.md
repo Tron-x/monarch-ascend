@@ -23,7 +23,7 @@ python python/examples/dining_philosophers.py
 
 The example prints the admin server address on startup:
 
-```
+```text
 Mesh admin server listening on http://127.0.0.1:1729
 ```
 
@@ -68,7 +68,10 @@ stacks with frame-level detail, GIL ownership, and thread names. Each press
 fetches a fresh trace — useful for diagnosing hangs in C extensions and CUDA
 calls.
 
-`py-spy` is included as a default dependency of `torchmonarch`.
+`py-spy` is not bundled with `torchmonarch`; it must be resolvable on the
+target host — either on `PATH` or via the `PYSPY_BIN` environment variable. If
+it cannot be found, the stack-trace request reports that py-spy is unavailable
+rather than failing the proc.
 
 ```{image} _static/tui-pyspy.png
 :alt: Py-spy overlay showing per-thread Python stack traces with native frames
@@ -97,7 +100,7 @@ calls.
 
 ## CLI Options
 
-```
+```text
 monarch-tui [OPTIONS] --addr <ADDR>
 ```
 

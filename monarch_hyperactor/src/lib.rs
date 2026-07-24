@@ -8,7 +8,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 #![feature(exit_status_error)]
-#![feature(mapped_lock_guards)]
+#![deny(clippy::disallowed_methods)]
 
 pub mod actor;
 pub mod actor_mesh;
@@ -19,6 +19,7 @@ pub mod code_sync;
 pub mod config;
 pub mod context;
 pub mod endpoint;
+pub mod handle;
 pub mod host_mesh;
 pub mod local_state_broker;
 pub mod logging;

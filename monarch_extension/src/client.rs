@@ -14,6 +14,7 @@ use monarch_hyperactor::proc::InstanceWrapper;
 use monarch_hyperactor::proc::PyActorAddr;
 use monarch_hyperactor::proc::PyProc;
 use monarch_hyperactor::proc::PySerialized;
+use monarch_hyperactor::runtime::GilSite;
 use monarch_hyperactor::runtime::monarch_with_gil_blocking;
 use monarch_hyperactor::runtime::signal_safe_block_on;
 use monarch_messages::client::ClientMessage;
@@ -403,17 +404,14 @@ impl ClientActor {
     /// Attach the client to a controller actor. This will block until the controller responds.
     fn attach(&mut self, py: Python, controller_id: PyActorAddr) -> PyResult<()> {
         let instance_wrapper = self.instance.blocking_lock();
-        let actor_id = instance_wrapper.actor_id().clone();
-        let (instance, _handler) = instance_wrapper
-            .instance()
-            .child()
-            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        let actor_id = instance_wrapper.actor_addr().clone();
+        let instance = instance_wrapper.instance().child();
 
         signal_safe_block_on(py, async move {
             reference::ActorRef::<ControllerActor>::attest(reference::ActorAddr::from(
                 &controller_id,
             ))
-            .attach(&instance, reference::ActorRef::attest(actor_id.into()))
+            .attach(&instance, reference::ActorRef::attest(actor_id))
             .await
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))
         })?
@@ -421,10 +419,7 @@ impl ClientActor {
 
     fn drop_refs(&self, py: Python, controller_id: PyActorAddr, refs: Vec<Ref>) -> PyResult<()> {
         let instance_wrapper = self.instance.blocking_lock();
-        let (instance, _handler) = instance_wrapper
-            .instance()
-            .child()
-            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        let instance = instance_wrapper.instance().child();
 
         signal_safe_block_on(py, async move {
             reference::ActorRef::<ControllerActor>::attest(reference::ActorAddr::from(
@@ -440,9 +435,9 @@ impl ClientActor {
     /// or the timeout is reached in which case it will return None
     /// If the actor has been stopped, this returns an error.
     #[pyo3(signature = (*, timeout_msec = None))]
-    fn get_next_message<'py>(
+    fn get_next_message(
         &mut self,
-        py: Python<'py>,
+        py: Python<'_>,
         timeout_msec: Option<u64>,
     ) -> PyResult<Py<PyAny>> {
         let instance = self.instance.clone();
@@ -450,7 +445,7 @@ impl ClientActor {
             instance.lock().await.next_message(timeout_msec).await
         })?;
 
-        monarch_with_gil_blocking(|py| match result {
+        monarch_with_gil_blocking(GilSite::ReplyConvert, |py| match result {
             Ok(Some(ClientMessage::Result { seq, result })) => {
                 WorkerResponse { seq, result }.into_py_any(py)
             }
@@ -504,7 +499,7 @@ impl ClientActor {
 
     fn actor_id(&self) -> PyResult<PyActorAddr> {
         let instance = self.instance.blocking_lock();
-        Ok(PyActorAddr::from(instance.actor_id().clone()))
+        Ok(PyActorAddr::from(instance.actor_addr().clone()))
     }
 }
 

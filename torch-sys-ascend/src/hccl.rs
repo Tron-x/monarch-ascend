@@ -25,7 +25,6 @@ use torch_sys2::NpuDevice;
 use torch_sys2::ScalarType;
 use torch_sys2::Tensor;
 use torch_sys2::TensorCell;
-use torch_sys2::factory_float_tensor;
 use torch_sys2::is_float8_type;
 
 use crate::acl::AclError;

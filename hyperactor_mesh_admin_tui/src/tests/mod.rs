@@ -35,6 +35,7 @@ fn test_policy() -> TuiTimeoutPolicy {
         tls_cert: None,
         tls_key: None,
         diagnose: false,
+        plaintext: false,
     })
 }
 
@@ -47,18 +48,18 @@ fn test_addr() -> hyperactor::channel::ChannelAddr {
 }
 
 fn host(name: &str) -> NodeRef {
-    let proc_id = hyperactor::ProcAddr::from_resource_name(test_addr(), "world");
-    NodeRef::Host(proc_id.actor_id(name))
+    let proc_id = hyperactor_mesh::mesh_id::ResourceId::proc_addr_from_name(test_addr(), "world");
+    NodeRef::Host(proc_id.actor_addr(name))
 }
 
 fn proc_ref(name: &str) -> NodeRef {
-    let proc_id = hyperactor::ProcAddr::from_resource_name(test_addr(), name);
+    let proc_id = hyperactor_mesh::mesh_id::ResourceId::proc_addr_from_name(test_addr(), name);
     NodeRef::Proc(proc_id)
 }
 
 fn actor(name: &str) -> NodeRef {
-    let proc_id = hyperactor::ProcAddr::from_resource_name(test_addr(), "world");
-    NodeRef::Actor(proc_id.actor_id(name))
+    let proc_id = hyperactor_mesh::mesh_id::ResourceId::proc_addr_from_name(test_addr(), "world");
+    NodeRef::Actor(proc_id.actor_addr(name))
 }
 
 // Empty tree all operations are noops.
@@ -1553,13 +1554,17 @@ fn pyspy_proc_ref_actor_node_with_parent() {
         properties: NodeProperties::Actor {
             actor_status: "running".into(),
             actor_type: "TestActor".into(),
+            instance_id: String::new(),
             messages_processed: 0,
             created_at: Some(SystemTime::UNIX_EPOCH),
             last_message_handler: None,
             total_processing_time_us: 0,
+            queue_depth: 0,
             flight_recorder: None,
             is_system: false,
+            inbound_ordering: None,
             failure_info: None,
+            execution: None,
         },
         children: vec![],
         parent: Some(proc_ref("worker")),
@@ -2509,5 +2514,242 @@ fn refresh_policy_transitions_with_job_lifecycle() {
     assert_eq!(
         refresh_policy_for_job(&app.active_job),
         RefreshPolicy::Baseline,
+    );
+}
+
+// TUI-22: help glossary content + modal key semantics.
+
+#[test]
+fn help_content_root_non_empty() {
+    let props = NodeProperties::Root {
+        num_hosts: 0,
+        started_at: SystemTime::UNIX_EPOCH,
+        started_by: String::new(),
+        system_children: vec![],
+    };
+    let (kind, entries) = crate::render::detail_pane::help_content(&props);
+    assert_eq!(kind, "root");
+    assert!(!entries.is_empty());
+}
+
+#[test]
+fn help_content_proc_queue_depth_semantics() {
+    let props = NodeProperties::Proc {
+        proc_name: String::new(),
+        num_actors: 0,
+        system_children: vec![],
+        stopped_children: vec![],
+        stopped_retention_cap: 0,
+        is_poisoned: false,
+        failed_actor_count: 0,
+        debug: hyperactor_mesh::introspect::ProcDebugStats::default(),
+    };
+    let (_, entries) = crate::render::detail_pane::help_content(&props);
+    assert!(
+        entries.iter().any(|e| e.field == "queue depth"
+            && e.meaning.contains("not yet dequeued")
+            && e.meaning.contains("total")),
+        "proc help must explain queue depth (total across actors)",
+    );
+}
+
+#[test]
+fn help_content_actor_buffered_independence() {
+    let props = NodeProperties::Actor {
+        actor_status: String::new(),
+        actor_type: String::new(),
+        instance_id: String::new(),
+        messages_processed: 0,
+        created_at: None,
+        last_message_handler: None,
+        total_processing_time_us: 0,
+        queue_depth: 0,
+        flight_recorder: None,
+        is_system: false,
+        inbound_ordering: None,
+        failure_info: None,
+        execution: None,
+    };
+    let (_, entries) = crate::render::detail_pane::help_content(&props);
+    let buffered = entries
+        .iter()
+        .find(|e| e.field == "buffered")
+        .expect("actor help must include a 'buffered' entry");
+    assert!(
+        buffered.note.is_some_and(|n| n.contains("independent")),
+        "buffered entry must note its independence from queue depth",
+    );
+}
+
+#[test]
+fn show_help_set_by_question_mark() {
+    let mut app = App::new(
+        "http://localhost:8080".to_string(),
+        reqwest::Client::new(),
+        ThemeName::Nord,
+        LangName::En,
+        test_policy(),
+    );
+    assert!(!app.show_help);
+    let _ = app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+    assert!(app.show_help);
+}
+
+#[test]
+fn show_help_cleared_by_any_key() {
+    let mut app = App::new(
+        "http://localhost:8080".to_string(),
+        reqwest::Client::new(),
+        ThemeName::Nord,
+        LangName::En,
+        test_policy(),
+    );
+    app.show_help = true;
+    let _ = app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+    assert!(!app.show_help, "any key dismisses help");
+    assert!(!app.should_quit, "q dismisses help rather than quitting");
+}
+
+#[test]
+fn show_help_ctrl_c_still_quits() {
+    let mut app = App::new(
+        "http://localhost:8080".to_string(),
+        reqwest::Client::new(),
+        ThemeName::Nord,
+        LangName::En,
+        test_policy(),
+    );
+    app.show_help = true;
+    let result = app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(matches!(result, KeyResult::None));
+    assert!(app.should_quit, "Ctrl-C requests quit even from help");
+    // show_help intentionally not asserted cleared — irrelevant once quitting.
+}
+
+#[test]
+fn footer_idle_contains_help_hint() {
+    assert!(
+        crate::theme::Labels::en()
+            .footer_help_text
+            .contains("?: help")
+    );
+}
+
+#[test]
+fn footer_zh_idle_contains_help_hint() {
+    let zh = crate::theme::Labels::zh();
+    assert!(zh.footer_help_text.contains("帮助"));
+    assert!(zh.footer_help_text.contains("?"));
+}
+
+// TUI-CLIP-1: detail_content_clipped fires the header alert only for a starved
+// actor detail; it suppresses the alert while help or an overlay owns the pane,
+// and for absent / non-actor selections.
+#[test]
+fn detail_content_clipped_guards() {
+    use hyperactor_mesh::introspect::Execution;
+
+    use crate::render::detail_pane::detail_content_clipped;
+
+    let mut app = make_app_with_cursor(vec![actor_node("a")], 0);
+    app.detail = Some(NodePayload {
+        identity: actor("a"),
+        properties: NodeProperties::Actor {
+            actor_status: "running".into(),
+            actor_type: "TestActor".into(),
+            instance_id: String::new(),
+            messages_processed: 0,
+            created_at: Some(SystemTime::UNIX_EPOCH),
+            last_message_handler: None,
+            total_processing_time_us: 0,
+            queue_depth: 0,
+            flight_recorder: None,
+            is_system: false,
+            inbound_ordering: None,
+            failure_info: None,
+            execution: Some(Box::new(Execution {
+                active_count: 2,
+                active_handlers: vec![],
+                complete: true,
+                truncated: false,
+            })),
+        },
+        children: vec![],
+        parent: Some(proc_ref("worker")),
+        as_of: SystemTime::now(),
+    });
+    // Live execution starved to zero height -> alert; roomy -> no alert.
+    assert!(detail_content_clipped(&app, 18));
+    assert!(!detail_content_clipped(&app, 45));
+
+    // Help glossary owns the pane -> suppressed even when starved.
+    app.show_help = true;
+    assert!(!detail_content_clipped(&app, 18));
+    app.show_help = false;
+
+    // An overlay (diagnostics / py-spy) owns the pane -> suppressed.
+    app.set_job(ActiveJob::Diagnostics {
+        results: Vec::new(),
+        running: true,
+        rx: None,
+        completed_at: None,
+    });
+    assert!(app.overlay.is_some());
+    assert!(!detail_content_clipped(&app, 18));
+
+    // No selection detail -> no alert.
+    let no_detail = make_app_with_cursor(vec![], 0);
+    assert!(!detail_content_clipped(&no_detail, 18));
+
+    // Non-actor selection -> no alert.
+    let mut host_app = make_app_with_cursor(vec![], 0);
+    host_app.detail = Some(NodePayload {
+        identity: host("h"),
+        properties: NodeProperties::Host {
+            addr: "10.0.0.1:8080".into(),
+            num_procs: 1,
+            system_children: vec![],
+            memory: hyperactor_mesh::introspect::ProcessMemoryStats {
+                process_rss_bytes: None,
+                process_vm_size_bytes: None,
+            },
+        },
+        children: vec![],
+        parent: Some(NodeRef::Root),
+        as_of: SystemTime::now(),
+    });
+    assert!(!detail_content_clipped(&host_app, 18));
+}
+
+// TUI-CLIP-1: render_header prepends the content-hidden alert to line 1 when
+// detail_clipped is set, and omits it otherwise.
+#[test]
+fn render_header_shows_content_clipped_alert() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let app = make_app_with_cursor(vec![], 0);
+    let render = |clipped: bool| {
+        let backend = TestBackend::new(120, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| crate::render::status_bar::render_header(f, f.area(), &app, clipped))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+            }
+        }
+        text
+    };
+    assert!(
+        render(true).contains("content hidden"),
+        "alert present when detail is clipped"
+    );
+    assert!(
+        !render(false).contains("content hidden"),
+        "no alert when detail is not clipped"
     );
 }

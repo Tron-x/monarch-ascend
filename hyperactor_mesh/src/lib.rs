@@ -8,9 +8,7 @@
 
 //! This crate provides hyperactor's mesh abstractions.
 
-#![feature(assert_matches)]
 #![feature(associated_type_defaults)]
-#![feature(exit_status_error)]
 #![feature(impl_trait_in_bindings)]
 #![feature(get_disjoint_mut_helpers)]
 #![feature(exact_size_is_empty)]
@@ -25,7 +23,7 @@ pub mod actor_mesh;
 mod assign;
 pub mod bootstrap;
 pub mod casting;
-pub mod comm;
+pub mod client_root;
 pub mod config;
 pub mod config_dump;
 pub mod connect;
@@ -57,17 +55,19 @@ pub mod testactor;
 pub mod testing;
 mod testresource;
 pub mod transport;
-pub mod value_mesh;
+pub mod value_mesh {
+    pub use hyperactor::value_mesh::*;
+}
 
 use std::io;
 
 pub use actor_mesh::ActorMesh;
 pub use actor_mesh::ActorMeshRef;
 pub use bootstrap::Bootstrap;
+pub use bootstrap::HostBootstrapReady;
 pub use bootstrap::bootstrap;
 pub use bootstrap::bootstrap_or_die;
 pub use casting::CastError;
-pub use comm::CommActor;
 pub use dashmap;
 use enum_as_inner::EnumAsInner;
 pub use global_context::GlobalClientActor;
@@ -116,6 +116,22 @@ pub type StatusMesh = ValueMesh<Status>;
 /// Construct via `ValueOverlay::try_from_runs` after normalizing.
 pub type StatusOverlay = value_mesh::ValueOverlay<Status>;
 
+inventory::submit! {
+    hyperactor::accum::ReducerFactory {
+        typehash_f: <hyperactor::value_mesh::ValueOverlayReducer<crate::resource::Status> as typeuri::Named>::typehash,
+        builder_f: |_| Ok(Box::new(hyperactor::value_mesh::ValueOverlayReducer::<crate::resource::Status>::new())),
+    }
+}
+
+// Reducer for per-proc `State<ProcState>` overlays, so `ProcMeshRef::states`
+// can reduce partial per-host meshes up the cast tree (see `GetHostProcStates`).
+inventory::submit! {
+    hyperactor::accum::ReducerFactory {
+        typehash_f: <hyperactor::value_mesh::ValueOverlayReducer<crate::resource::State<crate::host_mesh::host_agent::ProcState>> as typeuri::Named>::typehash,
+        builder_f: |_| Ok(Box::new(hyperactor::value_mesh::ValueOverlayReducer::<crate::resource::State<crate::host_mesh::host_agent::ProcState>>::new())),
+    }
+}
+
 /// Errors that occur during mesh operations.
 #[derive(Debug, EnumAsInner, thiserror::Error)]
 pub enum Error {
@@ -151,6 +167,12 @@ pub enum Error {
     #[error("actor not registered for type {0}")]
     ActorTypeNotRegistered(String),
 
+    #[error(transparent)]
+    ClientRootError(#[from] crate::client_root::ClientRootError),
+
+    #[error("client-root capability is absent from this actor's environment")]
+    MissingClientRoot,
+
     // TODO: this should be a valuemesh of statuses
     #[error("error while spawning actor {0}: {1}")]
     GspawnError(mesh_id::ActorMeshId, String),
@@ -163,6 +185,12 @@ pub enum Error {
 
     #[error("error configuring host mesh agent {0}: {1}")]
     HostMeshAgentConfigurationError(ActorAddr, String),
+
+    /// HM-2 / HM-3 / HM-4: structured per-host failure from
+    /// `HostMeshRef::push_config()`. See the HM-* invariant block in
+    /// `host_mesh.rs` for the contract this surfaces.
+    #[error(transparent)]
+    ConfigPushFailed(#[from] crate::host_mesh::ConfigPushError),
 
     #[error(
         "error creating proc (host rank {host_rank}) on host mesh agent {mesh_agent}, state: {state}"
@@ -190,6 +218,12 @@ pub enum Error {
         RankedValues::invert(statuses)
     )]
     ActorStopError { statuses: RankedValues<Status> },
+
+    #[error(
+        "error stopping proc mesh: statuses: {}",
+        RankedValues::invert(statuses)
+    )]
+    ProcMeshStopError { statuses: RankedValues<Status> },
 
     #[error("error spawning actor: {0}")]
     SingletonActorSpawnError(anyhow::Error),
@@ -282,6 +316,16 @@ impl From<view::InvalidCardinality> for Error {
     }
 }
 
+impl From<hyperactor::value_mesh::ValueMeshError> for Error {
+    fn from(e: hyperactor::value_mesh::ValueMeshError) -> Self {
+        match e {
+            hyperactor::value_mesh::ValueMeshError::InvalidRankCardinality { expected, actual } => {
+                Error::InvalidRankCardinality { expected, actual }
+            }
+        }
+    }
+}
+
 /// The type of result used in `hyperactor_mesh`.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -317,7 +361,7 @@ mod tests {
         assert!(structurally_equal(&actual, &expected));
     }
 
-    #[cfg(FALSE)]
+    #[cfg(false)]
     #[test]
     fn shouldnt_compile() {
         let _ = sel!(foobar);

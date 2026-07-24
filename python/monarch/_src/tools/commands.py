@@ -6,6 +6,16 @@
 
 # pyre-strict
 
+# ``from __future__ import annotations`` turns every annotation in this file
+# into a string that's only evaluated by tools that ask for it (type checkers,
+# ``typing.get_type_hints``). That lets us reference ``Runner``,
+# ``AppDef``, ``ServerSpec``, etc. in signatures without paying the cost of
+# importing ``torchx`` or ``monarch.tools.mesh_spec`` at module-load time.
+# All runtime uses of those names are pushed inside the functions that need
+# them so ``from monarch._src.tools.commands import load_current_job`` (and
+# any other no-scheduler entry point) works without ``torchx`` installed.
+from __future__ import annotations
+
 import asyncio
 import getpass
 import logging
@@ -16,18 +26,16 @@ import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Mapping, Optional, Union
+from typing import Any, Mapping, Optional, TYPE_CHECKING, Union
 
 from monarch.tools.colors import CYAN, ENDC
-from monarch.tools.config import (  # @manual=//monarch/python/monarch/tools/config/meta:defaults
-    Config,
-    defaults,
-)
-from monarch.tools.mesh_spec import mesh_spec_from_metadata, ServerSpec
 from monarch.tools.utils import MONARCH_HOME
-from torchx.runner import Runner  # @manual=//torchx/runner:lib_core
-from torchx.specs import AppDef, AppDryRunInfo, AppState, CfgVal, parse_app_handle
-from torchx.specs.api import is_terminal
+
+if TYPE_CHECKING:
+    from monarch.tools.config import Config
+    from monarch.tools.mesh_spec import ServerSpec
+    from torchx.runner import Runner
+    from torchx.specs import AppDryRunInfo
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -40,6 +48,11 @@ TIMEOUT_AFTER_KILL = 300  # 5 minutes
 
 
 def torchx_runner() -> Runner:
+    from monarch.tools.config import (  # @manual=//monarch/python/monarch/tools/config/meta:defaults
+        defaults,
+    )
+    from torchx.runner import Runner  # @manual=//torchx/runner:lib_core
+
     # namespace is currently unused so make it empty str
     # so that server handle is short (e.g. slurm:///job-id)
     _EMPTY_NS = ""
@@ -49,6 +62,7 @@ def torchx_runner() -> Runner:
 def create(
     config: Config,
     name: Optional[str] = None,
+    # pyrefly: ignore [bad-return]
 ) -> Union[str, AppDryRunInfo]:
     """Creates a monarch server by submitting it as a job to the target scheduler.
 
@@ -56,9 +70,9 @@ def create(
 
     .. doc-test::
 
-        from monarch.tools.config import defaults
+        from monarch.tools.config import Config, defaults
 
-        config = defaults.config(scheduler="slurm")
+        config = Config(scheduler="slurm")
         config.appdef = defaults.component_fn(scheduler=config.scheduler)()
 
         config.scheduler_args.update(
@@ -78,6 +92,11 @@ def create(
         scheduler_args: scheduler configs
         name: the name of the job. If none, a default job name will be created.
     """
+    from monarch.tools.config import (  # @manual=//monarch/python/monarch/tools/config/meta:defaults
+        defaults,
+    )
+    from torchx.specs import AppDef, AppDryRunInfo, CfgVal
+
     if name is None:
         name = _default_name()
     scheduler: str = config.scheduler
@@ -127,6 +146,9 @@ def info(server_handle: str) -> Optional[ServerSpec]:
     NOTE: This function can return non-empty info for jobs that have
     exited recently.
     """
+    from monarch.tools.mesh_spec import mesh_spec_from_metadata, ServerSpec
+    from torchx.specs import parse_app_handle
+
     with torchx_runner() as runner:
         status = runner.status(server_handle)
         if status is None:
@@ -196,6 +218,9 @@ async def server_ready(
                 print(f"Job in {server_info.state} state. Hostnames are not available")
 
     """
+
+    from torchx.specs import AppState
+    from torchx.specs.api import is_terminal
 
     check_interval_seconds = check_interval.total_seconds()
     start = datetime.now()
@@ -269,9 +294,9 @@ async def get_or_create(
 
     .. code-block:: python
 
-        from monarch.tools.config import defaults
+        from monarch.tools.config import Config, defaults
 
-        config = defaults.config(scheduler)
+        config = Config(scheduler=scheduler)
         config.appdef = defaults.component_fn(config.scheduler)()
 
         server_handle = get_or_create(name="my_job_name", config)
@@ -343,6 +368,8 @@ def kill_and_confirm(
     is actually terminated before returning to avoid the job still being around
     after cancel() completes.
     """
+    from torchx.specs import AppState
+
     with torchx_runner() as runner:
         runner.cancel(server_handle)
         start_time = time.time()
@@ -404,7 +431,7 @@ def _context_state(name: str) -> Path:
 def load_current_job() -> Any:
     from monarch._src.job.job import load_current_job as _load  # pyre-ignore[21]
 
-    return _load()  # pyre-ignore[16]
+    return _load()
 
 
 def _current_context() -> Optional[str]:
@@ -458,7 +485,7 @@ def context_rm(name: str) -> None:
         try:
             from monarch._src.job.job import job_load  # pyre-ignore[21]
 
-            job_load(str(state_file)).kill()  # pyre-ignore[16]
+            job_load(str(state_file)).kill()
         except Exception:
             pass
     shutil.rmtree(str(_context_dir(name)), ignore_errors=True)
@@ -506,15 +533,21 @@ def apply_job(module_path: Optional[str] = None) -> None:
     from monarch._src.job.job import BashActor, set_current_job  # pyre-ignore[21]
 
     if module_path is not None:
-        set_current_job(module_path)  # pyre-ignore[16]
+        set_current_job(module_path)
 
     job = load_current_job()
     state = job.state()
+    apply_id = job.apply_id  # pyre-ignore[16]
+    if apply_id is not None:
+        print(
+            f"Mount daemon log: /tmp/monarch_mounts_{apply_id}.log "
+            "(tail for sync/cold-transfer progress, on-demand-pull events)"
+        )
     t0 = time.time()
     mesh = next(iter(state._hosts.values()))
     procs = mesh.spawn_procs()
     try:
-        procs.spawn("_ready_check", BashActor).run.call("true").get()  # pyre-ignore[16]
+        procs.spawn("_ready_check", BashActor).run.call("true").get()
         print(f"Job is ready ({time.time() - t0:.0f}s)")
     finally:
         procs.stop().get(timeout=30.0)
@@ -562,7 +595,7 @@ def _output_dir_for_job(job: "Any") -> tuple[str, str]:
     import uuid as _uuid
 
     run_id = _uuid.uuid4().hex[:8]
-    entries = job._mounts._gather_entries
+    entries = job._components.mounts._mounts._gather_entries
     if entries:
         entry = entries[0]
         remote = entry.remote_mount_point
@@ -656,12 +689,12 @@ def exec_on_job(
         # If a python_exe was set for this mesh's remote mount, prepend its
         # directory to PATH so commands like "python" resolve to the right one.
         mesh_env = dict(env_dict)
-        exe = job._python_executables.get(name, job._default_python_exe)
+        exe = job._components.mounts.python_executable_for_mesh(name)
         if exe is not None:
             bin_dir = os.path.dirname(exe)
             existing_path = mesh_env.get("PATH", os.environ.get("PATH", ""))
             mesh_env["PATH"] = f"{bin_dir}:{existing_path}"
-        rc = exec_command(  # pyre-ignore[16]
+        rc = exec_command(
             host_mesh,
             cmd,
             env=mesh_env,
@@ -678,6 +711,6 @@ def exec_on_job(
 
         last_mesh.shutdown().get()
         job.kill()
-        shutdown_context().get()  # pyre-ignore[16]
+        shutdown_context().get()
 
     return max_rc

@@ -117,9 +117,11 @@ use pyo3::types::PyTuple;
 use pyo3::types::PyType;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
 
+use crate::handle::HandleCore;
+use crate::handle::PyHandle;
 use crate::pickle::reduce_shared;
+use crate::runtime::GilSite;
 use crate::runtime::get_tokio_runtime;
 use crate::runtime::monarch_with_gil;
 use crate::runtime::monarch_with_gil_blocking;
@@ -150,7 +152,7 @@ py_global!(actor_mesh_module, "monarch._src.actor", "actor_mesh");
 /// `traceback.extract_stack()`.
 fn current_traceback() -> PyResult<Option<Py<PyAny>>> {
     if hyperactor_config::global::get(ENABLE_UNAWAITED_PYTHON_TASK_TRACEBACK) {
-        monarch_with_gil_blocking(|py| {
+        monarch_with_gil_blocking(GilSite::Traceback, |py| {
             Ok(Some(
                 py.import("traceback")?
                     .call_method0("extract_stack")?
@@ -312,7 +314,7 @@ impl PythonTaskAwaitIterator {
     /// Convert the thrown Python exception value into a `PyErr` and
     /// surface it to Rust.
     fn throw(&mut self, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
-        Err(monarch_with_gil_blocking(|py| {
+        Err(monarch_with_gil_blocking(GilSite::Convert, |py| {
             PyErr::from_value(value.into_bound(py))
         }))
     }
@@ -339,7 +341,7 @@ impl PyPythonTask {
         Ok(PythonTask::new_with_traceback(
             async {
                 let result = fut.await?;
-                monarch_with_gil(|py| result.into_py_any(py)).await
+                monarch_with_gil(GilSite::Convert, |py| result.into_py_any(py)).await
             },
             traceback,
         )
@@ -361,7 +363,7 @@ impl PyPythonTask {
 }
 
 // Helper: convert a Rust error into a generic Python ValueError.
-fn to_py_error<T>(e: T) -> PyErr
+pub(crate) fn to_py_error<T>(e: T) -> PyErr
 where
     T: Error,
 {
@@ -390,7 +392,7 @@ impl PyPythonTask {
     /// Fails if the task has already been consumed.
     fn traceback(&self) -> PyResult<Option<Py<PyAny>>> {
         if let Some(task) = &self.inner {
-            Ok(monarch_with_gil_blocking(|py| {
+            Ok(monarch_with_gil_blocking(GilSite::Traceback, |py| {
                 task.traceback().as_ref().map(|t| t.clone_ref(py))
             }))
         } else {
@@ -413,54 +415,74 @@ impl PyPythonTask {
     /// Like `spawn()`, this consumes the `PyPythonTask` (it can only
     /// be spawned once).
     pub(crate) fn spawn_abortable(&mut self) -> PyResult<PyShared> {
+        Ok(PyShared {
+            core: self.spawn_core(true)?,
+        })
+    }
+
+    /// Spawn this task onto the Tokio runtime and return the shared
+    /// `HandleCore` that observes its completion via the `watch` channel.
+    ///
+    /// `abort` decides whether dropping the core aborts the producing task
+    /// (`spawn_abortable`) or leaves it running (`spawn`/`spawn_handle`).
+    /// Consumes the task. Shared by `spawn`/`spawn_abortable`/`spawn_handle`.
+    fn spawn_core(&mut self, abort: bool) -> PyResult<HandleCore> {
         let (tx, rx) = watch::channel(None);
         let traceback = self.traceback()?;
-        let traceback1 = self.traceback()?;
+        // Clone the second owned copy under the same (single) GIL section, and
+        // only when a traceback was actually captured -- avoids a second GIL
+        // round-trip per spawn in the common (capture-disabled) case.
+        let traceback1 = traceback
+            .as_ref()
+            .map(|t| monarch_with_gil_blocking(GilSite::Traceback, |py| t.clone_ref(py)));
         let task = self.take_task()?;
         let handle = get_tokio_runtime().spawn(async move {
             send_result(tx, task.await, traceback1);
         });
-        Ok(PyShared {
+        Ok(HandleCore::new(
             rx,
-            handle: Some(handle),
-            abort: true,
+            abort.then(|| handle.abort_handle()),
             traceback,
-        })
+        ))
     }
 }
 
-/// Publish a completed task result to the `watch` channel.
+/// Publish a completed background-task result to the `watch` channel.
 ///
-/// If the receiver has already been dropped, `watch::Sender::send`
-/// returns the unsent value as `SendError`. We treat that as "nobody
-/// will ever observe this result".
+/// Shared by `PyPythonTask` spawns and the direct [`PyHandle::spawn`] producer
+/// (HDL-13). If the receiver has already been dropped, `watch::Sender::send`
+/// returns the unsent value as `SendError`. We treat that as "nobody will ever
+/// observe this result".
 ///
-/// In the special case where the unobserved result is an error, we
-/// log it (and include the task creation traceback when available) to
-/// avoid silently losing failures from background tasks.
-fn send_result(
+/// In the special case where the unobserved result is an error, we log it (and
+/// include the creation-site traceback when available) to avoid silently losing
+/// failures from background tasks.
+pub(crate) fn send_result(
     tx: tokio::sync::watch::Sender<Option<PyResult<Py<PyAny>>>>,
     result: PyResult<Py<PyAny>>,
     traceback: Option<Py<PyAny>>,
 ) {
     // a SendErr just means that there are no consumers of the value left.
-    match tx.send(Some(result)) {
-        Err(tokio::sync::watch::error::SendError(Some(Err(pyerr)))) => {
-            monarch_with_gil_blocking(|py| {
-                let tb = if let Some(tb) = traceback {
-                    format_traceback(py, &tb).unwrap()
-                } else {
-                    "None (run with `MONARCH_HYPERACTOR_ENABLE_UNAWAITED_PYTHON_TASK_TRACEBACK=1` to see a traceback here)\n".into()
-                };
-                tracing::error!(
-                    "PythonTask errored but is not being awaited; this will not crash your program, but indicates that \
-                    something went wrong.\n{}\nTraceback where the task was created (most recent call last):\n{}",
-                    SerializablePyErr::from(py, &pyerr),
-                    tb
-                );
-            });
-        }
-        _ => {}
+    if let Err(tokio::sync::watch::error::SendError(Some(Err(pyerr)))) = tx.send(Some(result)) {
+        monarch_with_gil_blocking(GilSite::Traceback, |py| {
+            let tb = if let Some(tb) = traceback {
+                format_traceback(py, &tb).unwrap()
+            } else {
+                // No creation traceback was captured: either a capture-disabled
+                // `PythonTask` (the default when the env var is unset) or the
+                // direct `PyHandle::spawn` producer, which never captures one.
+                "creation traceback unavailable (PythonTask producers can set \
+                 `MONARCH_HYPERACTOR_ENABLE_UNAWAITED_PYTHON_TASK_TRACEBACK=1` to capture one)\n"
+                    .into()
+            };
+            tracing::error!(
+                "a background task errored but is not being awaited; this will not crash your \
+                program, but indicates that something went wrong.\n{}\nTraceback where the task \
+                was created (most recent call last):\n{}",
+                SerializablePyErr::from(py, &pyerr),
+                tb
+            );
+        });
     };
 }
 
@@ -490,19 +512,19 @@ impl PyPythonTask {
     /// `from_coroutine` world, or may be waited on synchronously via
     /// `Shared.block_on()`. Consumes the task.
     pub(crate) fn spawn(&mut self) -> PyResult<PyShared> {
-        let (tx, rx) = watch::channel(None);
-        let traceback = self.traceback()?;
-        let traceback1 = self.traceback()?;
-        let task = self.take_task()?;
-        let handle = get_tokio_runtime().spawn(async move {
-            send_result(tx, task.await, traceback1);
-        });
         Ok(PyShared {
-            rx,
-            handle: Some(handle),
-            abort: false,
-            traceback,
+            core: self.spawn_core(false)?,
         })
+    }
+
+    /// Spawn this task onto the Tokio runtime and return an observe-only
+    /// `Handle`.
+    ///
+    /// Like `spawn`, but hands back the clean `Handle` (`get`/`poll`/
+    /// `as_asyncio`/`await`) rather than `Shared`; non-abortable on drop.
+    /// Consumes the task.
+    pub(crate) fn spawn_handle(&mut self) -> PyResult<PyHandle> {
+        Ok(PyHandle::from_core(self.spawn_core(false)?))
     }
 
     /// Implement Python's `await` protocol for `PythonTask`.
@@ -549,7 +571,7 @@ impl PyPythonTask {
         // maintained inside the tokio runtime.
         let monarch_context = context(py).call0()?.unbind();
         PyPythonTask::new(async move {
-            let (coroutine_iterator, none) = monarch_with_gil(|py| {
+            let (coroutine_iterator, none) = monarch_with_gil(GilSite::AwaitDrive, |py| {
                 coro.into_bound(py)
                     .call_method0("__await__")
                     .map(|x| (x.unbind(), py.None()))
@@ -561,7 +583,7 @@ impl PyPythonTask {
                 Wait(Pin<Box<dyn Future<Output = Result<Py<PyAny>, PyErr>> + Send + 'static>>),
             }
             loop {
-                let action = monarch_with_gil(|py| -> PyResult<Action> {
+                let action = monarch_with_gil(GilSite::AwaitDrive, |py| -> PyResult<Action> {
                     // We may be executing in a new thread at this point, so we need to set the value
                     // of context().
                     let _context = actor_mesh_module(py).getattr("_context")?;
@@ -617,11 +639,16 @@ impl PyPythonTask {
     /// Consumes the original task. If it does not complete within
     /// `seconds`, the returned task fails with `TimeoutError`.
     fn with_timeout(&mut self, seconds: f64) -> PyResult<PyPythonTask> {
+        // Reject a negative, NaN, or non-finite timeout with ValueError up front
+        // rather than panicking in Duration::from_secs_f64 on a Tokio worker
+        // thread (matching Handle.get(timeout)).
+        let duration = std::time::Duration::try_from_secs_f64(seconds)
+            .map_err(|e| PyValueError::new_err(format!("invalid timeout {seconds}: {e}")))?;
         let tb = self.traceback()?;
         let task = self.take_task()?;
         PyPythonTask::new_with_traceback(
             async move {
-                tokio::time::timeout(std::time::Duration::from_secs_f64(seconds), task)
+                tokio::time::timeout(duration, task)
                     .await
                     .map_err(|_| PyTimeoutError::new_err(()))?
             },
@@ -644,16 +671,15 @@ impl PyPythonTask {
     fn spawn_blocking(py: Python<'_>, f: Py<PyAny>) -> PyResult<PyShared> {
         let (tx, rx) = watch::channel(None);
         let traceback = current_traceback()?;
-        let traceback1 = traceback.as_ref().map_or_else(
-            || None,
-            |t| monarch_with_gil_blocking(|py| Some(t.clone_ref(py))),
-        );
+        let traceback1 = traceback
+            .as_ref()
+            .map(|t| monarch_with_gil_blocking(GilSite::Traceback, |py| t.clone_ref(py)));
         let monarch_context = context(py).call0()?.unbind();
         // The `_context` contextvar needs to be propagated through to the thread that
         // runs the blocking tokio task. Upon completion, the original value of `_context`
         // is restored.
-        let handle = get_tokio_runtime().spawn_blocking(move || {
-            let result = monarch_with_gil_blocking(|py| {
+        get_tokio_runtime().spawn_blocking(move || {
+            let result = monarch_with_gil_blocking(GilSite::AwaitDrive, |py| {
                 let _context = actor_mesh_module(py).getattr("_context")?;
                 let old_context = _context.call_method1("get", (PyNone::get(py),))?;
                 _context
@@ -668,10 +694,7 @@ impl PyPythonTask {
             send_result(tx, result, traceback1);
         });
         Ok(PyShared {
-            rx,
-            handle: Some(handle),
-            abort: false,
-            traceback,
+            core: HandleCore::new(rx, None, traceback),
         })
     }
 
@@ -733,42 +756,19 @@ impl PyPythonTask {
     module = "monarch._rust_bindings.monarch_hyperactor.pytokio"
 )]
 pub struct PyShared {
-    /// One-shot result channel. Starts as `None`; becomes
-    /// `Some(Ok(obj))` or `Some(Err(pyerr))` when the background task
-    /// completes.
-    rx: watch::Receiver<Option<PyResult<Py<PyAny>>>>,
-
-    /// Handle for the spawned Tokio task that is producing `rx`’s
-    /// result. `None` for `Shared.from_value(...)`.
-    handle: Option<JoinHandle<()>>,
-
-    /// If true, dropping `Shared` aborts the background task via
-    /// `handle.abort()`. This is set by `spawn_abortable()`.
-    abort: bool,
-
-    /// Optional creation-site traceback (captured when enabled) used
-    /// when logging un-awaited errors / for derived tasks.
-    traceback: Option<Py<PyAny>>,
+    /// The watch-channel core.
+    core: HandleCore,
 }
 
-/// If this `Shared` was created via `spawn_abortable()`, abort the
-/// underlying Tokio task on drop.
-///
-/// This prevents abandoned background work from running forever when
-/// no receivers remain. We guard against panics during interpreter
-/// shutdown / runtime teardown.
-impl Drop for PyShared {
-    fn drop(&mut self) {
-        if self.abort {
-            // When the PyShared is dropped, we don't want the background task to go
-            // forever, because nothing will wait on the rx.
-            if let Some(h) = self.handle.as_ref() {
-                // Guard against panics during interpreter shutdown when tokio runtime may be gone
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    h.abort();
-                }));
-            }
-        }
+impl PyShared {
+    /// Await this `Shared`'s result from Rust, yielding the resolved
+    /// `Py<PyAny>` (or the producer's `PyErr`).
+    ///
+    /// Returns the same future the Python `await` path drives, so a Rust
+    /// caller in another crate can resolve a `Shared[T]` inside an `async fn`
+    /// without a pickle round-trip or a blocking `block_on`.
+    pub fn wait_future(&self) -> impl Future<Output = PyResult<Py<PyAny>>> + Send + 'static {
+        self.core.wait_future()
     }
 }
 
@@ -786,35 +786,7 @@ impl PyShared {
     /// Cloning the receiver allows multiple independent awaiters to
     /// observe the same completion.
     pub(crate) fn task(&self) -> PyResult<PyPythonTask> {
-        // watch channels start unchanged, and when a value is sent to them signal
-        // the receivers `changed` future.
-        // By cloning the rx before awaiting it,
-        // we can have multiple awaiters get triggered by the same change.
-        // self.rx will always be in the state where it hasn't see the change yet.
-        let mut rx = self.rx.clone();
-        PyPythonTask::new_with_traceback(
-            async move {
-                // Check if a value is already available (not None).
-                // The channel is initialized with None, and the sender sets it to Some(result).
-                // If it's still None, wait for a change. Otherwise, the value is ready.
-                if rx.borrow().is_none() {
-                    rx.changed().await.map_err(to_py_error)?;
-                }
-                // We need to hold the GIL when cloning Python objects (Py<PyAny> and PyErr).
-                monarch_with_gil(|py| {
-                    let borrowed = rx.borrow();
-                    match borrowed.as_ref().unwrap() {
-                        Ok(v) => Ok(v.bind(py).clone().unbind()),
-                        Err(err) => Err(err.clone_ref(py)),
-                    }
-                })
-                .await
-            },
-            self.traceback.as_ref().map_or_else(
-                || None,
-                |t| monarch_with_gil_blocking(|py| Some(t.clone_ref(py))),
-            ),
-        )
+        PyPythonTask::new_with_traceback(self.core.wait_future(), self.core.traceback_clone())
     }
 
     /// Implement Python's `await` protocol for `Shared`.
@@ -826,7 +798,7 @@ impl PyShared {
     /// Note: `await shared` is only supported inside the
     /// `PythonTask.from_coroutine(...)` world (because it ultimately
     /// awaits a `PythonTask`).
-    fn __await__(&mut self, py: Python<'_>) -> PyResult<PythonTaskAwaitIterator> {
+    fn __await__(&self, py: Python<'_>) -> PyResult<PythonTaskAwaitIterator> {
         let task = self.task()?;
         Ok(PythonTaskAwaitIterator::new(task.into_py_any(py)?))
     }
@@ -850,11 +822,18 @@ impl PyShared {
             return Ok(value);
         }
 
-        let task = slf.task()?.take_task()?;
+        // Unlike `Handle::get()`, block_on() deliberately does NOT raise
+        // WouldBlockRuntime for a still-pending value inside a Tokio runtime.
+        // Blocking there panics the runtime loudly, which is preferable to a
+        // silent deadlock for the pending mesh bare-pickle path that relies on
+        // this (`reduce_shared` blocks a pending `Shared` during pickling), and
+        // the common multiprocessing case is unaffected. This trade was
+        // deliberately chosen; do not change it to raise.
+        let wait = slf.core.wait_future();
         // Explicitly drop the reference so that if another thread attempts to borrow
         // this object mutably during signal_safe_block_on, it won't throw an exception.
         drop(slf);
-        signal_safe_block_on(py, task)?
+        signal_safe_block_on(py, wait)?
     }
 
     /// Support `Shared[T]` type syntax on the Python side (no runtime
@@ -873,15 +852,7 @@ impl PyShared {
     ///
     /// This does not wait; it only inspects the current watch value.
     pub(crate) fn poll(&self) -> PyResult<Option<Py<PyAny>>> {
-        let b = self.rx.borrow();
-        let r = b.as_ref();
-        match r {
-            None => Ok(None),
-            Some(r) => Python::attach(|py| match r {
-                Ok(v) => Ok(Some(v.clone_ref(py))),
-                Err(err) => Err(err.clone_ref(py)),
-            }),
-        }
+        self.core.poll()
     }
 
     /// Construct a `Shared` that is already completed with `value`.
@@ -892,22 +863,19 @@ impl PyShared {
     /// `await` (inside `from_coroutine`), or `block_on()`.
     #[classmethod]
     fn from_value(_cls: &Bound<'_, PyType>, value: Py<PyAny>) -> PyResult<Self> {
-        let (tx, rx) = watch::channel(None);
-        tx.send(Some(Ok(value))).map_err(to_py_error)?;
         Ok(Self {
-            rx,
-            handle: None,
-            abort: false,
-            traceback: None,
+            core: HandleCore::from_value(value)?,
         })
     }
 
     /// Pickle protocol support for PyShared.
     ///
-    /// This implements the pickle reduce protocol:
-    /// - If the shared is finished, pickle as (Shared.from_value, (value,))
-    /// - If pending pickles are allowed, defer pickling and return (pop_pending_pickle, ())
-    /// - Otherwise, block on the shared and pickle as (Shared.from_value, (value,))
+    /// Delegates to `reduce_shared`: a finished shared pickles as
+    /// `(Shared.from_value, (value,))`; a pending one blocks on the shared and
+    /// then pickles the resolved value. Mesh references do not take this generic
+    /// path -- their own reducers record a `MeshRef` in the message's
+    /// out-of-band `refs` table, a pending mesh's slot filled sender-side (by
+    /// awaiting the handle) before the send.
     fn __reduce__<'py>(
         slf: &Bound<'py, Self>,
         py: Python<'py>,
@@ -922,17 +890,27 @@ impl PyShared {
 /// This checks whether `tokio::runtime::Handle::try_current()`
 /// succeeds.
 #[pyfunction]
-fn is_tokio_thread() -> bool {
+pub(crate) fn is_tokio_thread() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
 }
 
 /// Register the pytokio Python bindings into the given module.
 ///
-/// This wires up the exported pyclasses (`PythonTask`, `Shared`)
-/// and module-level functions used by the Monarch Python layer.
+/// This wires up the exported pyclasses (`PythonTask`, `Shared`,
+/// `Handle`), the `WouldBlockRuntime` exception, and module-level
+/// functions used by the Monarch Python layer.
 pub fn register_python_bindings(hyperactor_mod: &Bound<'_, PyModule>) -> PyResult<()> {
     hyperactor_mod.add_class::<PyPythonTask>()?;
     hyperactor_mod.add_class::<PyShared>()?;
+    hyperactor_mod.add_class::<crate::handle::PyHandle>()?;
+    let would_block = hyperactor_mod
+        .py()
+        .get_type::<crate::handle::WouldBlockRuntime>();
+    would_block.setattr(
+        "__module__",
+        "monarch._rust_bindings.monarch_hyperactor.pytokio",
+    )?;
+    hyperactor_mod.add("WouldBlockRuntime", would_block)?;
     let f = wrap_pyfunction!(is_tokio_thread, hyperactor_mod)?;
     f.setattr(
         "__module__",
@@ -983,7 +961,7 @@ impl AwaitPyExt for PyPythonTask {
         let py_any: Py<PyAny> = fut.await?;
 
         // Convert Py<PyAny> -> Py<T>.
-        monarch_with_gil(|py| {
+        monarch_with_gil(GilSite::Test, |py| {
             let bound_any = py_any.bind(py);
 
             // Try extract a Py<T>.
@@ -1010,5 +988,31 @@ impl AwaitPyExt for PyPythonTask {
         drop(py_any);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // with_timeout validates the seconds up front, raising ValueError for a
+    // negative/NaN/non-finite timeout rather than panicking in
+    // Duration::from_secs_f64 on a worker thread (matching Handle.get(timeout)).
+    #[test]
+    fn with_timeout_rejects_invalid_seconds() {
+        ensure_python();
+        monarch_with_gil_blocking(GilSite::Test, |py| {
+            for bad in [-1.0, f64::NAN, f64::INFINITY] {
+                let mut task = PyPythonTask::sleep(3600.0).unwrap();
+                let err = task
+                    .with_timeout(bad)
+                    .err()
+                    .expect("with_timeout should reject an invalid timeout");
+                assert!(
+                    err.is_instance_of::<PyValueError>(py),
+                    "with_timeout({bad}) should raise ValueError, not panic"
+                );
+            }
+        });
     }
 }

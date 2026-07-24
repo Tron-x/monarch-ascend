@@ -18,6 +18,7 @@ from monarch._src.actor.actor_mesh import (
     Actor,
     ActorError,
     as_endpoint,
+    attach,
     Channel,
     context,
     Context,
@@ -38,6 +39,7 @@ from monarch._src.actor.debugger.debug_controller import debug_controller
 from monarch._src.actor.endpoint import endpoint
 from monarch._src.actor.future import Future
 from monarch._src.actor.host_mesh import (
+    default_bootstrap_cmd,
     HostMesh,
     hosts_from_config,
     this_host,
@@ -45,7 +47,8 @@ from monarch._src.actor.host_mesh import (
 )
 from monarch._src.actor.proc_mesh import get_or_spawn_controller, ProcMesh
 from monarch._src.actor.supervision import unhandled_fault_hook
-from monarch._src.actor.telemetry import span
+from monarch._src.actor.telemetry import span, traced
+from monarch.actor.concurrent import concurrent_endpoint
 
 __all__ = [
     "Accumulator",
@@ -55,6 +58,7 @@ __all__ = [
     "as_endpoint",
     "current_rank",
     "current_size",
+    "concurrent_endpoint",
     "endpoint",
     "Future",
     "Point",
@@ -67,6 +71,7 @@ __all__ = [
     "get_or_spawn_controller",
     "this_host",
     "this_proc",
+    "default_bootstrap_cmd",
     "HostMesh",
     "context",
     "hosts_from_config",
@@ -76,6 +81,7 @@ __all__ = [
     "Extent",
     "run_worker_loop_forever",
     "attach_to_workers",
+    "attach",
     "enable_transport",
     "Context",
     "ChannelTransport",
@@ -83,4 +89,5 @@ __all__ = [
     "MeshFailure",
     "config",
     "span",
+    "traced",
 ]

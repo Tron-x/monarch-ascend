@@ -14,18 +14,19 @@ doctest = false
 crate-type = ["cdylib"]
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.103"
 async-trait = "0.1.86"
 bincode = { version = "2", features = ["serde"] }
-bytes = { version = "1.11.1", features = ["serde"] }
+bytes = { version = "1.12.1", features = ["serde"] }
 fuse3 = { version = "0.8.1", features = ["tokio-runtime", "unprivileged"] }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 hyperactor = { version = "0.0.0", path = "../hyperactor" }
 hyperactor_mesh = { version = "0.0.0", path = "../hyperactor_mesh" }
 hyperactor_telemetry = { version = "0.0.0", path = "../hyperactor_telemetry" }
-libc = "0.2.183"
+libc = "0.2.186"
 monarch_cpp_static_libs = { path = "../monarch_cpp_static_libs", optional = true }
 monarch_distributed_telemetry = { version = "0.0.0", path = "../monarch_distributed_telemetry", optional = true }
+monarch_gil = { version = "0.0.0", path = "../monarch_gil" }
 monarch_hyperactor = { version = "0.0.0", path = "../monarch_hyperactor" }
 monarch_introspection_snapshot = { version = "0.0.0", path = "../monarch_introspection_snapshot", optional = true }
 monarch_messages = { version = "0.0.0", path = "../monarch_messages", default-features = false, optional = true }
@@ -39,12 +40,11 @@ pyo3 = { version = "0.26", features = ["anyhow", "multiple-pymethods", "py-clone
 pyo3-async-runtimes = { version = "0.26", features = ["attributes", "tokio-runtime"] }
 rdmaxcel-sys = { path = "../rdmaxcel-sys", optional = true }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
-tokio = { version = "1.52.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
 torch-sys-ascend = { version = "0.0.0", path = "../torch-sys-ascend", optional = true }
-torch-sys-cuda = { version = "0.0.0", path = "../torch-sys-cuda", optional = true }
+torch-sys-cuda = { version = "0.0.0", path = "../torch-sys-cuda", optional = true, default-features = false }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 wirevalue = { version = "0.0.0", path = "../wirevalue" }
-xxhash-rust = { version = "0.8.15", features = ["xxh3", "xxh64"] }
 
 [build-dependencies]
 build_utils = { path = "../build_utils" }
@@ -54,5 +54,10 @@ monarch_cpp_static_libs = { path = "../monarch_cpp_static_libs", optional = true
 default = ["tensor_engine"]
 distributed_sql_telemetry = ["dep:monarch_distributed_telemetry", "dep:monarch_introspection_snapshot"]
 extension-module = ["pyo3/extension-module"]
-tensor_engine = ["dep:monarch_cpp_static_libs", "dep:monarch_messages", "dep:monarch_rdma_extension", "dep:monarch_tensor_worker", "dep:nccl-sys", "dep:rdmaxcel-sys", "dep:torch-sys-cuda", "monarch_tensor_worker/cuda_backend", "monarch_messages/cuda_backend", "monarch_rdma_extension/cuda"]
-ascend_engine = ["dep:monarch_messages", "dep:monarch_rdma_extension", "dep:monarch_tensor_worker", "dep:hccl-sys", "dep:torch-sys-ascend", "monarch_tensor_worker/ascend_backend", "monarch_messages/ascend_backend", "monarch_rdma_extension/hixl"]
+rdma = ["dep:monarch_cpp_static_libs", "dep:monarch_rdma_extension", "monarch_rdma_extension/cuda"]
+tensor_engine = ["dep:monarch_messages", "dep:monarch_tensor_worker", "dep:torch-sys-cuda", "monarch_messages/cuda", "monarch_tensor_worker/cuda_backend"]
+tensor_engine_gpu = ["dep:nccl-sys", "dep:rdmaxcel-sys", "monarch_messages/cuda", "monarch_tensor_worker/cuda", "rdma", "tensor_engine", "torch-sys-cuda/cuda"]
+ascend_engine = ["dep:hccl-sys", "dep:monarch_messages", "dep:monarch_rdma_extension", "dep:monarch_tensor_worker", "dep:torch-sys-ascend", "monarch_messages/ascend_backend", "monarch_rdma_extension/hixl", "monarch_tensor_worker/ascend_backend"]
+
+[lints]
+workspace = true

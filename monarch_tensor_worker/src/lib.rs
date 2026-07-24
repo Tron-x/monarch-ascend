@@ -6,12 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#![feature(assert_matches)]
 #![feature(duration_constructors)]
-#![feature(exit_status_error)]
 // NOTE: Until https://github.com/PyO3/pyo3/pull/4674, `pyo3::pymethods` trigger
 // and unsafe-op-in-unsafe-fn warnings.
 #![allow(unsafe_op_in_unsafe_fn)]
+#![deny(clippy::disallowed_methods)]
 
 //! A `hyperactor`-based implementation of a PyTorch worker actor.
 //!
@@ -54,15 +53,15 @@ use device_mesh::DeviceMesh;
 use futures::future::try_join_all;
 use hyperactor as reference;
 use hyperactor::Actor;
-use hyperactor::Bind;
 use hyperactor::Handler;
 use hyperactor::RemoteSpawn;
-use hyperactor::Unbind;
 use hyperactor::actor::ActorHandle;
 use hyperactor::context;
 use hyperactor_config::Flattrs;
-use hyperactor_mesh::comm::multicast::CastInfo;
+use hyperactor_mesh::casting::CastInfo;
 use itertools::Itertools;
+use monarch_gil::GilSite;
+use monarch_gil::monarch_with_gil_blocking;
 use monarch_hyperactor::shape::PyPoint;
 use monarch_messages::controller::ControllerActor;
 use monarch_messages::controller::ControllerMessageClient;
@@ -84,7 +83,6 @@ use monarch_messages::worker::WorkerParams;
 use monarch_types::ReduceOp;
 use monarch_types::UniqueId;
 use ndslice::Slice;
-use pyo3::Python;
 use pyo3::types::PyAnyMethods;
 use serde::Deserialize;
 use serde::Serialize;
@@ -147,8 +145,8 @@ enum Recording {
 #[hyperactor::spawnable]
 #[hyperactor::export(
     handlers = [
-        WorkerMessage {cast = true},
-        AssignRankMessage {cast = true},
+        WorkerMessage,
+        AssignRankMessage,
     ],
 )]
 pub struct WorkerActor {
@@ -181,8 +179,9 @@ pub struct WorkerActor {
 }
 
 impl WorkerActor {
+    #[cfg(feature = "cuda_backend")]
     fn runtime_has_cuda() -> bool {
-        Python::attach(|py| {
+        monarch_with_gil_blocking(GilSite::WorkerInit, |py| {
             py.import("torch")
                 .expect("torch must be importable in a worker")
                 .getattr("cuda")
@@ -245,9 +244,16 @@ impl RemoteSpawn for WorkerActor {
         }: Self::Params,
         _environment: Flattrs,
     ) -> Result<Self> {
-        Python::attach(|py| {
+        monarch_with_gil_blocking(GilSite::WorkerInit, |py| {
             py.import("monarch.safe_torch").unwrap();
         });
+        #[cfg(feature = "cuda_backend")]
+        let device = if Self::runtime_has_cuda() {
+            device_index.map(|i| AccelDevice::new(DeviceIndex(i)))
+        } else {
+            None
+        };
+        #[cfg(feature = "ascend_backend")]
         let device = device_index.map(|i| AccelDevice::new(DeviceIndex(i)));
         Ok(Self {
             device,
@@ -279,11 +285,11 @@ impl Handler<AssignRankMessage> for WorkerActor {
         let point = cx.cast_point();
         self.rank = point.rank();
         self.respond_with_python_message = true;
-        Python::attach(|py| {
+        monarch_with_gil_blocking(GilSite::WorkerInit, |py| {
             let mesh_controller = py.import("monarch.mesh_controller").unwrap();
             let p: PyPoint = point.into();
             mesh_controller
-                .call_method1("_initialize_env", (p, cx.proc().proc_id().to_string()))
+                .call_method1("_initialize_env", (p, cx.proc().proc_addr().to_string()))
                 .unwrap();
         });
         Ok(())
@@ -292,7 +298,7 @@ impl Handler<AssignRankMessage> for WorkerActor {
 
 /// Worker messages. These define the observable behavior of the worker, so the
 /// documentations here
-#[derive(Handler, Clone, Serialize, Deserialize, Debug, Named, Bind, Unbind)]
+#[derive(Handler, Clone, Serialize, Deserialize, Debug, Named)]
 pub enum AssignRankMessage {
     AssignRank(),
 }
@@ -320,27 +326,30 @@ impl WorkerMessageHandler for WorkerActor {
             return Ok(());
         };
         // The wire type is the portable `monarch_types::UniqueId` enum; convert
-        // to whichever backend `CommId` we were built against.  On CUDA this is
-        // an identity (CommId == UniqueId); on Ascend we extract the HCCL
-        // variant via `RootInfo::try_from`.
+        // to whichever backend `CommId` we were built against.
         let unique_id: CommId = unique_id.try_into()?;
-        let comm = NcclCommActor::new(CommParams::New {
-            device,
-            unique_id,
-            world_size: self.world_size.try_into().unwrap(),
-            rank: self.rank.try_into().unwrap(),
-        })
-        .await?
-        .spawn(cx)?;
+        let comm = cx.spawn(
+            NcclCommActor::new(CommParams::New {
+                device,
+                unique_id,
+                world_size: self.world_size.try_into().unwrap(),
+                rank: self.rank.try_into().unwrap(),
+            })
+            .await?,
+        );
 
         let tensor = factory_zeros(&[1], ScalarType::Float, Layout::Strided, device.into());
         let cell = TensorCell::new(tensor);
+        #[cfg(feature = "cuda_backend")]
+        let current_stream = backend::Stream::get_current_stream()?;
+        #[cfg(feature = "ascend_backend")]
+        let current_stream = backend::Stream::get_current_stream();
 
         comm.all_reduce(
             cx,
             cell,
             ReduceOp::Sum,
-            backend::Stream::get_current_stream(),
+            current_stream,
         )
         .await?;
 
@@ -367,7 +376,7 @@ impl WorkerMessageHandler for WorkerActor {
         let _: Vec<()> = try_join_all(
             sorted_streams
                 .into_iter()
-                .zip(splits.into_iter())
+                .zip(splits)
                 .map(|(stream, split)| stream.init_comm(cx, split)),
         )
         .await?;
@@ -410,7 +419,7 @@ impl WorkerMessageHandler for WorkerActor {
         let device_meshes = self
             .device_meshes
             .iter()
-            .map(|(k, v)| (k.clone(), v.0.clone()))
+            .map(|(k, v)| (*k, v.0.clone()))
             .collect();
 
         let mut remote_process_groups = HashMap::new();
@@ -430,10 +439,8 @@ impl WorkerMessageHandler for WorkerActor {
                         anyhow::anyhow!("no comm found for remote process group {remote_process_group_ref:#?} stream {stream:#?}")
                     })?
                     .clone();
-                remote_process_groups.insert(
-                    remote_process_group_ref.clone(),
-                    (device_mesh, dims_vec, comm),
-                );
+                remote_process_groups
+                    .insert(*remote_process_group_ref, (device_mesh, dims_vec, comm));
             }
         }
 
@@ -461,7 +468,7 @@ impl WorkerMessageHandler for WorkerActor {
         result: StreamRef,
         creation_mode: StreamCreationMode,
     ) -> Result<()> {
-        let handle: ActorHandle<StreamActor> = StreamActor::new(StreamParams {
+        let handle: ActorHandle<StreamActor> = cx.spawn(StreamActor::new(StreamParams {
             world_size: self.world_size,
             rank: self.rank,
             creation_mode,
@@ -469,8 +476,7 @@ impl WorkerMessageHandler for WorkerActor {
             device: self.device,
             controller_actor: self.controller_actor.clone(),
             respond_with_python_message: self.respond_with_python_message,
-        })
-        .spawn(cx)?;
+        }));
         self.streams.insert(result, Arc::new(handle));
         Ok(())
     }
@@ -601,7 +607,7 @@ impl WorkerMessageHandler for WorkerActor {
             &self.controller_actor,
             cx,
             seq.next(),
-            cx.self_id().clone(),
+            cx.self_addr().clone(),
             controller,
         )
         .await?;
@@ -743,7 +749,7 @@ impl WorkerMessageHandler for WorkerActor {
                     actor_id,
                     reason
                 );
-                if cx.self_id() == &actor_id {
+                if cx.self_addr() == &actor_id {
                     self_error_exit_code
                 } else {
                     peer_error_exit_code
@@ -782,7 +788,7 @@ impl WorkerMessageHandler for WorkerActor {
         } else {
             self.device_meshes
                 .iter()
-                .map(|(k, v)| (k.clone(), v.0.clone()))
+                .map(|(k, v)| (*k, v.0.clone()))
                 .collect()
         };
 
@@ -795,7 +801,7 @@ impl WorkerMessageHandler for WorkerActor {
             .send_value(
                 cx,
                 seq,
-                cx.self_id().clone(),
+                cx.self_addr().clone(),
                 mutates,
                 function,
                 args_kwargs,
@@ -854,7 +860,7 @@ impl WorkerMessageHandler for WorkerActor {
                         cx,
                         ranks_for_group
                             .into_iter()
-                            .map(|v| v.clone().try_into())
+                            .map(|v| v.try_into())
                             .collect::<Result<Vec<_>, _>>()?,
                     )
                     .await?
@@ -906,7 +912,7 @@ impl WorkerMessageHandler for WorkerActor {
                         cx,
                         ranks_for_group
                             .into_iter()
-                            .map(|v| v.clone().try_into())
+                            .map(|v| v.try_into())
                             .collect::<Result<Vec<_>, _>>()?,
                     )
                     .await?
@@ -952,7 +958,7 @@ impl WorkerMessageHandler for WorkerActor {
         stream: StreamRef,
     ) -> Result<Option<Result<WireValue, String>>> {
         let stream = self.try_get_stream(stream)?;
-        Ok(stream.get_ref_unit_tests_only(cx, ref_id.clone()).await?)
+        Ok(stream.get_ref_unit_tests_only(cx, ref_id).await?)
     }
 
     async fn define_recording(
@@ -1108,7 +1114,7 @@ impl WorkerMessageHandler for WorkerActor {
 
 #[cfg(all(test, fbcode_build))]
 mod tests {
-    use std::assert_matches::assert_matches;
+    use std::assert_matches;
 
     use anyhow::Result;
     use hyperactor::RemoteSpawn;
@@ -1118,7 +1124,6 @@ mod tests {
     use monarch_messages::controller::WorkerError;
     use monarch_messages::worker::WorkerMessageClient;
     use monarch_types::PickledPyObject;
-    use pyo3::Python;
     use pyo3::prelude::*;
     use pyo3::types::PyList;
     use pyo3::types::PyString;
@@ -1134,25 +1139,22 @@ mod tests {
     async fn basic_worker() -> Result<()> {
         test_setup()?;
 
-        let proc = Proc::local();
+        let proc = Proc::isolated();
         let (client, controller_ref, mut controller_rx) = proc.attach_actor("controller").unwrap();
 
-        let worker_handle = proc
-            .spawn(
-                "worker",
-                WorkerActor::new(
-                    WorkerParams {
-                        world_size: 1,
-                        rank: 0,
-                        device_index: None,
-                        controller_actor: controller_ref,
-                    },
-                    Flattrs::default(),
-                )
-                .await
-                .unwrap(),
+        let worker_handle = proc.spawn(
+            WorkerActor::new(
+                WorkerParams {
+                    world_size: 1,
+                    rank: 0,
+                    device_index: None,
+                    controller_actor: controller_ref,
+                },
+                Flattrs::default(),
             )
-            .unwrap();
+            .await
+            .unwrap(),
+        );
         worker_handle
             .command_group(
                 &client,
@@ -1243,25 +1245,22 @@ mod tests {
     async fn error_sends_response() -> Result<()> {
         test_setup()?;
 
-        let proc = Proc::local();
+        let proc = Proc::isolated();
         let (client, controller_ref, mut controller_rx) = proc.attach_actor("controller").unwrap();
 
-        let worker_handle = proc
-            .spawn(
-                "worker",
-                WorkerActor::new(
-                    WorkerParams {
-                        world_size: 1,
-                        rank: 0,
-                        device_index: None,
-                        controller_actor: controller_ref,
-                    },
-                    Flattrs::default(),
-                )
-                .await
-                .unwrap(),
+        let worker_handle = proc.spawn(
+            WorkerActor::new(
+                WorkerParams {
+                    world_size: 1,
+                    rank: 0,
+                    device_index: None,
+                    controller_actor: controller_ref,
+                },
+                Flattrs::default(),
             )
-            .unwrap();
+            .await
+            .unwrap(),
+        );
         worker_handle
             .command_group(
                 &client,
@@ -1306,25 +1305,22 @@ mod tests {
     async fn mutated_refs_are_updated_with_error() -> Result<()> {
         test_setup()?;
 
-        let proc = Proc::local();
+        let proc = Proc::isolated();
         let (client, controller_ref, mut controller_rx) = proc.attach_actor("controller").unwrap();
 
-        let worker_handle = proc
-            .spawn(
-                "worker",
-                WorkerActor::new(
-                    WorkerParams {
-                        world_size: 1,
-                        rank: 0,
-                        device_index: None,
-                        controller_actor: controller_ref,
-                    },
-                    Flattrs::default(),
-                )
-                .await
-                .unwrap(),
+        let worker_handle = proc.spawn(
+            WorkerActor::new(
+                WorkerParams {
+                    world_size: 1,
+                    rank: 0,
+                    device_index: None,
+                    controller_actor: controller_ref,
+                },
+                Flattrs::default(),
             )
-            .unwrap();
+            .await
+            .unwrap(),
+        );
         worker_handle
             .command_group(
                 &client,
@@ -1380,25 +1376,22 @@ mod tests {
     async fn accessing_errored_dependency() -> Result<()> {
         test_setup()?;
 
-        let proc = Proc::local();
+        let proc = Proc::isolated();
         let (client, controller_ref, mut controller_rx) = proc.attach_actor("controller").unwrap();
 
-        let worker_handle = proc
-            .spawn(
-                "worker",
-                WorkerActor::new(
-                    WorkerParams {
-                        world_size: 1,
-                        rank: 0,
-                        device_index: None,
-                        controller_actor: controller_ref,
-                    },
-                    Flattrs::default(),
-                )
-                .await
-                .unwrap(),
+        let worker_handle = proc.spawn(
+            WorkerActor::new(
+                WorkerParams {
+                    world_size: 1,
+                    rank: 0,
+                    device_index: None,
+                    controller_actor: controller_ref,
+                },
+                Flattrs::default(),
             )
-            .unwrap();
+            .await
+            .unwrap(),
+        );
         worker_handle
             .command_group(
                 &client,
@@ -1459,27 +1452,24 @@ mod tests {
     async fn py_remote_function_calls() -> Result<()> {
         test_setup()?;
 
-        let proc = Proc::local();
+        let proc = Proc::isolated();
         let (client, controller_ref, mut controller_rx) = proc.attach_actor("controller").unwrap();
 
-        let worker_handle = proc
-            .spawn(
-                "worker",
-                WorkerActor::new(
-                    WorkerParams {
-                        world_size: 1,
-                        rank: 0,
-                        device_index: None,
-                        controller_actor: controller_ref,
-                    },
-                    Flattrs::default(),
-                )
-                .await
-                .unwrap(),
+        let worker_handle = proc.spawn(
+            WorkerActor::new(
+                WorkerParams {
+                    world_size: 1,
+                    rank: 0,
+                    device_index: None,
+                    controller_actor: controller_ref,
+                },
+                Flattrs::default(),
             )
-            .unwrap();
+            .await
+            .unwrap(),
+        );
         let (split_arg, sort_list, dim, layout, none, scalar, device, memory_format) =
-            Python::attach(|py| {
+            monarch_with_gil_blocking(GilSite::Test, |py| {
                 let split_arg: PickledPyObject = PyString::new(py, "/fbs/fbc/foo/bar")
                     .into_any()
                     .try_into()?;
@@ -1761,25 +1751,22 @@ mod tests {
     async fn delete_refs() -> Result<()> {
         test_setup()?;
 
-        let proc = Proc::local();
+        let proc = Proc::isolated();
         let (client, controller_ref, _) = proc.attach_actor("controller").unwrap();
 
-        let worker_handle = proc
-            .spawn(
-                "worker",
-                WorkerActor::new(
-                    WorkerParams {
-                        world_size: 1,
-                        rank: 0,
-                        device_index: None,
-                        controller_actor: controller_ref,
-                    },
-                    Flattrs::default(),
-                )
-                .await
-                .unwrap(),
+        let worker_handle = proc.spawn(
+            WorkerActor::new(
+                WorkerParams {
+                    world_size: 1,
+                    rank: 0,
+                    device_index: None,
+                    controller_actor: controller_ref,
+                },
+                Flattrs::default(),
             )
-            .unwrap();
+            .await
+            .unwrap(),
+        );
         worker_handle
             .command_group(
                 &client,
@@ -1839,25 +1826,22 @@ mod tests {
     async fn request_status() -> Result<()> {
         test_setup()?;
 
-        let proc = Proc::local();
+        let proc = Proc::isolated();
         let (client, controller_ref, mut controller_rx) = proc.attach_actor("controller").unwrap();
 
-        let worker_handle = proc
-            .spawn(
-                "worker",
-                WorkerActor::new(
-                    WorkerParams {
-                        world_size: 1,
-                        rank: 0,
-                        device_index: None,
-                        controller_actor: controller_ref,
-                    },
-                    Flattrs::default(),
-                )
-                .await
-                .unwrap(),
+        let worker_handle = proc.spawn(
+            WorkerActor::new(
+                WorkerParams {
+                    world_size: 1,
+                    rank: 0,
+                    device_index: None,
+                    controller_actor: controller_ref,
+                },
+                Flattrs::default(),
             )
-            .unwrap();
+            .await
+            .unwrap(),
+        );
         worker_handle
             .command_group(
                 &client,
@@ -1928,41 +1912,37 @@ mod tests {
     #[async_timed_test(timeout_secs = 60)]
     async fn backend_network_init() {
         test_setup().unwrap();
-        let proc = Proc::local();
+        let proc = Proc::isolated();
         let (client, controller_ref, _) = proc.attach_actor("controller").unwrap();
 
-        let worker_handle1 = proc
-            .spawn(
-                "worker0",
-                WorkerActor::new(
-                    WorkerParams {
-                        world_size: 2,
-                        rank: 0,
-                        device_index: Some(0),
-                        controller_actor: controller_ref.clone(),
-                    },
-                    Flattrs::default(),
-                )
-                .await
-                .unwrap(),
+        let worker_handle1 = proc.spawn_with_label(
+            "worker0",
+            WorkerActor::new(
+                WorkerParams {
+                    world_size: 2,
+                    rank: 0,
+                    device_index: Some(0),
+                    controller_actor: controller_ref.clone(),
+                },
+                Flattrs::default(),
             )
-            .unwrap();
-        let worker_handle2 = proc
-            .spawn(
-                "worker1",
-                WorkerActor::new(
-                    WorkerParams {
-                        world_size: 2,
-                        rank: 1,
-                        device_index: Some(1),
-                        controller_actor: controller_ref,
-                    },
-                    Flattrs::default(),
-                )
-                .await
-                .unwrap(),
+            .await
+            .unwrap(),
+        );
+        let worker_handle2 = proc.spawn_with_label(
+            "worker1",
+            WorkerActor::new(
+                WorkerParams {
+                    world_size: 2,
+                    rank: 1,
+                    device_index: Some(1),
+                    controller_actor: controller_ref,
+                },
+                Flattrs::default(),
             )
-            .unwrap();
+            .await
+            .unwrap(),
+        );
 
         let unique_id = CommId::new().unwrap();
         worker_handle1

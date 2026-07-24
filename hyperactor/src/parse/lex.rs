@@ -37,6 +37,8 @@ pub(crate) enum TokenKind {
     Colon,
     /// `@`
     At,
+    /// `!`
+    Bang,
     /// `<`
     LessThan,
     /// `>`
@@ -52,6 +54,7 @@ impl TokenKind {
             Self::Dot => ".",
             Self::Colon => ":",
             Self::At => "@",
+            Self::Bang => "!",
             Self::LessThan => "<",
             Self::GreaterThan => ">",
             Self::Eof => "end of input",
@@ -64,6 +67,7 @@ impl TokenKind {
             Self::Dot => "\".\"",
             Self::Colon => "\":\"",
             Self::At => "\"@\"",
+            Self::Bang => "\"!\"",
             Self::LessThan => "\"<\"",
             Self::GreaterThan => "\">\"",
             Self::Eof => "end of input",
@@ -82,7 +86,7 @@ pub(crate) struct Token<'a> {
     pub(crate) span: Span,
 }
 
-impl<'a> Token<'a> {
+impl Token<'_> {
     pub(crate) fn eof(pos: usize) -> Self {
         Self {
             kind: TokenKind::Eof,
@@ -119,6 +123,13 @@ impl<'a> Lexer<'a> {
     /// Create a new lexer.
     pub(crate) fn new(input: &'a str) -> Self {
         Self { input, offset: 0 }
+    }
+
+    /// Create a lexer positioned at `offset` within `input`. To bound
+    /// the scan, pass an `input` already truncated to the desired end;
+    /// the lexer emits no tokens past `input.len()`.
+    pub(crate) fn new_at(input: &'a str, offset: usize) -> Self {
+        Self { input, offset }
     }
 }
 
@@ -158,6 +169,14 @@ impl<'a> Iterator for Lexer<'a> {
                     span: Span::new(start, self.offset),
                 }
             }
+            b'!' => {
+                self.offset += 1;
+                Token {
+                    kind: TokenKind::Bang,
+                    text: &self.input[start..self.offset],
+                    span: Span::new(start, self.offset),
+                }
+            }
             b'<' => {
                 self.offset += 1;
                 Token {
@@ -175,7 +194,9 @@ impl<'a> Iterator for Lexer<'a> {
                 }
             }
             _ => {
-                let len = rest.find(['.', ':', '@', '<', '>']).unwrap_or(rest.len());
+                let len = rest
+                    .find(['.', ':', '@', '!', '<', '>'])
+                    .unwrap_or(rest.len());
                 self.offset += len;
                 Token {
                     kind: TokenKind::Text,
@@ -194,7 +215,7 @@ mod tests {
 
     #[test]
     fn test_lexer_tokenizes_id_and_ref_syntax() {
-        let tokens = Lexer::new("controller<abc>.local:7@inproc://0").collect::<Vec<_>>();
+        let tokens = Lexer::new("controller<abc>.local!introspect@inproc://0").collect::<Vec<_>>();
         assert_eq!(
             tokens,
             vec![
@@ -229,34 +250,34 @@ mod tests {
                     span: Span::new(16, 21),
                 },
                 Token {
-                    kind: TokenKind::Colon,
-                    text: ":",
+                    kind: TokenKind::Bang,
+                    text: "!",
                     span: Span::new(21, 22),
                 },
                 Token {
                     kind: TokenKind::Text,
-                    text: "7",
-                    span: Span::new(22, 23),
+                    text: "introspect",
+                    span: Span::new(22, 32),
                 },
                 Token {
                     kind: TokenKind::At,
                     text: "@",
-                    span: Span::new(23, 24),
+                    span: Span::new(32, 33),
                 },
                 Token {
                     kind: TokenKind::Text,
                     text: "inproc",
-                    span: Span::new(24, 30),
+                    span: Span::new(33, 39),
                 },
                 Token {
                     kind: TokenKind::Colon,
                     text: ":",
-                    span: Span::new(30, 31),
+                    span: Span::new(39, 40),
                 },
                 Token {
                     kind: TokenKind::Text,
                     text: "//0",
-                    span: Span::new(31, 34),
+                    span: Span::new(40, 43),
                 },
             ]
         );

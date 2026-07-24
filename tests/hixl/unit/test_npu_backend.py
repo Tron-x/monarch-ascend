@@ -183,3 +183,8 @@ except Exception as e:
 # ============================================================
 print_section("Done")
 print("NPU backend validation complete.")
+
+# Do not leave multiple proc meshes for the one-second atexit fallback to reap.
+from monarch._src.actor.actor_mesh import shutdown_context
+
+shutdown_context().get(timeout=75.0)

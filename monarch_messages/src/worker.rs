@@ -25,11 +25,11 @@ use derive_more::From;
 use derive_more::TryInto;
 use enum_as_inner::EnumAsInner;
 use hyperactor as reference;
-use hyperactor::Bind;
 use hyperactor::HandleClient;
 use hyperactor::Handler;
 use hyperactor::RefClient;
-use hyperactor::Unbind;
+use monarch_gil::GilSite;
+use monarch_gil::monarch_with_gil_blocking;
 use monarch_types::ReduceOp;
 use monarch_types::SerializablePyErr;
 use monarch_types::UniqueId;
@@ -184,10 +184,10 @@ impl Ref {
         if let Ok(ref_) = obj.extract::<Ref>() {
             return Ok(ref_);
         }
-        if let Ok(func) = obj.getattr(attr_name) {
-            if let Ok(Ok(val)) = func.call0().map(|val| val.extract::<u64>()) {
-                return Ok(val.into());
-            }
+        if let Ok(func) = obj.getattr(attr_name)
+            && let Ok(Ok(val)) = func.call0().map(|val| val.extract::<u64>())
+        {
+            return Ok(val.into());
         }
         Err(PyValueError::new_err("Could not convert object to Ref"))
     }
@@ -307,7 +307,7 @@ impl Cloudpickle {
 }
 
 impl Cloudpickle {
-    pub fn dumps<'py>(obj: Bound<'py, PyAny>) -> PyResult<Self> {
+    pub fn dumps(obj: Bound<'_, PyAny>) -> PyResult<Self> {
         let py = obj.py();
         let dumps = cloudpickle_dumps(py);
         let bytes_obj = dumps.call1((obj,))?;
@@ -352,7 +352,7 @@ impl ArgsKwargs {
         args: Vec<WireValue>,
         kwargs: HashMap<String, WireValue>,
     ) -> PyResult<Self> {
-        Python::attach(|py| {
+        monarch_with_gil_blocking(GilSite::Convert, |py| {
             // Convert WireValue args to Python objects
             let py_args: Vec<Bound<'_, PyAny>> = args
                 .into_iter()
@@ -414,10 +414,8 @@ impl ResolvableFunction {
     /// when called.
     pub fn panic_if_requested(&self) {
         match self {
-            Self::FunctionPath(func) => {
-                if func.path == "__test_panic" {
-                    panic!("__test_panic called");
-                }
+            Self::FunctionPath(func) if func.path == "__test_panic" => {
+                panic!("__test_panic called");
             }
             _ => (),
         }
@@ -666,9 +664,7 @@ impl From<BorrowError> for CallFunctionError {
     Deserialize,
     Debug,
     Named,
-    EnumAsInner,
-    Bind,
-    Unbind
+    EnumAsInner
 )]
 pub enum WorkerMessage {
     /// Initialize backend network state.
@@ -956,7 +952,4 @@ pub struct WorkerParams {
 }
 wirevalue::register_type!(WorkerParams);
 
-hyperactor::behavior!(
-    WorkerActor,
-    WorkerMessage { cast = true },
-);
+hyperactor::behavior!(WorkerActor, WorkerMessage,);

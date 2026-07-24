@@ -47,11 +47,11 @@
 //! | Actor     | `addr,proc_name,name[pid]`    |
 
 #![feature(anonymous_lifetime_in_impl_trait)]
-#![feature(assert_matches)]
 #![feature(associated_type_defaults)]
 #![feature(box_patterns)]
 #![feature(btree_cursors)]
 #![feature(error_reporter)]
+#![feature(exact_size_is_empty)]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(never_type)]
 #![feature(panic_update_hook)]
@@ -64,8 +64,13 @@ pub mod actor;
 pub mod actor_local;
 pub mod addr;
 pub mod channel;
+pub mod client;
 pub mod config;
 pub mod context;
+pub mod endpoint;
+pub mod environment;
+/// Gateway management for proc connectivity.
+pub mod gateway;
 pub mod id;
 mod init;
 pub mod introspect;
@@ -79,6 +84,8 @@ pub mod port;
 pub mod proc;
 pub mod ref_;
 pub mod remote;
+pub mod runtime_identity;
+pub(crate) mod sequenced;
 mod signal_handler;
 mod stdio_redirect;
 pub mod subject;
@@ -87,6 +94,7 @@ pub mod sync;
 /// Test utilities.
 pub mod testing;
 pub mod time;
+pub mod value_mesh;
 
 #[cfg(fbcode_build)]
 pub mod meta;
@@ -106,28 +114,34 @@ pub mod internal_macro_support {
 }
 
 pub use actor::Actor;
+pub use actor::ActorGuard;
 pub use actor::ActorHandle;
+pub use actor::AnyActorGuard;
+pub use actor::AnyActorHandle;
 pub use actor::Handler;
 pub use actor::HandlerInfo;
 pub use actor::RemoteHandles;
 pub use actor::RemoteSpawn;
 pub use actor_local::ActorLocal;
 pub use addr::ActorAddr;
+pub use addr::Addr;
 pub use addr::AddrParseError;
-pub use addr::Address;
 pub use addr::Location;
 pub use addr::PortAddr;
 pub use addr::ProcAddr;
-#[doc(inline)]
-pub use hyperactor_macros::Bind;
+pub use client::Client;
+pub use endpoint::Endpoint;
+pub use endpoint::EndpointLocation;
+pub use endpoint::RemoteEndpoint;
+pub use environment::ActorEnvironment;
+pub use environment::ActorEnvironmentError;
+pub use gateway::Gateway;
 #[doc(inline)]
 pub use hyperactor_macros::HandleClient;
 #[doc(inline)]
 pub use hyperactor_macros::Handler;
 #[doc(inline)]
 pub use hyperactor_macros::RefClient;
-#[doc(inline)]
-pub use hyperactor_macros::Unbind;
 #[doc(inline)]
 pub use hyperactor_macros::behavior;
 #[doc(inline)]
@@ -151,6 +165,7 @@ pub use hyperactor_telemetry::declare_static_timer;
 pub use hyperactor_telemetry::key_value;
 pub use hyperactor_telemetry::kv_pairs;
 pub use id::ActorId;
+pub use id::Id;
 pub use id::Label;
 pub use id::PortId;
 pub use id::ProcId;
@@ -167,20 +182,21 @@ pub use mailbox::Message;
 pub use mailbox::OncePortHandle;
 pub use mailbox::PortHandle;
 pub use mailbox::RemoteMessage;
-pub use proc::AttachRequest;
-pub use proc::AttachRx;
-pub use proc::BootstrapAssignment;
+pub use port::ControlPort;
+pub use port::Port;
 pub use proc::Context;
-pub use proc::Host2Client;
 pub use proc::Instance;
 pub use proc::InstanceCell;
 pub use proc::Proc;
+pub use proc::StatusMessage;
 pub use proc::WeakProc;
 pub use ref_::ActorRef;
 pub use ref_::OncePortRef;
+#[doc(hidden)]
+pub use ref_::OncePortRefRepr;
 pub use ref_::PortRef;
-pub use ref_::UnboundPort;
-pub use ref_::UnboundPortKind;
+#[doc(hidden)]
+pub use ref_::PortRefRepr;
 pub use remote::Accepts;
 /// Rank or position index used by distributed mesh helpers.
 pub type Index = usize;
@@ -199,6 +215,33 @@ pub use signal_handler::sigpipe_disposition;
 #[doc(inline)]
 pub use signal_handler::unregister_signal_cleanup;
 
+/// Serve the current gateway on the provided channel address.
+pub fn serve(
+    addr: channel::ChannelAddr,
+) -> Result<gateway::GatewayServeHandle, channel::ChannelError> {
+    Gateway::current().serve(addr)
+}
+
+/// Spawn a root actor with a fresh uid labeled from the actor type on the current proc.
+pub fn spawn<A: Actor>(actor: A) -> ActorHandle<A> {
+    Proc::current().spawn(actor)
+}
+
+/// Spawn a root actor with a fresh uid carrying a display label on the current proc.
+pub fn spawn_with_label<A: Actor>(label: &str, actor: A) -> ActorHandle<A> {
+    Proc::current().spawn_with_label(label, actor)
+}
+
+/// Spawn a root actor using an explicit uid on the current proc.
+pub fn spawn_with_uid<A: Actor>(uid: Uid, actor: A) -> anyhow::Result<ActorHandle<A>> {
+    Proc::current().spawn_with_uid(uid, actor)
+}
+
+/// Create a client actor on the current proc.
+pub fn client(label: &str) -> Client {
+    Proc::current().client(label)
+}
+
 mod private {
     /// Public trait in a private module for sealing traits within this crate:
     /// [Sealed trait pattern](https://rust-lang.github.io/api-guidelines/future-proofing.html#sealed-traits-protect-against-downstream-implementations-c-sealed).
@@ -209,6 +252,14 @@ mod private {
     impl<A: crate::Actor> Sealed for &crate::proc::Instance<A> {}
     impl<A: crate::Actor> Sealed for crate::proc::Context<'_, A> {}
     impl<A: crate::Actor> Sealed for &crate::proc::Context<'_, A> {}
+    impl Sealed for crate::client::Client {}
+    impl Sealed for &crate::client::Client {}
     impl Sealed for crate::mailbox::Mailbox {}
     impl Sealed for &crate::mailbox::Mailbox {}
+    impl<A: crate::Actor> Sealed for &crate::actor::ActorHandle<A> {}
+    impl<M: crate::Message> Sealed for &crate::mailbox::PortHandle<M> {}
+    impl<M: crate::Message> Sealed for crate::mailbox::OncePortHandle<M> {}
+    impl<A: crate::actor::Referable> Sealed for &crate::ref_::ActorRef<A> {}
+    impl<M: crate::RemoteMessage> Sealed for &crate::ref_::PortRef<M> {}
+    impl<M: crate::RemoteMessage> Sealed for crate::ref_::OncePortRef<M> {}
 }

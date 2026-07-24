@@ -66,7 +66,6 @@ if TYPE_CHECKING:
             mesh_bootstrap_enable_pdeathsig: NotRequired[bool]
             mesh_terminate_concurrency: NotRequired[int]
             mesh_terminate_timeout: NotRequired[str]
-            shared_asyncio_runtime: NotRequired[bool]
             small_write_threshold: NotRequired[int]
             max_cast_dimension_size: NotRequired[int]
             remote_alloc_bind_to_inaddr_any: NotRequired[bool]
@@ -87,7 +86,9 @@ if TYPE_CHECKING:
             rdma_allow_tcp_fallback: NotRequired[bool]
             rdma_disable_ibverbs: NotRequired[bool]
             rdma_max_chunk_size_mb: NotRequired[int]
+            rdma_ibverbs_target: NotRequired[str]
 
+        # pyrefly: ignore [invalid-annotation]
         ConfigureKwargsType = Unpack[ConfigureArgs]
     else:
         ConfigureKwargsType = object
@@ -140,7 +141,6 @@ def configure(**kwargs: "ConfigureKwargsType") -> None:
             mesh_terminate_timeout: Timeout per child during graceful termination (humantime).
 
         Runtime and buffering:
-            shared_asyncio_runtime: Share asyncio runtime across actors.
             small_write_threshold: Threshold below which writes are copied (bytes).
 
         Mesh configuration:
@@ -183,6 +183,11 @@ def configure(**kwargs: "ConfigureKwargsType") -> None:
                 causing all RDMA operations to use the TCP fallback backend.
             rdma_max_chunk_size_mb: Maximum chunk size in megabytes for RDMA
                 transfers.
+            rdma_ibverbs_target: Default ibverbs device target for managers
+                without an explicit target. Accepts ``"cpu:<numa>"``,
+                ``"gpu:<ordinal>"``, or ``"nic:<name>"``. Empty preserves
+                automatic selection. Non-empty value syntax is validated when
+                the RDMA manager starts.
 
         **kwargs: Reserved for future configuration keys exposed by Rust bindings.
     """
@@ -273,7 +278,6 @@ def configured(**overrides: "ConfigureKwargsType") -> Iterator[Dict[str, Any]]:
     finally:
         # Restore previous runtime
         clear_runtime_config()
-        # pyre-fixme[6]: Values are already from the config function.
         configure(**prev)
 
 
@@ -298,7 +302,7 @@ def parametrize_config(
         >>>
         >>> @parametrize_config(
         ...     actor_queue_dispatch={True, False},
-        ...     shared_asyncio_runtime={True, False},
+        ...     prefix_with_rank={True, False},
         ... )
         ... async def test_actor_feature():
         ...     # Test runs 4 times: all combinations of the two bool options
@@ -309,7 +313,7 @@ def parametrize_config(
     import inspect
     import itertools
 
-    import pytest  # pyre-ignore[21]: pytest is a test-only dependency
+    import pytest
 
     if not config_options:
         raise ValueError("parametrize_config requires at least one config option")
@@ -341,7 +345,6 @@ def parametrize_config(
             async def async_wrapper(
                 _config_overrides: Dict[str, Any], *args: Any, **kwargs: Any
             ) -> Any:
-                # pyre-fixme[6]: Values are checked inside the function.
                 with configured(**_config_overrides):
                     return await fn(*args, **kwargs)
 
@@ -353,7 +356,6 @@ def parametrize_config(
             def sync_wrapper(
                 _config_overrides: Dict[str, Any], *args: Any, **kwargs: Any
             ) -> Any:
-                # pyre-fixme[6]: Values are checked inside the function.
                 with configured(**_config_overrides):
                     return fn(*args, **kwargs)
 
@@ -390,19 +392,19 @@ def parametrize_config_pointwise(
         >>>
         >>> @parametrize_config_pointwise(
         ...     actor_queue_dispatch=[True, False],
-        ...     shared_asyncio_runtime=[True, False],
+        ...     prefix_with_rank=[True, False],
         ... )
         ... async def test_actor_feature():
         ...     # Runs 2 times:
-        ...     # (actor_queue_dispatch=True, shared_asyncio_runtime=True)
-        ...     # (actor_queue_dispatch=False, shared_asyncio_runtime=False)
+        ...     # (actor_queue_dispatch=True, prefix_with_rank=True)
+        ...     # (actor_queue_dispatch=False, prefix_with_rank=False)
         ...     pass
     """
     import asyncio
     import functools
     import inspect
 
-    import pytest  # pyre-ignore[21]: pytest is a test-only dependency
+    import pytest
 
     if not config_options:
         raise ValueError(
@@ -438,7 +440,6 @@ def parametrize_config_pointwise(
             async def async_wrapper(
                 _config_overrides: Dict[str, Any], *args: Any, **kwargs: Any
             ) -> Any:
-                # pyre-fixme[6]: Values are checked inside the function.
                 with configured(**_config_overrides):
                     return await fn(*args, **kwargs)
 
@@ -450,7 +451,6 @@ def parametrize_config_pointwise(
             def sync_wrapper(
                 _config_overrides: Dict[str, Any], *args: Any, **kwargs: Any
             ) -> Any:
-                # pyre-fixme[6]: Values are checked inside the function.
                 with configured(**_config_overrides):
                     return fn(*args, **kwargs)
 

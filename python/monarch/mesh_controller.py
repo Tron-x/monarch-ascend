@@ -101,6 +101,7 @@ class PdbWrapper(pdb.Pdb):
             # not the nested one inside session.run. This means that the local
             # variables are what gets printed, etc. To do this
             # we first execute up 2 to get to that frame.
+            # pyrefly: ignore [bad-argument-type]
             self.do_up(2)
         return r
 
@@ -120,6 +121,7 @@ class PdbWrapper(pdb.Pdb):
             self.stdout = sys.stdout
         return r
 
+    # pyrefly: ignore [bad-override]
     def set_trace(self):
         from monarch._rust_bindings.monarch_messages.debugger import DebuggerAction
 
@@ -426,6 +428,7 @@ def spawn_tensor_engine(proc_mesh: "ProcMesh") -> DeviceMesh:
     gpus = proc_mesh.sizes.get("gpus", 1)
 
     # we currently block on the creation of the proc mesh, but conceivably we could init concurrently here.
+    # pyrefly: ignore [bad-argument-count, bad-argument-type]
     backend_ctrl = Controller(context().actor_instance, proc_mesh._proc_mesh.block_on())
     client = MeshClient(cast("TController", backend_ctrl), proc_mesh.size(), gpus)
     dm = DeviceMesh(
@@ -474,9 +477,14 @@ def _create_call_method_indirect_message(
     ]
     broker_id: Tuple[str, int] = client._mesh_controller.broker_id
     actor_msg_kind = PythonMessageKind.CallMethodIndirect(
-        method_name, broker_id, seq, unflatten_args
+        # pyrefly: ignore [bad-argument-count]
+        method_name,
+        broker_id,
+        seq,
+        unflatten_args,
     )
 
+    # pyrefly: ignore [bad-return]
     return (actor_msg_kind, broker_id)
 
 
@@ -544,6 +552,7 @@ def _create_actor_message_kind(
     actor_msg, broker_id = _create_call_method_indirect_message(
         method_name, client, ident, refs
     )
+    # pyrefly: ignore [bad-argument-type]
     worker_msg = SendResultOfActorCall(ident, broker_id, tensors, [], stream_ref)
     client.send(mesh._ndslice, worker_msg)
     # we have to ask for status updates
@@ -581,7 +590,12 @@ def actor_rref(endpoint, pickling_state: PicklingState):
         result_msg = None
 
     actor_msg_kind, broker_id = _create_call_method_indirect_message(
-        endpoint._name, mesh.client, seq, refs
+        # pyrefly: ignore [bad-argument-type]
+        endpoint._name,
+        # pyrefly: ignore [bad-argument-type]
+        mesh.client,
+        seq,
+        refs,
     )
     actor_msg = PendingMessage(actor_msg_kind, pickling_state)
     endpoint._actor_mesh.cast_unresolved(
@@ -599,6 +613,7 @@ def actor_rref(endpoint, pickling_state: PicklingState):
             broker_id,
             refs,
             cast("List[Ref]", mutates),
+            # pyrefly: ignore [bad-argument-type]
             stream._active._to_ref(mesh.client),
         )
     )

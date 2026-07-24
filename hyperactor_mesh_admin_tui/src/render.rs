@@ -15,6 +15,7 @@
 // - error
 // - lang_name
 // - refresh_interval_label
+// - show_help
 // - show_stopped
 // - show_system
 // - theme
@@ -30,6 +31,7 @@ use ratatui::layout::Constraint;
 use ratatui::layout::Direction;
 use ratatui::layout::Layout;
 
+use self::detail_pane::detail_content_clipped;
 use self::detail_pane::render_detail_pane;
 use self::status_bar::render_footer;
 use self::status_bar::render_header;
@@ -50,7 +52,8 @@ pub(crate) fn ui(frame: &mut ratatui::Frame<'_>, app: &App) {
         ])
         .split(frame.area());
 
-    render_header(frame, chunks[0], app);
+    let detail_clipped = detail_content_clipped(app, chunks[1].height);
+    render_header(frame, chunks[0], app, detail_clipped);
     render_body(frame, chunks[1], app);
     render_footer(frame, chunks[2], app);
 }

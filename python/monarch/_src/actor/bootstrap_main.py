@@ -11,8 +11,6 @@ This is the main function for the boostrapping a new Proc.
 """
 
 import asyncio
-import importlib.resources
-import logging
 import multiprocessing
 import os
 import platform
@@ -46,7 +44,9 @@ def invoke_main() -> None:
         # if this is invoked with the stdout piped somewhere, then print
         # changes its buffering behavior. So we default to the standard
         # behavior of std out as if it were a terminal.
+        # pyrefly: ignore [missing-attribute]
         sys.stdout.reconfigure(line_buffering=True)
+        # pyrefly: ignore [unknown-name]
         global bootstrap_main
 
         # TODO: figure out what from worker_main.py we should reproduce here.
@@ -61,18 +61,6 @@ def invoke_main() -> None:
             # we can stream python logs now; no need to forward them to rust processes
             pass
             # install opentelemetry tracing
-
-        try:
-            with (
-                importlib.resources.as_file(
-                    importlib.resources.files("monarch") / "py-spy"
-                ) as pyspy,
-            ):
-                if pyspy.exists():
-                    os.environ["PYSPY_BIN"] = str(pyspy)
-                # fallback to using local py-spy
-        except Exception as e:
-            logging.warning(f"Failed to set up py-spy: {e}")
 
         from monarch._src.actor.debugger.breakpoint import remote_breakpointhook
 

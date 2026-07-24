@@ -9,14 +9,18 @@ from monarch._rust_bindings.monarch_distributed_telemetry import (
     query_engine as query_engine,
 )
 
-def enable_record_batch_tracing(batch_size: int) -> None:
-    """Register a RecordBatchSink with the telemetry system."""
+def _start_socket_ingest(
+    scanner: database_scanner.DatabaseScanner, socket_path: str
+) -> None:
+    """Start Unix-socket ingest for a database scanner."""
     ...
 
-def get_record_batch_flush_count() -> int:
-    """Get the total number of RecordBatches flushed by the sink."""
+def _register_trace_entity_schemas(
+    scanner: database_scanner.DatabaseScanner,
+) -> None:
+    """Register trace and entity schemas for a database scanner."""
     ...
 
-def reset_record_batch_flush_count() -> None:
-    """Reset the flush counter to zero."""
+def _set_unix_socket_sink_path(socket_path: str) -> None:
+    """Activate the process-global Unix socket sink."""
     ...

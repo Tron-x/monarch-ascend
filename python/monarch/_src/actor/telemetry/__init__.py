@@ -7,9 +7,11 @@
 # pyre-strict
 
 
+import functools
+import inspect
 import logging
 import warnings
-from typing import Optional, Sequence
+from typing import Callable, Dict, Optional, overload, Sequence, TypeVar
 
 import opentelemetry.metrics as metrics  # @manual=fbsource//third-party/pypi/opentelemetry-api:opentelemetry-api
 import opentelemetry.trace as trace  # @manual=fbsource//third-party/pypi/opentelemetry-api:opentelemetry-api
@@ -24,6 +26,7 @@ from monarch._rust_bindings.monarch_hyperactor.telemetry import (  # @manual=//m
 from opentelemetry.context import Context
 from opentelemetry.metrics import CallbackT
 from opentelemetry.util.types import Attributes
+from typing_extensions import ParamSpec
 
 
 def _current_actor_id() -> ActorAddr | None:
@@ -35,6 +38,106 @@ def _current_actor_id() -> ActorAddr | None:
 
 def span(name: str) -> PySpan:
     return PySpan(name, _current_actor_id())
+
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+@overload
+def traced(fn: Callable[_P, _R]) -> Callable[_P, _R]: ...
+
+
+@overload
+def traced(*, name: str) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]: ...
+
+
+def traced(
+    fn: Callable[_P, _R] | None = None, *, name: str | None = None
+) -> Callable[_P, _R] | Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    """Decorator that wraps a function in a telemetry span.
+
+    Works with both sync and async functions. The span is automatically
+    associated with the current actor context, if any. When no name is
+    provided, the function's ``__name__`` is used as the span name.
+
+    Usage::
+
+        @traced
+        async def do_work():
+            ...
+
+        @traced(name="custom_name")
+        def compute():
+            ...
+    """
+
+    def decorator(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+        span_name: str = name if name is not None else fn.__name__
+
+        if inspect.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            # pyrefly: ignore [bad-return]
+            async def async_wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+                with span(span_name):
+                    return await fn(*args, **kwargs)  # type: ignore[misc]
+
+            return async_wrapper  # type: ignore[return-value]
+        else:
+
+            @functools.wraps(fn)
+            # pyrefly: ignore [bad-return]
+            def sync_wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+                with span(span_name):
+                    return fn(*args, **kwargs)
+
+            return sync_wrapper
+
+    if fn is not None:
+        return decorator(fn)
+    return decorator
+
+
+def log_with_tracing(
+    level: int,
+    msg: object,
+    *args: object,
+    stack_info: bool = False,
+    stacklevel: int = 1,
+    extra: Dict[str, object] | None = None,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Emit a log record through the normal `logging` handler chain and also
+    forward it directly to Rust tracing.
+
+    Use this in library code that must guarantee the event reaches the
+    tracing backend even when no `TracingForwarder` handler is attached to
+    the calling process's loggers (e.g., a non-actor driver process).
+    `stacklevel=1` attributes the record's pathname/lineno/funcName to the
+    immediate caller of `log_with_tracing`.
+    """
+    logger = logger or logging.getLogger(__name__)
+
+    fn, lno, func, sinfo = logger.findCaller(
+        stack_info=stack_info,
+        stacklevel=stacklevel + 1,
+    )
+
+    record = logger.makeRecord(
+        logger.name,
+        level,
+        fn,
+        lno,
+        msg,
+        args,
+        None,
+        func,
+        extra=extra,
+        sinfo=sinfo,
+    )
+    logger.handle(record)
+    forward_to_tracing(record)
 
 
 class TracingForwarder(logging.Handler):
@@ -57,6 +160,7 @@ class Counter(metrics.Counter):
     inner: PyCounter
 
     def __init__(self, name: str) -> None:
+        # pyrefly: ignore [missing-attribute]
         super().__init__(name)
         self.inner = PyCounter(name)
 
@@ -76,6 +180,7 @@ class UpDownCounter(metrics.UpDownCounter):
     inner: PyUpDownCounter
 
     def __init__(self, name: str) -> None:
+        # pyrefly: ignore [missing-attribute]
         super().__init__(name)
         self.inner = PyUpDownCounter(name)
 
@@ -95,6 +200,7 @@ class Histogram(metrics.Histogram):
     inner: PyHistogram
 
     def __init__(self, name: str) -> None:
+        # pyrefly: ignore [missing-attribute]
         super().__init__(name)
         self.inner = PyHistogram(name)
 

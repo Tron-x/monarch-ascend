@@ -21,13 +21,8 @@ use hyperactor::Instance;
 use hyperactor::supervision::ActorSupervisionEvent;
 use hyperactor_mesh::actor_mesh::ActorMesh;
 use hyperactor_mesh::actor_mesh::ActorMeshRef;
-use hyperactor_mesh::sel;
 use monarch_types::py_global;
 use monarch_types::py_module_add_function;
-use ndslice::Region;
-use ndslice::Slice;
-use ndslice::selection::Selection;
-use ndslice::selection::structurally_equal;
 use ndslice::view::Ranked;
 use ndslice::view::RankedSliceable;
 use pyo3::IntoPyObjectExt;
@@ -39,6 +34,7 @@ use pyo3::types::PyBytes;
 use pyo3::types::PyTuple;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
+use tracing::Instrument;
 
 use crate::actor::PythonActor;
 use crate::actor::PythonMessage;
@@ -47,6 +43,7 @@ use crate::context::PyInstance;
 use crate::pickle::PendingMessage;
 use crate::proc::PyActorAddr;
 use crate::pytokio::PyPythonTask;
+use crate::runtime::GilSite;
 use crate::runtime::get_tokio_runtime;
 use crate::runtime::monarch_with_gil;
 use crate::runtime::monarch_with_gil_blocking;
@@ -54,11 +51,6 @@ use crate::shape::PyRegion;
 use crate::supervision::Supervisable;
 use crate::supervision::SupervisionError;
 
-py_global!(
-    is_pending_pickle_allowed,
-    "monarch._src.actor.pickle",
-    "is_pending_pickle_allowed"
-);
 py_global!(_pickle, "monarch._src.actor.actor_mesh", "_pickle");
 
 py_global!(
@@ -67,6 +59,26 @@ py_global!(
     "Shared"
 );
 
+/// Closed actor-mesh selection surface used by public send APIs.
+///
+/// Public Python APIs expose only `"all"` and `"choose"`. Keep that
+/// invariant explicit here so arbitrary `ndslice::Selection` values stay out
+/// of the public mesh-casting surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AllOrChoose {
+    All,
+    Choose,
+}
+
+impl AllOrChoose {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Choose => "choose",
+        }
+    }
+}
+
 /// Trait defining the common interface for actor mesh, mesh ref and actor mesh implementations.
 /// This corresponds to the Python ActorMeshProtocol ABC.
 pub(crate) trait ActorMeshProtocol: Send + Sync {
@@ -74,7 +86,7 @@ pub(crate) trait ActorMeshProtocol: Send + Sync {
     fn cast(
         &self,
         message: PythonMessage,
-        selection: Selection,
+        selection: AllOrChoose,
         instance: &Instance<PythonActor>,
     ) -> PyResult<()>;
 
@@ -87,7 +99,7 @@ pub(crate) trait ActorMeshProtocol: Send + Sync {
     fn cast_with_headers(
         &self,
         message: PythonMessage,
-        selection: Selection,
+        selection: AllOrChoose,
         instance: &Instance<PythonActor>,
         _caller_headers: hyperactor_config::Flattrs,
     ) -> PyResult<()> {
@@ -101,7 +113,7 @@ pub(crate) trait ActorMeshProtocol: Send + Sync {
     fn cast_unresolved(
         &self,
         message: PendingMessage,
-        selection: Selection,
+        selection: AllOrChoose,
         instance: &Instance<PythonActor>,
     ) -> PyResult<()> {
         let message = get_tokio_runtime().block_on(message.resolve())?;
@@ -115,7 +127,7 @@ pub(crate) trait ActorMeshProtocol: Send + Sync {
     fn cast_unresolved_with_headers(
         &self,
         message: PendingMessage,
-        selection: Selection,
+        selection: AllOrChoose,
         instance: &Instance<PythonActor>,
         caller_headers: hyperactor_config::Flattrs,
     ) -> PyResult<()> {
@@ -124,6 +136,11 @@ pub(crate) trait ActorMeshProtocol: Send + Sync {
     }
 
     fn __reduce__<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)>;
+
+    /// The serializable reference for this mesh, for the out-of-band `refs`
+    /// table. Required so every impl chooses: hold a resolved ref and return
+    /// it, or (a pending mesh) have none and error explicitly.
+    fn mesh_ref(&self) -> PyResult<ActorMeshRef<PythonActor>>;
 
     /// Stop the actor mesh asynchronously.
     /// Default implementation raises NotImplementedError for types that don't support stopping.
@@ -178,10 +195,10 @@ impl PythonActorMesh {
     }
 }
 
-pub(crate) fn to_hy_sel(selection: &str) -> PyResult<Selection> {
+pub(crate) fn to_all_or_choose(selection: &str) -> PyResult<AllOrChoose> {
     match selection {
-        "choose" => Ok(sel!(?)),
-        "all" => Ok(sel!(*)),
+        "choose" => Ok(AllOrChoose::Choose),
+        "all" => Ok(AllOrChoose::All),
         _ => Err(PyErr::new::<PyValueError, _>(format!(
             "Invalid selection: {}",
             selection
@@ -199,7 +216,7 @@ impl PythonActorMesh {
         selection: &str,
         instance: &PyInstance,
     ) -> PyResult<()> {
-        let sel = to_hy_sel(selection)?;
+        let sel = to_all_or_choose(selection)?;
         self.inner.cast(message.clone(), sel, instance.deref())
     }
 
@@ -210,7 +227,7 @@ impl PythonActorMesh {
         selection: &str,
         instance: &PyInstance,
     ) -> PyResult<()> {
-        let sel = to_hy_sel(selection)?;
+        let sel = to_all_or_choose(selection)?;
         let message = message.take()?;
         self.inner.cast_unresolved(message, sel, instance)
     }
@@ -257,7 +274,7 @@ impl From<PyErr> for ClonePyErr {
 
 impl Clone for ClonePyErr {
     fn clone(&self) -> Self {
-        monarch_with_gil_blocking(|py| self.inner.clone_ref(py).into())
+        monarch_with_gil_blocking(GilSite::Convert, |py| self.inner.clone_ref(py).into())
     }
 }
 
@@ -333,7 +350,7 @@ impl ActorMeshProtocol for AsyncActorMesh {
     fn cast(
         &self,
         _message: PythonMessage,
-        _selection: Selection,
+        _selection: AllOrChoose,
         _instance: &Instance<PythonActor>,
     ) -> PyResult<()> {
         panic!("not implemented")
@@ -342,7 +359,7 @@ impl ActorMeshProtocol for AsyncActorMesh {
     fn cast_unresolved(
         &self,
         message: PendingMessage,
-        selection: Selection,
+        selection: AllOrChoose,
         instance: &Instance<PythonActor>,
     ) -> PyResult<()> {
         self.cast_unresolved_with_headers(
@@ -356,7 +373,7 @@ impl ActorMeshProtocol for AsyncActorMesh {
     fn cast_unresolved_with_headers(
         &self,
         message: PendingMessage,
-        selection: Selection,
+        selection: AllOrChoose,
         instance: &Instance<PythonActor>,
         caller_headers: hyperactor_config::Flattrs,
     ) -> PyResult<()> {
@@ -366,58 +383,68 @@ impl ActorMeshProtocol for AsyncActorMesh {
             PythonMessageKind::CallMethod { response_port, .. } => response_port.clone(),
             _ => None,
         };
-        self.push(async move {
-            let result = async {
-                let resolved = message.resolve().await?;
-                mesh.await?
-                    .cast_with_headers(resolved, selection, &instance, caller_headers)
-            }
-            .await;
-            if let (Some(mut port_ref), Err(pyerr)) = (port, result) {
-                let _ = monarch_with_gil(|py: Python<'_>| {
-                    let exception_str = crate::logging::format_traceback(py, &pyerr);
-                    tracing::error!(
-                        actor_id = instance.self_id().to_string(),
-                        "error occurred during cast unresolved: {}",
-                        exception_str
-                    );
-
-                    // Endpoint calls create a response port: the
-                    // PortRef is sent to the remote worker (to send
-                    // results back), and collect_valuemesh owns the
-                    // PortReceiver. If mesh.cast() fails here, we try
-                    // to send the exception back to the caller via
-                    // the PortRef ourselves. But a supervision event
-                    // can cause collect_valuemesh to drop the
-                    // PortReceiver (removing the port from the
-                    // mailbox) before we get here. Disable
-                    // return-undeliverable so a delivery failure
-                    // doesn't bounce back and crash the root client.
-                    //
-                    // TODO: Tie the lifetime of this queued work to
-                    // the PortReceiver (e.g. a cancellation token set
-                    // on drop) so we can distinguish
-                    // supervision-caused failures — where the caller
-                    // already knows — from other cast errors where
-                    // the caller actually needs this exception.
-
-                    port_ref.set_return_undeliverable(false);
-
-                    let mut state =
-                        crate::pickle::pickle(py, pyerr.into_value(py).into_any(), false, false)?;
-                    let _ = port_ref.send(
-                        &instance,
-                        PythonMessage::new_from_buf(
-                            PythonMessageKind::Exception { rank: Some(0) },
-                            state.take_inner()?.take_buffer(),
-                        ),
-                    );
-
-                    Ok::<_, PyErr>(())
-                })
+        self.push(
+            async move {
+                let result = async {
+                    let resolved = match message.try_resolve_now()? {
+                        Ok(resolved) => resolved,
+                        Err(message) => message.resolve().await?,
+                    };
+                    mesh.await?
+                        .cast_with_headers(resolved, selection, &instance, caller_headers)
+                }
                 .await;
+                if let (Some(mut port_ref), Err(pyerr)) = (port, result) {
+                    let _ = monarch_with_gil(GilSite::Traceback, |py: Python<'_>| {
+                        let exception_str = crate::logging::format_traceback(py, &pyerr);
+                        tracing::error!(
+                            actor_id = instance.self_addr().to_string(),
+                            "error occurred during cast unresolved: {}",
+                            exception_str
+                        );
+
+                        // Endpoint calls create a response port: the
+                        // PortRef is sent to the remote worker (to send
+                        // results back), and collect_valuemesh owns the
+                        // PortReceiver. If mesh.cast() fails here, we try
+                        // to send the exception back to the caller via
+                        // the PortRef ourselves. But a supervision event
+                        // can cause collect_valuemesh to drop the
+                        // PortReceiver (removing the port from the
+                        // mailbox) before we get here. Disable
+                        // return-undeliverable so a delivery failure
+                        // doesn't bounce back and crash the root client.
+                        //
+                        // TODO: Tie the lifetime of this queued work to
+                        // the PortReceiver (e.g. a cancellation token set
+                        // on drop) so we can distinguish
+                        // supervision-caused failures — where the caller
+                        // already knows — from other cast errors where
+                        // the caller actually needs this exception.
+
+                        port_ref.set_return_undeliverable(false);
+
+                        let mut state = crate::pickle::pickle(
+                            py,
+                            pyerr.into_value(py).into_any(),
+                            false,
+                            false,
+                        )?;
+                        let _ = port_ref.post(
+                            &instance,
+                            PythonMessage::new_from_buf(
+                                PythonMessageKind::Exception { rank: Some(0) },
+                                state.take_inner()?.take_buffer(),
+                            ),
+                        );
+
+                        Ok::<_, PyErr>(())
+                    })
+                    .await;
+                }
             }
-        });
+            .instrument(tracing::debug_span!("AsyncActorMesh::cast")),
+        );
         Ok(())
     }
 
@@ -429,17 +456,33 @@ impl ActorMeshProtocol for AsyncActorMesh {
                 let shared =
                     PyPythonTask::new(async move { Ok(PythonActorMesh::from_impl(fut.await?)) })?
                         .spawn_abortable()?;
+                let shared = Py::new(py, shared)?;
+                if crate::pickle::reserve_mesh_reference_if_active(shared.clone_ref(py)) {
+                    let pop_fn = py
+                        .import("monarch._rust_bindings.monarch_hyperactor.pickle")?
+                        .getattr("pop_mesh_reference")?;
+                    return Ok((pop_fn, PyTuple::empty(py).into_any()));
+                }
                 // Get Shared.block_on as an unbound method
                 let block_on = shared_class(py).getattr("block_on")?;
-                let args = PyTuple::new(py, [shared.into_pyobject(py)?])?;
+                let args = PyTuple::new(py, [shared])?;
                 Ok((block_on, args.into_any()))
             }
         }
     }
 
+    fn mesh_ref(&self) -> PyResult<ActorMeshRef<PythonActor>> {
+        // A pending mesh has no serializable ref of its own; the reserve/fill
+        // slot carries it out-of-band. This is a backstop: the happy path never
+        // asks a pending mesh for a ref.
+        Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "pending actor mesh has no serializable ref; it is carried via the reserve/fill slot",
+        ))
+    }
+
     fn stop(&self, instance: &PyInstance, reason: String) -> PyResult<PyPythonTask> {
         let mesh = self.mesh.clone();
-        let instance = monarch_with_gil_blocking(|_py| instance.clone());
+        let instance = monarch_with_gil_blocking(GilSite::Stop, |_py| instance.clone());
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.push(async move {
             let result =
@@ -523,6 +566,10 @@ pub(crate) struct PyActorMeshRef {
     name = "PythonActorMeshImpl",
     module = "monarch._rust_bindings.monarch_hyperactor.actor_mesh"
 )]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "PyO3 #[pyclass] enum; Box wrapping interacts with PyO3 codegen and Python interop — separate diff"
+)]
 pub(crate) enum PythonActorMeshImpl {
     Owned(PyActorMesh),
     Ref(PyActorMeshRef),
@@ -562,7 +609,7 @@ impl ActorMeshProtocol for PythonActorMeshImpl {
     fn cast(
         &self,
         message: PythonMessage,
-        selection: Selection,
+        selection: AllOrChoose,
         instance: &Instance<PythonActor>,
     ) -> PyResult<()> {
         <ActorMeshRef<PythonActor> as ActorMeshProtocol>::cast(
@@ -576,7 +623,7 @@ impl ActorMeshProtocol for PythonActorMeshImpl {
     fn cast_with_headers(
         &self,
         message: PythonMessage,
-        selection: Selection,
+        selection: AllOrChoose,
         instance: &Instance<PythonActor>,
         caller_headers: hyperactor_config::Flattrs,
     ) -> PyResult<()> {
@@ -590,7 +637,8 @@ impl ActorMeshProtocol for PythonActorMeshImpl {
     }
 
     fn stop(&self, instance: &PyInstance, reason: String) -> PyResult<PyPythonTask> {
-        let (slf, instance) = monarch_with_gil_blocking(|_py| (self.clone(), instance.clone()));
+        let (slf, instance) =
+            monarch_with_gil_blocking(GilSite::Stop, |_py| (self.clone(), instance.clone()));
         match slf {
             PythonActorMeshImpl::Owned(mut mesh) => PyPythonTask::new(async move {
                 mesh.mesh
@@ -606,6 +654,11 @@ impl ActorMeshProtocol for PythonActorMeshImpl {
 
     fn __reduce__<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
         self.mesh_ref().__reduce__(py)
+    }
+
+    fn mesh_ref(&self) -> PyResult<ActorMeshRef<PythonActor>> {
+        // `self.mesh_ref()` resolves to the inherent borrow-returning method.
+        Ok(PythonActorMeshImpl::mesh_ref(self).clone())
     }
 
     fn name(&self) -> PyResult<PyPythonTask> {
@@ -637,7 +690,7 @@ impl ActorMeshProtocol for ActorMeshRef<PythonActor> {
     fn cast(
         &self,
         message: PythonMessage,
-        selection: Selection,
+        selection: AllOrChoose,
         instance: &Instance<PythonActor>,
     ) -> PyResult<()> {
         <Self as ActorMeshProtocol>::cast_with_headers(
@@ -652,44 +705,26 @@ impl ActorMeshProtocol for ActorMeshRef<PythonActor> {
     fn cast_with_headers(
         &self,
         message: PythonMessage,
-        selection: Selection,
+        selection: AllOrChoose,
         instance: &Instance<PythonActor>,
         caller_headers: hyperactor_config::Flattrs,
     ) -> PyResult<()> {
-        if structurally_equal(&selection, &Selection::All(Box::new(Selection::True))) {
-            ActorMeshRef::<PythonActor>::cast_with_headers(
+        match selection {
+            AllOrChoose::All => ActorMeshRef::<PythonActor>::cast_with_headers(
                 self,
                 instance,
                 &caller_headers,
-                message.clone(),
+                message,
             )
-            .map_err(cast_error_to_py_error)?;
-        } else if structurally_equal(&selection, &Selection::Any(Box::new(Selection::True))) {
-            let region = Ranked::region(self);
-            let random_rank = fastrand::usize(0..region.num_ranks());
-            let offset = region
-                .slice()
-                .get(random_rank)
-                .map_err(anyhow::Error::from)?;
-            let singleton_region = Region::new(
-                Vec::new(),
-                Slice::new(offset, Vec::new(), Vec::new()).map_err(anyhow::Error::from)?,
-            );
-            ActorMeshRef::<PythonActor>::cast_with_headers(
-                &self.sliced(singleton_region),
+            .map_err(cast_error_to_py_error),
+            AllOrChoose::Choose => ActorMeshRef::<PythonActor>::cast_choose_with_headers(
+                self,
                 instance,
                 &caller_headers,
-                message.clone(),
+                message,
             )
-            .map_err(cast_error_to_py_error)?;
-        } else {
-            return Err(PyRuntimeError::new_err(format!(
-                "invalid selection: {:?}",
-                selection
-            )));
+            .map_err(cast_error_to_py_error),
         }
-
-        Ok(())
     }
 
     /// Stop the actor mesh asynchronously.
@@ -700,6 +735,14 @@ impl ActorMeshProtocol for ActorMeshRef<PythonActor> {
     }
 
     fn __reduce__<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+        if crate::pickle::push_mesh_reference_if_active(crate::actor::MeshRef::Actor(Box::new(
+            self.clone(),
+        ))) {
+            let pop_fn = py
+                .import("monarch._rust_bindings.monarch_hyperactor.pickle")?
+                .getattr("pop_mesh_reference")?;
+            return Ok((pop_fn, pyo3::types::PyTuple::empty(py).into_any()));
+        }
         let bytes = bincode::serde::encode_to_vec(self, bincode::config::legacy())
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let py_bytes = (PyBytes::new(py, &bytes),).into_bound_py_any(py).unwrap();
@@ -708,6 +751,10 @@ impl ActorMeshProtocol for ActorMeshRef<PythonActor> {
             .unwrap();
         let from_bytes = module.getattr("py_actor_mesh_from_bytes").unwrap();
         Ok((from_bytes, py_bytes))
+    }
+
+    fn mesh_ref(&self) -> PyResult<ActorMeshRef<PythonActor>> {
+        Ok(self.clone())
     }
 
     fn name(&self) -> PyResult<PyPythonTask> {
@@ -722,7 +769,7 @@ impl PythonActorMeshImpl {
         Ok(self
             .mesh_ref()
             .get(rank)
-            .map(|r| hyperactor::ActorRef::into_actor_id(r.clone()))
+            .map(|r| hyperactor::ActorRef::into_actor_addr(r.clone()))
             .map(PyActorAddr::from))
     }
 
@@ -800,7 +847,7 @@ pub fn hold_gil_for_test(delay_secs: f64, hold_secs: f64) {
         // Wait before grabbing the GIL (blocking sleep is fine here, we're in a spawned thread)
         thread::sleep(Duration::from_secs_f64(delay_secs));
         // Acquire and hold the GIL - MUST use blocking sleep to keep GIL held
-        Python::attach(|_py| {
+        monarch_with_gil_blocking(GilSite::Test, |_py| {
             tracing::info!("start holding the gil...");
             thread::sleep(Duration::from_secs_f64(hold_secs));
             tracing::info!("end holding the gil...");
@@ -838,34 +885,34 @@ mod tests {
     use async_trait::async_trait;
     use hyperactor::Actor;
     use hyperactor::Context;
+    use hyperactor::Endpoint as _;
     use hyperactor::Handler;
     use hyperactor::Instance;
     use hyperactor::Proc;
     use hyperactor::actor::Signal;
     use hyperactor::channel::ChannelTransport;
     use hyperactor::mailbox;
-    use hyperactor::mailbox::PortReceiver;
-    use hyperactor::proc::WorkCell;
+    use hyperactor::proc::ActorWorkReceiver;
     use hyperactor::supervision::ActorSupervisionEvent;
     use hyperactor_mesh::host_mesh::HostMesh;
     use hyperactor_mesh::mesh_controller::GetSubscriberCount;
     use hyperactor_mesh::supervision::MeshFailure;
     use monarch_types::PickledPyObject;
     use ndslice::extent;
-    use pyo3::Python;
     use tokio::sync::mpsc;
 
     use super::*;
     use crate::actor::PythonActor;
     use crate::actor::PythonActorParams;
+    use crate::config::ACTOR_QUEUE_DISPATCH;
 
     /// Minimal root-client actor for test infrastructure.
     /// Handles MeshFailure by panicking (test failure).
     #[derive(Debug)]
     struct TestClient {
-        signal_rx: PortReceiver<Signal>,
-        supervision_rx: PortReceiver<ActorSupervisionEvent>,
-        work_rx: mpsc::UnboundedReceiver<WorkCell<Self>>,
+        signal_rx: mpsc::UnboundedReceiver<Signal>,
+        supervision_rx: mpsc::UnboundedReceiver<ActorSupervisionEvent>,
+        work_rx: ActorWorkReceiver<Self>,
     }
 
     impl Actor for TestClient {}
@@ -894,8 +941,8 @@ mod tests {
                                 None => break,
                             }
                         }
-                        _ = self.signal_rx.recv() => {}
-                        Ok(event) = self.supervision_rx.recv() => {
+                        Some(_) = self.signal_rx.recv() => {}
+                        Some(event) = self.supervision_rx.recv() => {
                             let _ = instance
                                 .handle_supervision_event(&mut self, event)
                                 .await;
@@ -944,14 +991,14 @@ mod tests {
 
         let mut host_mesh = HostMesh::local_in_process().await.unwrap();
         let proc_mesh = host_mesh
-            .spawn(instance, "test", extent!(replicas = 2), None)
+            .spawn(instance, "test", extent!(replicas = 2), None, None)
             .await
             .unwrap();
 
         // Create a minimal Python class and pickle it so we can spawn
         // PythonActor instances (mirroring PyProcMesh::spawn_async).
         // The class must live in __main__'s globals for pickle to find it.
-        let pickled_type = Python::attach(|py| {
+        let pickled_type = monarch_with_gil_blocking(GilSite::Test, |py| {
             py.run(c"class MinimalActor: pass", None, None).unwrap();
 
             PickledPyObject::pickle(
@@ -963,14 +1010,15 @@ mod tests {
             .unwrap()
         });
 
+        let actor_params = PythonActorParams::new(pickled_type, None, None);
+        let config_lock = hyperactor_config::global::lock();
+        let _queue_dispatch_guard = config_lock.override_key(ACTOR_QUEUE_DISPATCH, false);
         let actor_mesh = proc_mesh
-            .spawn::<PythonActor, _>(
-                instance,
-                "test_actors",
-                &PythonActorParams::new(pickled_type, None, None),
-            )
+            .spawn::<PythonActor, _>(instance, "test_actors", &actor_params)
             .await
             .unwrap();
+        drop(_queue_dispatch_guard);
+        drop(config_lock);
 
         let controller = actor_mesh.controller().as_ref().unwrap().clone();
 
@@ -996,9 +1044,7 @@ mod tests {
 
         // Query the subscriber count from the controller.
         let (port, mut rx) = mailbox::open_port::<usize>(instance);
-        controller
-            .send(instance, GetSubscriberCount(port.bind()))
-            .unwrap();
+        controller.post(instance, GetSubscriberCount(port.bind()));
         let initial_count = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("timed out waiting for subscriber count")
@@ -1021,9 +1067,7 @@ mod tests {
         // After 5 calls from the same context, there should be exactly 1
         // subscriber (created lazily on the first call, reused thereafter).
         let (port, mut rx) = mailbox::open_port::<usize>(instance);
-        controller
-            .send(instance, GetSubscriberCount(port.bind()))
-            .unwrap();
+        controller.post(instance, GetSubscriberCount(port.bind()));
         let after_count = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("timed out waiting for subscriber count")
@@ -1044,9 +1088,7 @@ mod tests {
         }
 
         let (port, mut rx) = mailbox::open_port::<usize>(instance);
-        controller
-            .send(instance, GetSubscriberCount(port.bind()))
-            .unwrap();
+        controller.post(instance, GetSubscriberCount(port.bind()));
         let final_count = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("timed out waiting for subscriber count")

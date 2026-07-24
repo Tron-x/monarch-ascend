@@ -111,14 +111,57 @@ setup_sccache() {
     fi
 
     echo "Setting up sccache..."
-    pip install sccache
+    if ! pip install sccache; then
+        echo "Warning: failed to install sccache; continuing without Rust compiler cache"
+        unset RUSTC_WRAPPER
+        return
+    fi
 
-    export RUSTC_WRAPPER=sccache
     export SCCACHE_BUCKET=ossci-compiler-cache
     export SCCACHE_REGION=us-east-1
     export SCCACHE_S3_KEY_PREFIX=monarch
+    export SCCACHE_FALLBACK_DISABLE_FILE="${RUNNER_TEMP:-/tmp}/monarch-sccache-disabled"
+    rm -f "${SCCACHE_FALLBACK_DISABLE_FILE}" 2>/dev/null || true
 
-    echo "sccache configured: bucket=${SCCACHE_BUCKET}, prefix=${SCCACHE_S3_KEY_PREFIX}"
+    # Validate sccache before handing it to cargo. sccache starts its server on
+    # first use and verifies the remote S3 cache by reading .sccache_check; if
+    # S3 returns a transient 5xx here, cargo would otherwise fail before the
+    # build begins (for example while probing `rustc -vV`).
+    local rustc_path
+    rustc_path=$(rustup which rustc 2>/dev/null || command -v rustc || true)
+    if [ -z "${rustc_path}" ]; then
+        echo "Warning: could not locate rustc; continuing without Rust compiler cache"
+        unset RUSTC_WRAPPER
+        unset SCCACHE_BUCKET
+        unset SCCACHE_REGION
+        unset SCCACHE_S3_KEY_PREFIX
+        unset SCCACHE_FALLBACK_DISABLE_FILE
+        return
+    fi
+    local sccache_check_log
+    sccache_check_log=$(mktemp -t monarch-sccache-check.XXXXXX)
+    if ! sccache "${rustc_path}" -vV >"${sccache_check_log}" 2>&1; then
+        echo "Warning: sccache failed its startup/cache check; continuing without Rust compiler cache"
+        cat "${sccache_check_log}"
+        rm -f "${sccache_check_log}"
+        unset RUSTC_WRAPPER
+        unset SCCACHE_BUCKET
+        unset SCCACHE_REGION
+        unset SCCACHE_S3_KEY_PREFIX
+        unset SCCACHE_FALLBACK_DISABLE_FILE
+        return
+    fi
+    rm -f "${sccache_check_log}"
+
+    local common_setup_dir
+    common_setup_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    local sccache_wrapper="${common_setup_dir}/sccache-rustc-wrapper.sh"
+    # The wrapper is committed executable (0755); ensure the bit survives odd
+    # checkouts without aborting setup on a read-only mount.
+    chmod +x "${sccache_wrapper}" 2>/dev/null || true
+    export RUSTC_WRAPPER="${sccache_wrapper}"
+
+    echo "sccache configured: bucket=${SCCACHE_BUCKET}, prefix=${SCCACHE_S3_KEY_PREFIX}, wrapper=${RUSTC_WRAPPER}"
 }
 
 # Install Python test dependencies
@@ -128,10 +171,16 @@ install_python_test_dependencies() {
     dnf install -y rsync # required for code sync tests
 }
 
-# Install wheel from artifact directory
+# Install wheel from artifact directory.
+# Moves the .whl out of RUNNER_ARTIFACT_DIR first so that linux_job_v2's
+# upload-artifact step (which uploads everything in that directory) never
+# re-uploads the wheel under the test-results artifact name.
 install_wheel_from_artifact() {
     echo "Installing wheel from artifact..."
-    pip install "${RUNNER_ARTIFACT_DIR}"/*.whl
+    local wheel_dir="${RUNNER_TEMP:-/tmp}/wheel"
+    mkdir -p "$wheel_dir"
+    mv -v "${RUNNER_ARTIFACT_DIR}"/*.whl "$wheel_dir/"
+    pip install "$wheel_dir"/*.whl
 }
 
 # Setup and install dependencies for Tensor Engine
@@ -148,8 +197,8 @@ setup_tensor_engine() {
 # Usage: setup_pytorch_with_headers <gpu-arch-type> <gpu-arch-version> <torch-spec>
 setup_pytorch_with_headers() {
     local gpu_arch_type=${1:-"cuda"}
-    local gpu_arch_version=${2:-"12.8"}
-    local torch_spec=${3:-"--pre torch --index-url https://download.pytorch.org/whl/nightly/cu128"}
+    local gpu_arch_version=${2:-"13.2"}
+    local torch_spec=${3:-"--pre torch --index-url https://download.pytorch.org/whl/nightly/cu132"}
 
     echo "Setting up PyTorch with C++ headers (${gpu_arch_type} ${gpu_arch_version})..."
 
@@ -159,12 +208,13 @@ setup_pytorch_with_headers() {
     if [[ "${gpu_arch_type}" == "rocm" ]]; then
         # ROCm uses version with dots: "7.1" -> "rocm7.1"
         libtorch_variant="rocm${gpu_arch_version}"
-        libtorch_filename="libtorch-shared-with-deps-latest.zip"
     else
-        # CUDA uses version without dots: "12.8" -> "cu128"
+        # CUDA uses version without dots: "13.2" -> "cu132"
         libtorch_variant="cu$(echo "${gpu_arch_version}" | tr -d '.')"
-        libtorch_filename="libtorch-cxx11-abi-shared-with-deps-latest.zip"
     fi
+    # PyTorch nightlies unified on cxx11 ABI and dropped the -cxx11-abi- infix;
+    # cu130+ only publishes libtorch-shared-with-deps-latest.zip.
+    libtorch_filename="libtorch-shared-with-deps-latest.zip"
     local libtorch_url="https://download.pytorch.org/libtorch/nightly/${libtorch_variant}/${libtorch_filename}"
 
     echo "Downloading libtorch from: ${libtorch_url}"
@@ -278,77 +328,55 @@ setup_test_environment() {
     install_python_test_dependencies
 }
 
-# Run Python test groups for Monarch.
+# Run Monarch Python tests with crash recovery.
 # Usage: run_test_groups
 #
-# Tests are executed in 10 sequential groups with process cleanup
-# between runs.
+# Tests run sequentially in a persistent worker subprocess. If the worker
+# crashes mid-test, that test is recorded as failed and the worker restarts
+# for the next test. All failures (including crashes) are reported at the end.
 run_test_groups() {
   set +e
   local test_results_dir="${RUNNER_TEST_RESULTS_DIR:-test-results}"
-  # Make sure the runtime linker uses the conda env's libstdc++
-  # (which was used to compile monarch) instead of the system's.
-  # TODO: Revisit this to determine if this is the proper/most
-  # sustainable/most robust solution.
   export CONDA_LIBSTDCPP="${CONDA_PREFIX}/lib/libstdc++.so.6"
   export LD_PRELOAD="${CONDA_LIBSTDCPP}${LD_PRELOAD:+:$LD_PRELOAD}"
-  # Backtraces help with debugging remotely.
   export RUST_BACKTRACE=1
-  local FAILED_GROUPS=()
-  local TEST_EXIT_CODE=0
-  for GROUP in $(seq 1 10); do
-    echo "Running test group $GROUP of 10..."
-    # Kill any existing Python processes to ensure clean state
-    echo "Cleaning up Python processes before group $GROUP..."
-    pkill -9 python || true
-    pkill -9 pytest || true
-    sleep 2
-    LC_ALL=C pytest python/tests/ -s -v -m "not oss_skip" \
-        --ignore-glob="**/meta/**" \
-        --dist=no \
-        --group="$GROUP" \
-        --junit-xml="$test_results_dir/test-results-$GROUP.xml" \
-        --splits=10
-    TEST_EXIT_CODE=$?
-    # Check result and record failures
-    if [[ $TEST_EXIT_CODE -eq 0 ]]; then
-        echo "✓ Test group $GROUP completed successfully"
-    else
-        FAILED_GROUPS+=("$GROUP")
-        echo "✗ Test group $GROUP failed with exit code $TEST_EXIT_CODE"
-    fi
-  done
-  # Final cleanup after all groups
-  echo "Final cleanup of Python processes..."
-  pkill -9 python || true
-  pkill -9 pytest || true
-  # Check if any groups failed and exit with appropriate code
-  if [ ${#FAILED_GROUPS[@]} -eq 0 ]; then
-    echo "✓ All test groups completed successfully!"
-  else
-    echo "✗ The following test groups failed: ${FAILED_GROUPS[*]}"
-    echo "Failed groups count: ${#FAILED_GROUPS[@]}/10"
-    return 1
-  fi
+  mkdir -p "$test_results_dir"
+  LC_ALL=C pytest python/tests/ -s -v -m "not oss_skip" \
+      --ignore-glob="**/meta/**" \
+      --crash-recovery \
+      --max-crashes=10 \
+      --max-leaked-procs=16 \
+      --restart-every=100 \
+      --junit-xml="$test_results_dir/test-results.xml"
+  local rc=$?
   set -e
+  return $rc
+}
+
+# Copy cargo-nextest's JUnit XML to <dest>. Honors CARGO_TARGET_DIR
+# when set, falling back to `target`.
+# Logs and returns 0 when the file is missing (e.g. compile error before
+# tests started); rely on upload-artifact's `if-no-files-found` to
+# surface that case.
+stage_nextest_junit() {
+  local dest="${1:?usage: stage_nextest_junit <dest_dir>}"
+  local src="${CARGO_TARGET_DIR:-target}/nextest/ci/junit.xml"
+  mkdir -p "$dest"
+  if [[ -f "$src" ]]; then
+    cp -v "$src" "$dest/nextest-junit.xml"
+  else
+    echo "stage_nextest_junit: $src not found; nothing to stage" >&2
+  fi
 }
 
 # Stage JUnit XML test results into RUNNER_ARTIFACT_DIR so linux_job_v2.yml
 # uploads them as a workflow artifact (when the caller sets upload-artifact).
 # Picks up pytest XMLs from RUNNER_TEST_RESULTS_DIR and the cargo-nextest
 # junit.xml; safe to call from a workflow that only ran one of them.
-#
-# Removes any *.whl that download-artifact placed in RUNNER_ARTIFACT_DIR first,
-# so the test-results artifact doesn't re-upload the wheel under its own name.
-# (The build workflow uploaded the wheel under its own name; that artifact
-# remains separately downloadable on the GitHub run summary.)
 stage_test_artifacts() {
   : "${RUNNER_ARTIFACT_DIR:?RUNNER_ARTIFACT_DIR must be set}"
-  rm -f "${RUNNER_ARTIFACT_DIR}"/*.whl
   if [[ -d "${RUNNER_TEST_RESULTS_DIR:-test-results}" ]]; then
     cp -v "${RUNNER_TEST_RESULTS_DIR:-test-results}"/*.xml "${RUNNER_ARTIFACT_DIR}/" 2>/dev/null || true
   fi
-  if [[ -f target/nextest/ci/junit.xml ]]; then
-    cp -v target/nextest/ci/junit.xml "${RUNNER_ARTIFACT_DIR}/nextest-junit.xml"
-  fi
+  stage_nextest_junit "${RUNNER_ARTIFACT_DIR}"
 }

@@ -14,14 +14,15 @@
 //! ## Wire protocol
 //!
 //! Each connection starts with a unified `LinkInit` header (13 bytes,
-//! unframed) containing only the `session_id`:
+//! unframed) carrying the protocol kind, session id, and stream id:
 //!
 //! ```text
-//! [magic: 4B "LNK\0"] [session_id: 8B u64 BE]
+//! [magic: 4B ("SMP\0" | "DPX\0")] [session_id: 8B u64 BE] [stream_id: 1B u8]
 //! ```
 //!
-//! After the init, the standard tagged frame format is used. The tag
-//! byte in the 8-byte header distinguishes logical channels:
+//! Duplex servers expect `DPX\0`; mismatched magics are rejected at
+//! handshake. After the init, the standard tagged frame format is used.
+//! The tag byte in the 8-byte header distinguishes logical channels:
 //!
 //! - `INITIATOR_TO_ACCEPTOR = 0x00`
 //! - `ACCEPTOR_TO_INITIATOR = 0x01`
@@ -33,7 +34,6 @@ use backoff::ExponentialBackoffBuilder;
 use backoff::backoff::Backoff;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -44,6 +44,7 @@ use super::LinkStatus;
 use super::ServerError;
 use super::SessionId;
 use super::log_send_error;
+#[cfg(test)]
 use super::read_link_init;
 use super::server::AcceptorLink;
 use super::server::ServerHandle;
@@ -53,14 +54,14 @@ use super::session::Session;
 use crate::RemoteMessage;
 use crate::channel::ChannelAddr;
 use crate::channel::ChannelError;
-use crate::channel::ChannelTransport;
+use crate::channel::CloseReason;
+use crate::channel::CompletionSink;
 use crate::channel::Rx;
 use crate::channel::SendError;
+use crate::channel::SendErrorReason;
 use crate::channel::Tx;
 use crate::channel::TxStatus;
 use crate::channel::net::Stream;
-use crate::channel::net::meta;
-use crate::channel::net::tls;
 use crate::metrics;
 
 /// Public duplex server that yields `(DuplexRx<In>, DuplexTx<Out>)` pairs.
@@ -81,6 +82,16 @@ impl<In: RemoteMessage, Out: RemoteMessage> DuplexServer<In, Out> {
         &self.addr
     }
 
+    /// Signal the duplex server to stop accepting new connections and
+    /// tear down its listener. Returns immediately; await
+    /// [`join`](Self::join) to confirm shutdown has completed. Forwards
+    /// to the underlying [`ServerHandle::stop`]; `join` also stops the
+    /// handle, so an explicit `stop` is only needed to signal teardown
+    /// without (yet) awaiting it.
+    pub fn stop(&self, reason: &str) {
+        self.handle.stop(reason);
+    }
+
     /// Gracefully shut down the duplex server. Cancels the listener
     /// and awaits its task; structured concurrency in
     /// [`dispatch_duplex_stream`] guarantees every in-flight session
@@ -92,6 +103,30 @@ impl<In: RemoteMessage, Out: RemoteMessage> DuplexServer<In, Out> {
             self.addr
         ));
         let _ = (&mut self.handle).await;
+    }
+
+    /// Build a [`DuplexServer`] from an accept channel, server handle,
+    /// and bind address. Used by the muxed-listener path where the
+    /// accept queue is driven by a shared accept loop.
+    pub(super) fn from_parts(
+        accept_rx: mpsc::Receiver<(DuplexRx<In>, DuplexTx<Out>)>,
+        handle: ServerHandle,
+        addr: ChannelAddr,
+    ) -> Self {
+        Self {
+            accept_rx,
+            handle,
+            addr,
+        }
+    }
+}
+
+impl<In: RemoteMessage, Out: RemoteMessage> Drop for DuplexServer<In, Out> {
+    fn drop(&mut self) {
+        self.handle.stop(&format!(
+            "DuplexServer dropped; channel address: {}",
+            self.addr
+        ));
     }
 }
 
@@ -177,14 +212,14 @@ impl<Out: RemoteMessage, In: RemoteMessage> std::fmt::Debug for DuplexClient<Out
 
 /// Sender half of a duplex channel.
 pub struct DuplexTx<M: RemoteMessage> {
-    tx: mpsc::UnboundedSender<(M, oneshot::Sender<SendError<M>>, Instant)>,
+    tx: mpsc::UnboundedSender<(M, CompletionSink<M>, Instant)>,
     addr: ChannelAddr,
     status: watch::Receiver<TxStatus>,
 }
 
 impl<M: RemoteMessage> DuplexTx<M> {
     pub(super) fn new(
-        tx: mpsc::UnboundedSender<(M, oneshot::Sender<SendError<M>>, Instant)>,
+        tx: mpsc::UnboundedSender<(M, CompletionSink<M>, Instant)>,
         addr: ChannelAddr,
         status: watch::Receiver<TxStatus>,
     ) -> Self {
@@ -194,14 +229,17 @@ impl<M: RemoteMessage> DuplexTx<M> {
 
 #[async_trait]
 impl<M: RemoteMessage> Tx<M> for DuplexTx<M> {
-    fn do_post(&self, message: M, return_channel: Option<oneshot::Sender<SendError<M>>>) {
-        let return_channel = return_channel.unwrap_or_else(|| oneshot::channel().0);
-        if let Err(mpsc::error::SendError((message, return_channel, _))) =
+    fn do_post(&self, message: M, completion: CompletionSink<M>) {
+        if let Err(mpsc::error::SendError((message, completion, _))) =
             self.tx
-                .send((message, return_channel, tokio::time::Instant::now()))
+                .send((message, completion, tokio::time::Instant::now()))
         {
-            let reason = self.status.borrow().as_closed().map(|r| r.to_string());
-            let _ = return_channel.send(SendError {
+            let reason = self
+                .status
+                .borrow()
+                .as_closed()
+                .map(|r| SendErrorReason::Other(r.to_string()));
+            completion.reject(SendError {
                 error: ChannelError::Closed,
                 message,
                 reason,
@@ -247,33 +285,21 @@ pub fn serve<In: RemoteMessage, Out: RemoteMessage>(
     let cancel_token = CancellationToken::new();
     let child_token = cancel_token.child_token();
 
-    let is_tls = matches!(
-        channel_addr.transport(),
-        ChannelTransport::Tls | ChannelTransport::MetaTls(_)
-    );
-    let dest = channel_addr.clone();
-    let prepare = move |stream: Box<dyn Stream>, source: ChannelAddr| {
-        let dest = dest.clone();
-        async move {
-            if is_tls {
-                let tls_acceptor = match dest.transport() {
-                    ChannelTransport::Tls => tls::tls_acceptor()?,
-                    _ => meta::tls_acceptor(true)?,
-                };
-                let mut tls_stream = tls_acceptor.accept(stream).await?;
-                let link_init = read_link_init(&mut tls_stream)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("LinkInit read failed from {}: {}", source, e))?;
-                Ok((link_init, Box::new(tls_stream) as Box<dyn Stream>))
-            } else {
-                let mut stream = stream;
-                let link_init = read_link_init(&mut stream)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("LinkInit read failed from {}: {}", source, e))?;
-                Ok((link_init, stream))
-            }
-        }
+    // A duplex server only enforces the duplex protocol kind when a mux
+    // could be demultiplexing simplex traffic off the same address — i.e.
+    // on net (kernel-socket) transports, where `serve_mux` dispatches
+    // simplex and duplex separately and a plain duplex endpoint should
+    // reject stray simplex dials. The in-process `Local` transport has no
+    // mux, yet gateways still route to Local duplex endpoints via simplex
+    // `channel::dial` (e.g. an in-process host's frontend). Accept either
+    // kind there, matching the pre-link-layer behavior; the dispatch reads
+    // sessions by `session_id`, not by kind.
+    let expected_kind = if channel_addr.transport().is_net() {
+        Some(super::ProtocolKind::Duplex)
+    } else {
+        None
     };
+    let prepare = super::preparer_for(channel_addr.clone(), expected_kind);
 
     let sessions: Arc<DashMap<SessionId, mpsc::UnboundedSender<Box<dyn Stream>>>> =
         Arc::new(DashMap::new());
@@ -341,6 +367,13 @@ where
         let link_init = read_link_init(&mut boxed)
             .await
             .map_err(|e| anyhow::anyhow!("LinkInit read failed from {}: {}", source, e))?;
+        if link_init.kind != super::ProtocolKind::Duplex {
+            return Err(anyhow::anyhow!(
+                "duplex server received {:?} client from {}",
+                link_init.kind,
+                source
+            ));
+        }
         Ok((link_init, boxed))
     };
 
@@ -401,7 +434,8 @@ enum Either {
 /// joins every dispatch in its `connections` `JoinSet`, so it
 /// finishes only after every recv/send loop has finished — same
 /// contract as the simplex [`dispatch_stream`](super::server::dispatch_stream).
-async fn dispatch_duplex_stream<In: RemoteMessage, Out: RemoteMessage>(
+#[tracing::instrument(level = "debug", skip_all)]
+pub(super) async fn dispatch_duplex_stream<In: RemoteMessage, Out: RemoteMessage>(
     session_id: SessionId,
     stream: Box<dyn Stream>,
     sessions: Arc<DashMap<SessionId, mpsc::UnboundedSender<Box<dyn Stream>>>>,
@@ -442,7 +476,7 @@ async fn dispatch_duplex_stream<In: RemoteMessage, Out: RemoteMessage>(
     // application-facing handles and yield them to the server.
     let (inbound_tx, inbound_rx) = mpsc::channel::<In>(1024);
     let (outbound_tx, mut outbound_rx) =
-        mpsc::unbounded_channel::<(Out, oneshot::Sender<SendError<Out>>, Instant)>();
+        mpsc::unbounded_channel::<(Out, CompletionSink<Out>, Instant)>();
     let (notify, status) = watch::channel(TxStatus::Active);
     let net_rx = DuplexRx(inbound_rx, addr.clone());
     let net_tx = DuplexTx {
@@ -595,14 +629,17 @@ async fn dispatch_duplex_stream<In: RemoteMessage, Out: RemoteMessage>(
     // fails after the link's receiver above is dropped.
     sessions.remove(&session_id);
 
-    let _ = notify.send(TxStatus::Closed("duplex session ended".into()));
+    let _ = notify.send(TxStatus::Closed(CloseReason::Other(
+        "duplex session ended".into(),
+    )));
 }
 
 /// Establish a duplex (bidirectional) session over the given link.
 /// Returns a [`DuplexClient`] wrapping the send/recv halves and the
 /// spawned recv/send task; the client owns a cancellation token so
 /// callers can deterministically tear the session down via
-/// [`DuplexClient::join`].
+/// [`DuplexClient::stop`] followed by [`DuplexClient::join`].
+#[tracing::instrument(level = "debug", skip_all)]
 pub(crate) fn spawn<Out: RemoteMessage, In: RemoteMessage>(
     link: impl Link,
 ) -> DuplexClient<Out, In> {
@@ -634,9 +671,9 @@ pub(crate) fn spawn<Out: RemoteMessage, In: RemoteMessage>(
         let mut link_status = LinkStatus::NeverConnected;
 
         loop {
-            // Race connect against cancel so a `DuplexClient::join`
-            // call mid-dial doesn't have to wait for the dial
-            // backoff to elapse.
+            // Race connect against cancel so a `DuplexClient::stop`
+            // call mid-dial doesn't have to wait for the dial backoff
+            // to elapse.
             let connected = tokio::select! {
                 result = session.connect() => match result {
                     Ok(s) => s,
@@ -810,7 +847,9 @@ pub(crate) fn spawn<Out: RemoteMessage, In: RemoteMessage>(
             }
         }
 
-        let _ = notify.send(TxStatus::Closed("duplex session ended".into()));
+        let _ = notify.send(TxStatus::Closed(CloseReason::Other(
+            "duplex session ended".into(),
+        )));
     });
     let tx = DuplexTx::new(outbound_tx, addr.clone(), status);
     let rx = DuplexRx::new(inbound_rx, addr.clone());
@@ -826,12 +865,18 @@ pub(crate) fn spawn<Out: RemoteMessage, In: RemoteMessage>(
 /// Connect to a duplex server. Returns a [`DuplexClient`] wrapping
 /// the send/recv halves and the spawned recv/send task; callers use
 /// [`DuplexClient::tx`] / [`DuplexClient::take_rx`] to extract the
-/// halves and [`DuplexClient::join`] to deterministically shut the
-/// session down.
+/// halves and [`DuplexClient::stop`] followed by [`DuplexClient::join`]
+/// to deterministically shut the session down.
 pub fn dial<Out: RemoteMessage, In: RemoteMessage>(
     addr: ChannelAddr,
 ) -> Result<DuplexClient<Out, In>, ClientError> {
-    Ok(spawn(super::link(addr, super::SessionId::random(), 0)?))
+    let addr = addr.into_dial_addr();
+    Ok(spawn(super::link(
+        addr,
+        super::SessionId::random(),
+        0,
+        super::ProtocolKind::Duplex,
+    )?))
 }
 
 #[cfg(test)]

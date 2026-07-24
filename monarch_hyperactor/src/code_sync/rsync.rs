@@ -11,6 +11,8 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
+#[cfg(feature = "packaged_rsync")]
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -25,15 +27,12 @@ use futures::TryStreamExt;
 use futures::try_join;
 use hyperactor as reference;
 use hyperactor::Actor;
-use hyperactor::Bind;
+use hyperactor::Endpoint as _;
 use hyperactor::Handler;
-use hyperactor::Unbind;
 use hyperactor::context;
 use hyperactor_mesh::ActorMesh;
 use hyperactor_mesh::connect::Connect;
 use hyperactor_mesh::connect::accept;
-#[cfg(feature = "packaged_rsync")]
-use lazy_static::lazy_static;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
@@ -55,9 +54,7 @@ use typeuri::Named;
 use crate::code_sync::WorkspaceLocation;
 
 #[cfg(feature = "packaged_rsync")]
-lazy_static! {
-    static ref RSYNC_BIN_PATH: OnceCell<TempPath> = OnceCell::new();
-}
+static RSYNC_BIN_PATH: LazyLock<OnceCell<TempPath>> = LazyLock::new(OnceCell::new);
 
 async fn get_rsync_bin_path() -> Result<&'static Path> {
     #[cfg(feature = "packaged_rsync")]
@@ -324,7 +321,7 @@ impl RsyncDaemon {
     }
 }
 
-#[derive(Debug, Clone, Named, Serialize, Deserialize, Bind, Unbind)]
+#[derive(Debug, Clone, Named, Serialize, Deserialize)]
 pub struct RsyncMessage {
     /// The connect message to create a duplex bytestream with the client.
     pub connect: reference::PortRef<Connect>,
@@ -336,7 +333,7 @@ pub struct RsyncMessage {
 wirevalue::register_type!(RsyncMessage);
 
 #[derive(Debug, Default)]
-#[hyperactor::export(handlers = [RsyncMessage { cast = true }])]
+#[hyperactor::export(handlers = [RsyncMessage])]
 #[hyperactor::spawnable]
 pub struct RsyncActor {
     //workspace: WorkspaceLocation,
@@ -359,8 +356,8 @@ impl Handler<RsyncMessage> for RsyncActor {
             let workspace = workspace
                 .resolve()
                 .context("resolving workspace location")?;
-            let (connect_msg, completer) = Connect::allocate(cx.self_id().clone().into(), cx);
-            connect.send(cx, connect_msg)?;
+            let (connect_msg, completer) = Connect::allocate(cx.self_addr().clone(), cx);
+            connect.post(cx, connect_msg);
 
             // some machines (e.g. github CI) do not have ipv6, so try ipv6 then fallback to ipv4
             let ipv6_lo: SocketAddr = "[::1]:0".parse()?;
@@ -380,7 +377,7 @@ impl Handler<RsyncMessage> for RsyncActor {
             anyhow::Ok(rsync_result)
         }
         .await;
-        result.send(cx, res.map_err(|e| format!("{:#?}", e)))?;
+        result.post(cx, res.map_err(|e| format!("{:#?}", e)));
         Ok(())
     }
 }
@@ -406,8 +403,8 @@ pub async fn rsync_mesh<C: context::Actor + Copy + Unpin>(
             .err_into::<anyhow::Error>()
             .try_for_each_concurrent(None, |connect| async move {
                 let (mut local, mut stream) = try_join!(
-                    TcpStream::connect(daemon_addr.clone()).err_into(),
-                    accept(cx, cx.instance().self_id().clone().into(), connect),
+                    TcpStream::connect(*daemon_addr).err_into(),
+                    accept(cx, cx.instance().self_addr().clone(), connect),
                 )?;
                 tokio::io::copy_bidirectional(&mut local, &mut stream).await?;
                 anyhow::Ok(())
@@ -504,7 +501,7 @@ mod tests {
         let instance = cx.actor_instance;
         let mut host_mesh = test_utils::local_host_mesh(1).await;
         let proc_mesh = host_mesh
-            .spawn(instance, "rsync_test", ndslice::Extent::unity(), None)
+            .spawn(instance, "rsync_test", ndslice::Extent::unity(), None, None)
             .await
             .unwrap();
         // Spawn actor mesh with RsyncActors

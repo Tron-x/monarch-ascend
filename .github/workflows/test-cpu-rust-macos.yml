@@ -52,11 +52,12 @@ jobs:
       - name: Run macOS CPU Rust tests
         shell: bash
         env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target
-          RUSTFLAGS: --cfg tracing_unstable
+          # CI disables the Send/Sync shortcut impls so rustc verifies the
+          # underlying auto-trait bounds structurally.
+          RUSTFLAGS: --cfg tracing_unstable --cfg hyperactor_verify_auto_traits
         run: |
           set -eux
-          cargo nextest run --workspace --profile ci \
+          cargo nextest run --locked --workspace --profile ci \
             -E "$(cat .config/nextest-filter.txt)" \
             --exclude monarch_messages \
             --exclude monarch_tensor_worker \
@@ -70,19 +71,9 @@ jobs:
             --exclude monarch_bench \
             --exclude monarch_conda
 
-      - name: Stage nextest results
-        if: always()
-        shell: bash
-        run: |
-          mkdir -p test-results
-          if [[ -f "${{ runner.temp }}/cargo-target/nextest/ci/junit.xml" ]]; then
-            cp -v "${{ runner.temp }}/cargo-target/nextest/ci/junit.xml" test-results/nextest-junit.xml
-          fi
-
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results-cpu-rust-macos-${{ github.sha }}
-          path: test-results/nextest-junit.xml
-          if-no-files-found: ignore
+          path: target/nextest/ci/junit.xml

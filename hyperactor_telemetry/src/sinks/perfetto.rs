@@ -382,7 +382,7 @@ impl PerfettoFileSink {
         track_id
     }
 
-    fn actor_track_name<'a>(fields: &'a TraceFields) -> Option<&'a str> {
+    fn actor_track_name(fields: &TraceFields) -> Option<&str> {
         match get_field(fields, ACTOR_ID_FIELD) {
             Some(FieldValue::Str(actor_id) | FieldValue::Debug(actor_id))
                 if !actor_id.is_empty() =>
@@ -723,6 +723,8 @@ impl TraceEventSink for PerfettoFileSink {
                 ));
                 self.write_instant(track, *timestamp, &display_name, fields);
             }
+
+            TraceEvent::Entity(_) => {}
         }
 
         Ok(())

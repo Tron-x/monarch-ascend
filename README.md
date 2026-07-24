@@ -43,13 +43,6 @@ The
 [introduction to monarch concepts](https://meta-pytorch.org/monarch/generated/examples/getting_started.html)
 provides an introduction to using these features.
 
-> ⚠️ **Early Development Warning** Monarch is currently in an experimental
-> stage. You should expect bugs, incomplete features, and APIs that may change
-> in future versions. The project welcomes bugfixes, but to make sure things are
-> well coordinated you should discuss any significant change before starting the
-> work. It's recommended that you signal your intention to contribute in the
-> issue tracker, either by filing a new issue or by claiming an existing one.
-
 ## 📖 Documentation
 
 View Monarch's hosted documentation
@@ -60,25 +53,16 @@ View Monarch's hosted documentation
 ### Installing from Pre-built Wheels
 
 Monarch provides pre-built wheels that work regardless of what version of
-PyTorch you have installed:
+PyTorch you have installed.  You can get these with `pip` or `uv`:
 
-#### Stable
-
-```sh
-pip install torchmonarch
-```
-
-#### Nightly
-
-```sh
-pip install --pre torchmonarch
-```
-
-Or install a specific nightly version:
-
-```sh
-pip install torchmonarch==0.3.0.dev20260106
-```
+- **Using PIP**:
+  - stable: `pip install torchmonarch`
+  - nightly: `pip install --pre torchmonarch`
+  - specific: `pip install torchmonarch==v0.7.0.dev20260713`
+- **Using UV** - note, you can also just use `uv pip install ...` and match the above pip commands; but the ones below add monarch to your UV project properly.
+  - stable: `uv add torchmonarch`
+  - nightly: `uv add --prerelease=allow torchmonarch`
+  - specific: `uv add torchmonarch==v0.7.0.dev20260713`
 
 ### Build and Install from Source
 
@@ -96,13 +80,13 @@ brew install uv
 ```
 
 **Configuring PyTorch Index**: By default, Monarch builds with PyTorch from the
-`pytorch-cu128` index (CUDA 12.8). To use a different CUDA version:
+`pytorch-cu132` index (CUDA 13.2). To use a different CUDA version:
 
 - Edit `[tool.uv.sources]` in `pyproject.toml` to point to a different index
-  (e.g., `pytorch-cu126`, `pytorch-cu130`, or `pytorch-cpu`)
+  (e.g., `pytorch-cu130`, or `pytorch-cpu`)
 - Or use `--extra-index-url` when running uv:
   ```sh
-  uv sync --extra-index-url https://download.pytorch.org/whl/cu126
+  uv sync --extra-index-url https://download.pytorch.org/whl/cu130
   ```
 
 #### Understanding Tensor Engine
@@ -160,7 +144,7 @@ rustup default nightly
 sudo dnf install -y cmake ninja-build protobuf-compiler libunwind
 
 # Install the correct cuda and cuda-toolkit versions for your machine
-sudo dnf install cuda-toolkit-12-8 cuda-12-8
+sudo dnf install cuda-toolkit-13-2 cuda-13-2
 
 # Install clang-devel, nccl-devel, and libstdc++-static
 sudo dnf install clang-devel libnccl-devel libstdc++-static
@@ -202,7 +186,7 @@ export CC=clang
 export CXX=clang++
 
 # Install the correct cuda and cuda-toolkit versions for your machine
-sudo apt install -y cuda-toolkit-12-8 cuda-12-8
+sudo apt install -y cuda-toolkit-13-2 cuda-13-2
 
 # Install RDMA libraries (needed for tensor_engine builds)
 sudo apt install -y rdma-core libibverbs1 libmlx5-1 libibverbs-dev
@@ -270,6 +254,53 @@ pip install -e .
 # Without tensor_engine
 USE_TENSOR_ENGINE=0 pip install -e .
 ```
+
+### Building a Docker Image from Source
+
+To build a Docker image that bundles your from-source build of Monarch — for
+example, to run Monarch on a Kubernetes cluster — first build a wheel, then build
+the image from that wheel. This picks up changes to both the Rust and Python
+code.
+
+```bash
+# Make sure to build for python 3.12 since the pytorch base image uses that python version
+uv python pin 3.12
+# Build the binary distribution, outputs to "dist/" directory.
+# --no-build-isolation allows using cached rust builds which speeds up subsequent
+# iterations.
+uv build --no-build-isolation --wheel
+
+# With docker:
+# Build and tag a docker image with your build of monarch. You can update the
+# PYTORCH_TAG to use a different base image depending on your needs.
+# The nightly dockerfile is used because it uses the package you already built,
+# rather than downloading from PyPI. The wheels are supplied through the
+# "monarch-wheels" named build context, which the Dockerfile copies from.
+docker build -f Dockerfile.nightly \
+  -t $USER/monarch:local-tag \
+  --build-arg PYTORCH_TAG=2.14.0.dev20260713-cuda13.2-cudnn9-runtime \
+  --build-context monarch-wheels=dist \
+  .
+
+# Push so it's available to the kubernetes cluster.
+# Either (a) push to a container registry so your cluster can access it.
+# Might be slow based on your upload speed and the size of the container.
+docker push $USER/monarch:latest
+# Or (b) if you have a fully local kubernetes cluster you can change it to
+# imagePullPolicy: Never in the manifest and it'll use the image locally. This
+# is the fastest iteration speed.
+
+# With podman + kind:
+# Same build command, replace "docker" with "podman"
+# Save image to archive
+podman save localhost/$USER/monarch:local-tag -o /tmp/monarch-image
+# Then push to your kind cluster for local dev:
+KIND_EXPERIMENTAL_PROVIDER=podman kind load image-archive /tmp/monarch-image -n monarch-cluster
+```
+
+Then point your deployment at the new image. Make sure to prepend the registry
+you used for docker login, like `ghcr.io` or `docker.io`, and that you have
+pushed the image first.
 
 ## Running examples
 

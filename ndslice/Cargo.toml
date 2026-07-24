@@ -14,17 +14,19 @@ name = "fuzz_reshape_selection"
 path = "tests/fuzz_reshape_selection.rs"
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.103"
 cityhasher = "0.1.0"
-clap = { version = "4.6.0", features = ["derive", "env", "string", "unicode", "wrap_help"] }
-enum-as-inner = "0.6.1"
+clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 hyperactor_config = { version = "0.0.0", path = "../hyperactor_config" }
-itertools = "0.14.0"
+itertools = "0.15.0"
 nom = "8"
 proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 proptest = "1.11.0"
-quote = "1.0.45"
-rand = "0.10.1"
+quote = "1.0.46"
+rand = "0.10.2"
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 thiserror = "2.0.18"
 typeuri = { version = "0.0.0", path = "../typeuri" }
+
+[lints]
+workspace = true

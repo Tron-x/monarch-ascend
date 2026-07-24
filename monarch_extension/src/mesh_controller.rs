@@ -25,6 +25,7 @@ use hyperactor as reference;
 use hyperactor::Actor;
 use hyperactor::ActorHandle;
 use hyperactor::Context;
+use hyperactor::Endpoint as _;
 use hyperactor::HandleClient;
 use hyperactor::Handler;
 use hyperactor::Instance;
@@ -35,6 +36,7 @@ use hyperactor::context;
 use hyperactor::mailbox::MailboxSenderError;
 use hyperactor::supervision::ActorSupervisionEvent;
 use hyperactor_mesh::ActorMesh;
+use hyperactor_mesh::ActorMeshRef;
 use hyperactor_mesh::ProcMeshRef;
 use hyperactor_mesh::supervision::MeshFailure;
 use hyperactor_mesh::value_mesh::ValueOverlay;
@@ -60,10 +62,11 @@ use monarch_messages::worker::WorkerMessage;
 use monarch_messages::worker::WorkerParams;
 use monarch_tensor_worker::AssignRankMessage;
 use monarch_tensor_worker::WorkerActor;
+use ndslice::Region;
 use ndslice::Slice;
 use ndslice::ViewExt;
-use ndslice::selection::ReifySlice;
 use ndslice::view::Ranked;
+use ndslice::view::RankedSliceable as _;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -105,7 +108,7 @@ impl _Controller {
         // Build rank map from proc ids to ranks.
         let rank_map: HashMap<reference::ProcAddr, usize> = proc_mesh
             .iter()
-            .map(|(point, proc)| (proc.proc_id().clone(), point.rank()))
+            .map(|(point, proc)| (proc.proc_addr().clone(), point.rank()))
             .collect();
 
         let region = Ranked::region(&proc_mesh);
@@ -126,7 +129,7 @@ impl _Controller {
                         rank_map,
                     })
                     .await,
-                )?;
+                );
                 Ok::<_, anyhow::Error>(Arc::new(Mutex::new(controller_handle)))
             })??;
 
@@ -173,32 +176,32 @@ impl _Controller {
             tracebacks,
             response_port,
         };
-        self.controller_handle
-            .blocking_lock()
-            .send(instance.deref(), msg)
-            .map_err(to_py_error)
+        hyperactor::Endpoint::post(
+            &*self.controller_handle.blocking_lock(),
+            instance.deref(),
+            msg,
+        );
+        Ok(())
     }
 
     fn _drop_refs(&mut self, instance: &PyInstance, refs: Vec<Ref>) -> PyResult<()> {
-        self.controller_handle
-            .blocking_lock()
-            .send(
-                instance.deref(),
-                ClientToControllerMessage::DropRefs { refs },
-            )
-            .map_err(to_py_error)
+        hyperactor::Endpoint::post(
+            &*self.controller_handle.blocking_lock(),
+            instance.deref(),
+            ClientToControllerMessage::DropRefs { refs },
+        );
+        Ok(())
     }
 
     fn _sync_at_exit(&mut self, instance: &PyInstance, port: PyPortId) -> PyResult<()> {
-        self.controller_handle
-            .blocking_lock()
-            .send(
-                instance.deref(),
-                ClientToControllerMessage::SyncAtExit {
-                    port: reference::PortRef::attest(reference::PortAddr::from(port)),
-                },
-            )
-            .map_err(to_py_error)
+        hyperactor::Endpoint::post(
+            &*self.controller_handle.blocking_lock(),
+            instance.deref(),
+            ClientToControllerMessage::SyncAtExit {
+                port: reference::PortRef::attest(reference::PortAddr::from(port)),
+            },
+        );
+        Ok(())
     }
 
     fn _send<'py>(
@@ -214,27 +217,24 @@ impl _Controller {
             slices.iter().map(|x| x.into()).collect::<Vec<Slice>>()
         };
         let message: WorkerMessage = convert(message)?;
-        self.controller_handle
-            .blocking_lock()
-            .send(
-                instance.deref(),
-                ClientToControllerMessage::Send { slices, message },
-            )
-            .map_err(to_py_error)
+        hyperactor::Endpoint::post(
+            &*self.controller_handle.blocking_lock(),
+            instance.deref(),
+            ClientToControllerMessage::Send { slices, message },
+        );
+        Ok(())
     }
 
     fn _drain_and_stop(&mut self, py: Python<'_>, instance: &PyInstance) -> PyResult<()> {
         let (stop_worker_port, stop_worker_receiver) = instance.open_once_port();
 
-        self.controller_handle
-            .blocking_lock()
-            .send(
-                instance.deref(),
-                ClientToControllerMessage::StopWorkers {
-                    response_port: stop_worker_port,
-                },
-            )
-            .map_err(to_py_error)?;
+        hyperactor::Endpoint::post(
+            &*self.controller_handle.blocking_lock(),
+            instance.deref(),
+            ClientToControllerMessage::StopWorkers {
+                response_port: stop_worker_port,
+            },
+        );
         signal_safe_block_on(py, async move { stop_worker_receiver.recv().await })?
             .map_err(to_py_error)?
             .map_err(PyRuntimeError::new_err)?;
@@ -372,10 +372,10 @@ impl Invocation {
                                     .expect("complete runs should not overlap");
                             }
                         }
-                        port.send(sender, overlay.into())?;
+                        port.post(sender, overlay.into());
                     } else {
                         for result in results {
-                            port.send(sender, result)?;
+                            port.post(sender, result);
                         }
                     }
                 }
@@ -419,19 +419,20 @@ impl Invocation {
                                         overlay
                                             .push_run(
                                                 rank..rank + 1,
-                                                PythonResponseMessage::Exception(
-                                                    exception.as_ref().message.clone(),
-                                                ),
+                                                PythonResponseMessage::Exception {
+                                                    part: exception.as_ref().message.clone(),
+                                                    refs: exception.as_ref().refs.clone(),
+                                                },
                                             )
                                             .expect("exception runs should not overlap");
                                     }
-                                    port.send(sender, overlay.into())?;
+                                    port.post(sender, overlay.into());
                                 } else {
                                     for rank in ranks.iter() {
-                                        port.send(
+                                        port.post(
                                             sender,
                                             exception.as_ref().clone().into_rank(rank),
-                                        )?;
+                                        );
                                     }
                                 }
                             }
@@ -600,29 +601,32 @@ impl History {
         let invocation = self.inflight_invocations.get(&seq).unwrap().clone();
 
         let python_message = Arc::new(
-            monarch_hyperactor::runtime::monarch_with_gil(|py| {
-                let traceback = invocation
-                    .lock()
-                    .unwrap()
-                    .tracebacks
-                    .bind(py)
-                    .get_item(0)
-                    .unwrap();
-                let remote_exception = py
-                    .import("monarch.mesh_controller")
-                    .unwrap()
-                    .getattr("RemoteException")
-                    .unwrap();
-                let exe = remote_exception
-                    .call1((exception.backtrace, traceback, rank))
-                    .unwrap();
-                let mut state = pickle(py, exe.unbind(), false, false).unwrap();
-                let inner = state.take_inner().unwrap();
-                PythonMessage::new_from_buf(
-                    PythonMessageKind::Exception { rank: Some(rank) },
-                    inner.take_buffer(),
-                )
-            })
+            monarch_hyperactor::runtime::monarch_with_gil(
+                monarch_hyperactor::runtime::GilSite::Traceback,
+                |py| {
+                    let traceback = invocation
+                        .lock()
+                        .unwrap()
+                        .tracebacks
+                        .bind(py)
+                        .get_item(0)
+                        .unwrap();
+                    let remote_exception = py
+                        .import("monarch.mesh_controller")
+                        .unwrap()
+                        .getattr("RemoteException")
+                        .unwrap();
+                    let exe = remote_exception
+                        .call1((exception.backtrace, traceback, rank))
+                        .unwrap();
+                    let mut state = pickle(py, exe.unbind(), false, false).unwrap();
+                    let inner = state.take_inner().unwrap();
+                    PythonMessage::new_from_buf(
+                        PythonMessageKind::Exception { rank: Some(rank) },
+                        inner.take_buffer(),
+                    )
+                },
+            )
             .await,
         );
 
@@ -659,21 +663,21 @@ impl History {
                 invocation.complete(sender)?;
             }
         }
-        if let Some(port) = &self.exit_port {
-            if self.min_incomplete_seq >= self.seq_lower_bound {
-                let result = match &self.unreported_exception {
-                    Some(exception) => exception.as_ref().clone(),
-                    None => {
-                        // the byte string is just a Python None
-                        PythonMessage::new_from_buf(
-                            PythonMessageKind::Result { rank: None },
-                            b"\x80\x04N.".to_vec(),
-                        )
-                    }
-                };
-                port.send(sender, result)?;
-                self.exit_port = None;
-            }
+        if let Some(port) = &self.exit_port
+            && self.min_incomplete_seq >= self.seq_lower_bound
+        {
+            let result = match &self.unreported_exception {
+                Some(exception) => exception.as_ref().clone(),
+                None => {
+                    // the byte string is just a Python None
+                    PythonMessage::new_from_buf(
+                        PythonMessageKind::Result { rank: None },
+                        b"\x80\x04N.".to_vec(),
+                    )
+                }
+            };
+            port.post(sender, result);
+            self.exit_port = None;
         }
         Ok(())
     }
@@ -726,6 +730,7 @@ enum ClientToControllerMessage {
 struct MeshControllerActor {
     proc_mesh_ref: ProcMeshRef,
     workers: Option<ActorMesh<WorkerActor>>,
+    worker_slice_cache: HashMap<Region, ActorMeshRef<WorkerActor>>,
     brokers: Option<ActorMesh<LocalStateBrokerActor>>,
     history: History,
     id: usize,
@@ -752,6 +757,7 @@ impl MeshControllerActor {
         MeshControllerActor {
             proc_mesh_ref,
             workers: None,
+            worker_slice_cache: HashMap::new(),
             brokers: None,
             history: History::new(world_size),
             id,
@@ -765,8 +771,69 @@ impl MeshControllerActor {
         self.workers.as_ref().unwrap()
     }
 
+    fn worker_slice(&mut self, region: Region) -> ActorMeshRef<WorkerActor> {
+        if let Some(slice) = self.worker_slice_cache.get(&region) {
+            return slice.clone();
+        }
+
+        let slice = self.workers().deref().sliced(region.clone());
+        self.worker_slice_cache.insert(region, slice.clone());
+        slice
+    }
+
     fn workers_mut(&mut self) -> &mut ActorMesh<WorkerActor> {
         self.workers.as_mut().unwrap()
+    }
+
+    fn cast_to_worker_slices(
+        &mut self,
+        this: &Context<'_, Self>,
+        slices: Vec<Slice>,
+        message: WorkerMessage,
+    ) -> anyhow::Result<()> {
+        let worker_region = Ranked::region(self.workers().deref()).clone();
+
+        let mut seen = HashSet::new();
+        for slice in slices {
+            let ranks = slice.iter().collect::<Vec<_>>();
+            if ranks.is_empty() {
+                continue;
+            }
+
+            let labels = if worker_region.labels().len() == slice.num_dim() {
+                worker_region.labels().to_vec()
+            } else {
+                (0..slice.num_dim())
+                    .map(|dim| format!("rank_{dim}"))
+                    .collect()
+            };
+            let region = Region::new(labels, slice);
+            anyhow::ensure!(
+                region.is_subset(&worker_region),
+                "worker send target must be a subset of the worker mesh"
+            );
+
+            // `Vec<Slice>` represents a union. Preserve the common efficient case
+            // by casting whole non-overlapping slices, but avoid duplicate delivery
+            // if later slices overlap earlier ones.
+            if ranks.iter().all(|rank| !seen.contains(rank)) {
+                seen.extend(ranks);
+                self.worker_slice(region).cast(this, message.clone())?;
+                continue;
+            }
+
+            for rank in ranks {
+                if !seen.insert(rank) {
+                    continue;
+                }
+                let singleton = Region::new(
+                    Vec::new(),
+                    Slice::new(rank, Vec::new(), Vec::new()).map_err(anyhow::Error::from)?,
+                );
+                self.worker_slice(singleton).cast(this, message.clone())?;
+            }
+        }
+        Ok(())
     }
 
     fn brokers_mut(&mut self) -> &mut ActorMesh<LocalStateBrokerActor> {
@@ -781,13 +848,13 @@ impl MeshControllerActor {
     ) -> anyhow::Result<()> {
         if matches!(action, DebuggerAction::Paused()) {
             self.debugger_paused
-                .push_back(reference::ActorRef::attest(debugger_actor_id.into()));
+                .push_back(reference::ActorRef::attest(debugger_actor_id));
         } else {
             let debugger_actor = self
                 .debugger_active
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("no active debugger"))?;
-            if debugger_actor_id != *debugger_actor.actor_id() {
+            if debugger_actor_id != *debugger_actor.actor_addr() {
                 anyhow::bail!("debugger action for wrong actor");
             }
             match action {
@@ -795,26 +862,30 @@ impl MeshControllerActor {
                     self.debugger_active = None;
                 }
                 DebuggerAction::Read { requested_size } => {
-                    monarch_hyperactor::runtime::monarch_with_gil(|py| {
-                        let read = py
-                            .import("monarch.controller.debugger")
-                            .unwrap()
-                            .getattr("read")
-                            .unwrap();
-                        let bytes: Vec<u8> =
-                            read.call1((requested_size,)).unwrap().extract().unwrap();
+                    monarch_hyperactor::runtime::monarch_with_gil(
+                        monarch_hyperactor::runtime::GilSite::Debugger,
+                        |py| {
+                            let read = py
+                                .import("monarch.controller.debugger")
+                                .unwrap()
+                                .getattr("read")
+                                .unwrap();
+                            let bytes: Vec<u8> =
+                                read.call1((requested_size,)).unwrap().extract().unwrap();
 
-                        debugger_actor.send(
-                            this,
-                            DebuggerMessage::Action {
-                                action: DebuggerAction::Write { bytes },
-                            },
-                        )
-                    })
-                    .await?;
+                            debugger_actor.post(
+                                this,
+                                DebuggerMessage::Action {
+                                    action: DebuggerAction::Write { bytes },
+                                },
+                            );
+                        },
+                    )
+                    .await;
                 }
                 DebuggerAction::Write { bytes } => {
                     monarch_hyperactor::runtime::monarch_with_gil(
+                        monarch_hyperactor::runtime::GilSite::Debugger,
                         |py| -> Result<(), anyhow::Error> {
                             let write = py
                                 .import("monarch.controller.debugger")
@@ -833,16 +904,13 @@ impl MeshControllerActor {
             }
         }
         if self.debugger_active.is_none() {
-            self.debugger_active = self.debugger_paused.pop_front().and_then(|pdb_actor| {
-                pdb_actor
-                    .send(
-                        this,
-                        DebuggerMessage::Action {
-                            action: DebuggerAction::Attach(),
-                        },
-                    )
-                    .map(|_| pdb_actor)
-                    .ok()
+            self.debugger_active = self.debugger_paused.pop_front().inspect(|pdb_actor| {
+                pdb_actor.post(
+                    this,
+                    DebuggerMessage::Action {
+                        action: DebuggerAction::Attach(),
+                    },
+                );
             });
         }
         Ok(())
@@ -892,7 +960,7 @@ impl MeshControllerActor {
     fn rank_of_worker(&self, actor_id: &reference::ActorAddr) -> usize {
         *self
             .rank_map
-            .get(&actor_id.proc_id())
+            .get(&actor_id.proc_addr())
             .expect("rank map should contain worker")
     }
 }
@@ -949,11 +1017,7 @@ impl Handler<ClientToControllerMessage> for MeshControllerActor {
     ) -> anyhow::Result<()> {
         match message {
             ClientToControllerMessage::Send { slices, message } => {
-                let workers = self.workers();
-                let sel = Ranked::region(workers.deref())
-                    .slice()
-                    .reify_slices(slices)?;
-                workers.cast_for_tensor_engine_only_do_not_use(this, sel, message)?;
+                self.cast_to_worker_slices(this, slices, message)?;
             }
             ClientToControllerMessage::Node {
                 seq,
@@ -988,9 +1052,9 @@ impl Handler<ClientToControllerMessage> for MeshControllerActor {
                     .stop(this, "client requested stop".to_string())
                     .await;
                 if worker_stop_result.is_ok() && broker_stop_result.is_ok() {
-                    response_port.send(this, Ok(()))?;
+                    response_port.post(this, Ok(()));
                 } else {
-                    response_port.send(this, Err(format!("stopping mesh workers failed: tensor worker result: {:?}, broker result: {:?}", worker_stop_result, broker_stop_result)))?;
+                    response_port.post(this, Err(format!("stopping mesh workers failed: tensor worker result: {:?}, broker result: {:?}", worker_stop_result, broker_stop_result)));
                 }
             }
         }
@@ -1004,7 +1068,7 @@ impl Handler<MeshFailure> for MeshControllerActor {
         // If an actor spawned by this one fails, we can't handle it. We fail
         // ourselves with a chained error and bubble up to the next owner.
         let err = ActorErrorKind::UnhandledSupervisionEvent(Box::new(ActorSupervisionEvent::new(
-            this.self_id().clone(),
+            this.self_addr().clone(),
             None,
             ActorStatus::Failed(ActorErrorKind::UnhandledSupervisionEvent(Box::new(
                 message.event.clone(),

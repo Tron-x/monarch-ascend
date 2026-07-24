@@ -8,6 +8,7 @@
 
 use hyperactor_mesh::introspect::NodeProperties;
 use ratatui::layout::Rect;
+use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
@@ -26,7 +27,12 @@ use crate::theme::ThemeName;
 /// Displays a colorful, information-dense header with topology stats,
 /// selection context, and system state. Uses semantic colors from the
 /// scheme for visual hierarchy and readability.
-pub(crate) fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+pub(crate) fn render_header(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    app: &App,
+    detail_clipped: bool,
+) {
     let l = &app.theme.labels;
 
     // Error state overrides normal display
@@ -139,6 +145,25 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Ap
             Span::styled(l.refresh_icon, app.theme.scheme.stat_timing),
             Span::styled(&app.refresh_interval_label, app.theme.scheme.stat_timing),
         ]);
+    }
+
+    // Terminal too short to show all detail panes. Prepend the warning -- line 1
+    // truncates from the right, so a segment at the end is the first thing a
+    // narrow terminal loses -- and make it loud (reversed + blink) so a size
+    // problem is not mistaken for missing data.
+    if detail_clipped {
+        let mut alert = vec![
+            Span::styled(
+                l.header_content_clipped,
+                app.theme
+                    .scheme
+                    .error
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD | Modifier::SLOW_BLINK),
+            ),
+            Span::styled(l.separator, app.theme.scheme.stat_label),
+        ];
+        alert.append(&mut line1_spans);
+        line1_spans = alert;
     }
 
     // Line 2: Selection context

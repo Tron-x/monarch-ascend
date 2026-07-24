@@ -205,19 +205,19 @@ impl<'py> IntoPyObject<'py> for PyDuration {
 
 // Declare monarch-specific configuration keys
 declare_attrs! {
-    /// Use a single asyncio runtime for all Python actors, rather than one per actor
-    @meta(CONFIG = ConfigAttr::new(
-        Some("HYPERACTOR_SHARED_ASYNCIO_RUNTIME".to_string()),
-        Some("shared_asyncio_runtime".to_string()),
-    ))
-    pub attr SHARED_ASYNCIO_RUNTIME: bool = false;
-
     /// Use queue-based message dispatch for Python actors instead of direct dispatch
     @meta(CONFIG = ConfigAttr::new(
         Some("MONARCH_ACTOR_QUEUE_DISPATCH".to_string()),
         Some("actor_queue_dispatch".to_string()),
     ))
-    pub attr ACTOR_QUEUE_DISPATCH: bool = false;
+    pub attr ACTOR_QUEUE_DISPATCH: bool = true;
+
+    /// Worker thread count for Monarch's Python Tokio runtime bridge.
+    @meta(CONFIG = ConfigAttr::new(
+        Some("MONARCH_TOKIO_WORKER_THREADS".to_string()),
+        Some("tokio_worker_threads".to_string()),
+    ))
+    pub attr TOKIO_WORKER_THREADS: Option<hyperactor_config::NonZeroUsize> = None;
 }
 
 /// Python API for configuration management
@@ -288,7 +288,7 @@ where
             key.name(),
         ))
     })?;
-    let val: Option<P> = hyperactor_config::global::try_get_cloned(key.clone())
+    let val: Option<P> = hyperactor_config::global::try_get_cloned(*key)
         .map(|v| v.try_into())
         .transpose()?;
     val.map(|v| v.into_py_any(py)).transpose()
@@ -314,7 +314,7 @@ where
     let key = key.downcast_ref::<T>().expect("cannot fail");
     let runtime = hyperactor_config::global::runtime_attrs();
     let val: Option<P> = runtime
-        .get(key.clone())
+        .get(*key)
         .cloned()
         .map(|v| v.try_into())
         .transpose()?;
@@ -334,9 +334,16 @@ fn set_runtime_config_py<T: AttrValue + Debug>(
     // Again, can't fail unless there's a bug in the code in this file.
     let key = key.downcast_ref().expect("cannot fail");
     let mut attrs = Attrs::new();
-    attrs.set(key.clone(), value);
+    attrs.set(*key, value);
     hyperactor_config::global::create_or_merge(Source::Runtime, attrs);
     Ok(())
+}
+
+fn py_value_repr(py: Python<'_>, val: &Py<PyAny>) -> String {
+    val.bind(py)
+        .repr()
+        .map(|repr| repr.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "<unprintable>".to_string())
 }
 
 /// Bridge a single Python kwarg into a typed Runtime config update.
@@ -464,12 +471,20 @@ macro_rules! declare_py_config_type {
             PythonConfigTypeInfo {
                 typehash: <Option<$ty> as Named>::typehash,
                 set_runtime_config: |py, key, val| {
-                    let val: Option<$ty> = val.extract::<Option<$py_ty>>(py)
+                    let val_repr = py_value_repr(py, &val);
+                    let val: Option<$py_ty> = val.extract::<Option<$py_ty>>(py)
                         .map_err(|err| PyTypeError::new_err(format!(
                             "invalid value `{}` for configuration key `{}` ({})",
-                            val, key.name(), err
-                        )))?
-                        .map(Into::into);
+                            val_repr, key.name(), err
+                        )))?;
+                    // Python extraction checks shape; TryInto checks Rust-side invariants.
+                    let val: Option<$ty> = val
+                        .map(TryInto::try_into)
+                        .transpose()
+                        .map_err(|err| PyValueError::new_err(format!(
+                            "invalid value `{}` for configuration key `{}` ({})",
+                            val_repr, key.name(), err
+                        )))?;
                     set_runtime_config_py(key, val)
                 },
                 get_global_config: |py, key| {
@@ -506,10 +521,16 @@ macro_rules! declare_py_config_type {
                 PythonConfigTypeInfo {
                     typehash: $ty::typehash,
                     set_runtime_config: |py, key, val| {
-                        let val: $ty = val.extract::<$py_ty>(py).map_err(|err| PyTypeError::new_err(format!(
+                        let val_repr = py_value_repr(py, &val);
+                        let val: $py_ty = val.extract::<$py_ty>(py).map_err(|err| PyTypeError::new_err(format!(
                             "invalid value `{}` for configuration key `{}` ({})",
-                            val, key.name(), err
-                        )))?.into();
+                            val_repr, key.name(), err
+                        )))?;
+                        // Python extraction checks shape; TryInto checks Rust-side invariants.
+                        let val: $ty = val.try_into().map_err(|err| PyValueError::new_err(format!(
+                            "invalid value `{}` for configuration key `{}` ({})",
+                            val_repr, key.name(), err
+                        )))?;
                         set_runtime_config_py(key, val)
                     },
                     get_global_config: |py, key| {
@@ -530,6 +551,8 @@ declare_py_config_type!(Option<PyDuration> as Option<Duration>);
 declare_py_config_type!(PyEncoding as wirevalue::Encoding);
 declare_py_config_type!(PyPortRange as std::ops::Range::<u16>);
 declare_py_config_type!(String as hyperactor_mesh::config::SocketAddrStr);
+declare_py_config_type!(usize as hyperactor_config::NonZeroUsize);
+declare_py_config_type!(Option<usize> as Option<hyperactor_config::NonZeroUsize>);
 declare_py_config_type!(
     i8, i16, i32, i64, u8, u16, u32, u64, usize, f32, f64, bool, String
 );
@@ -719,18 +742,32 @@ pub fn register_python_bindings(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::time::Duration;
 
+    use hyperactor_config::attrs::declare_attrs;
+    use pyo3::exceptions::PyValueError;
     use pyo3::prelude::*;
     use pyo3::types::PyString;
     use pyo3::types::PyTuple;
 
     use super::*;
+    use crate::runtime::GilSite;
+    use crate::runtime::monarch_with_gil_blocking;
+
+    declare_attrs! {
+        @meta(CONFIG = ConfigAttr::new(
+            None,
+            Some("test_nonzero_usize".to_string()),
+        ))
+        attr TEST_NONZERO_USIZE: hyperactor_config::NonZeroUsize =
+            hyperactor_config::NonZeroUsize::MIN;
+    }
 
     #[test]
     fn test_pyduration_parse_valid_formats() {
         Python::initialize();
-        Python::attach(|py| {
+        monarch_with_gil_blocking(GilSite::Test, |py| {
             // Test various valid duration formats
             let s = PyString::new(py, "30s");
             let d: PyDuration = s.extract().unwrap();
@@ -757,7 +794,7 @@ mod tests {
     #[test]
     fn test_pyduration_parse_invalid_format() {
         Python::initialize();
-        Python::attach(|py| {
+        monarch_with_gil_blocking(GilSite::Test, |py| {
             let s = PyString::new(py, "invalid");
             let result: PyResult<PyDuration> = s.extract();
             assert!(result.is_err());
@@ -769,7 +806,7 @@ mod tests {
     #[test]
     fn test_pyduration_roundtrip() {
         Python::initialize();
-        Python::attach(|py| {
+        monarch_with_gil_blocking(GilSite::Test, |py| {
             let original = Duration::from_secs(42);
             let py_duration = PyDuration(original);
             let py_obj = py_duration.into_pyobject(py).unwrap();
@@ -781,7 +818,7 @@ mod tests {
     #[test]
     fn test_pyencoding_enum_variants() {
         Python::initialize();
-        Python::attach(|py| {
+        monarch_with_gil_blocking(GilSite::Test, |py| {
             // Test all enum variants roundtrip
             for variant in [PyEncoding::Bincode, PyEncoding::Json, PyEncoding::Multipart] {
                 let py_obj = Bound::new(py, variant).unwrap().into_any();
@@ -794,7 +831,7 @@ mod tests {
     #[test]
     fn test_pyencoding_rejects_strings() {
         Python::initialize();
-        Python::attach(|_py| {
+        monarch_with_gil_blocking(GilSite::Test, |_py| {
             // Strings ought not to work
             let s = PyString::new(_py, "bincode");
             let result: PyResult<PyEncoding> = s.extract();
@@ -805,7 +842,7 @@ mod tests {
     #[test]
     fn test_pyencoding_conversions() {
         Python::initialize();
-        Python::attach(|_py| {
+        monarch_with_gil_blocking(GilSite::Test, |_py| {
             // Test Rust enum -> PyEncoding -> Rust enum
             let rust_enc = wirevalue::Encoding::Bincode;
             let py_enc: PyEncoding = rust_enc.into();
@@ -827,9 +864,40 @@ mod tests {
     }
 
     #[test]
+    fn test_nonzero_usize_config_rejects_zero_from_python() {
+        Python::initialize();
+        monarch_with_gil_blocking(GilSite::Test, |py| {
+            clear_runtime_config(py).expect("clear runtime config before test");
+
+            let kwargs = HashMap::from([(
+                "test_nonzero_usize".to_string(),
+                0usize.into_py_any(py).expect("convert integer to python"),
+            )]);
+            let err = configure(py, Some(kwargs)).expect_err("zero value should be rejected");
+
+            assert!(err.is_instance_of::<PyValueError>(py));
+            let err_msg = err.to_string();
+            assert!(
+                err_msg.contains(
+                    "invalid value `0` for configuration key `monarch_hyperactor::config::tests::test_nonzero_usize`"
+                ),
+                "unexpected error message: {}",
+                err_msg
+            );
+            assert!(
+                err_msg.contains("expected non-zero usize"),
+                "unexpected error message: {}",
+                err_msg
+            );
+
+            clear_runtime_config(py).expect("clear runtime config after test");
+        });
+    }
+
+    #[test]
     fn test_pyencoding_roundtrip() {
         Python::initialize();
-        Python::attach(|py| {
+        monarch_with_gil_blocking(GilSite::Test, |py| {
             let original = wirevalue::Encoding::Multipart;
             let py_encoding: PyEncoding = original.into();
             let py_obj = Bound::new(py, py_encoding).unwrap().into_any();
@@ -842,7 +910,7 @@ mod tests {
     #[test]
     fn test_pyportrange_parse_slice_format() {
         Python::initialize();
-        Python::attach(|py| {
+        monarch_with_gil_blocking(GilSite::Test, |py| {
             let slice = pyo3::types::PySlice::new(py, 8000, 9000, 1);
             let r: PyPortRange = slice.extract().unwrap();
             assert_eq!(r.0.start, 8000);
@@ -853,7 +921,7 @@ mod tests {
     #[test]
     fn test_pyportrange_reject_tuples_and_strings() {
         Python::initialize();
-        Python::attach(|py| {
+        monarch_with_gil_blocking(GilSite::Test, |py| {
             // Tuples should not work
             let tuple = PyTuple::new(py, [8000u16, 9000u16]).unwrap();
             let result: PyResult<PyPortRange> = tuple.extract();
@@ -869,7 +937,7 @@ mod tests {
     #[test]
     fn test_pyportrange_reject_backwards_range() {
         Python::initialize();
-        Python::attach(|py| {
+        monarch_with_gil_blocking(GilSite::Test, |py| {
             // start > stop should be rejected
             let slice = pyo3::types::PySlice::new(py, 9000, 8000, 1);
             let result: PyResult<PyPortRange> = slice.extract();
@@ -882,7 +950,7 @@ mod tests {
     #[test]
     fn test_pyportrange_reject_invalid_step() {
         Python::initialize();
-        Python::attach(|py| {
+        monarch_with_gil_blocking(GilSite::Test, |py| {
             // step != 1 and step != None should be rejected
             let slice = pyo3::types::PySlice::new(py, 8000, 9000, 2);
             let result: PyResult<PyPortRange> = slice.extract();
@@ -895,7 +963,7 @@ mod tests {
     #[test]
     fn test_pyportrange_reject_none_start() {
         Python::initialize();
-        Python::attach(|py| {
+        monarch_with_gil_blocking(GilSite::Test, |py| {
             // slice(None, 9000) should be rejected
             // Create via Python eval since PySlice::new doesn't support None
             let slice = py.eval(c"slice(None, 9000)", None, None).unwrap();
@@ -909,7 +977,7 @@ mod tests {
     #[test]
     fn test_pyportrange_reject_none_stop() {
         Python::initialize();
-        Python::attach(|py| {
+        monarch_with_gil_blocking(GilSite::Test, |py| {
             // slice(8000, None) should be rejected
             // Create via Python eval since PySlice::new doesn't support None
             let slice = py.eval(c"slice(8000, None)", None, None).unwrap();
@@ -923,7 +991,7 @@ mod tests {
     #[test]
     fn test_pyportrange_allow_empty_range() {
         Python::initialize();
-        Python::attach(|py| {
+        monarch_with_gil_blocking(GilSite::Test, |py| {
             // start == stop should be allowed (empty range)
             let slice = pyo3::types::PySlice::new(py, 8000, 8000, 1);
             let r: PyPortRange = slice.extract().unwrap();
@@ -936,7 +1004,7 @@ mod tests {
     #[test]
     fn test_pyportrange_roundtrip() {
         Python::initialize();
-        Python::attach(|py| {
+        monarch_with_gil_blocking(GilSite::Test, |py| {
             let original = 8000..9000;
             let py_range = PyPortRange(original.clone());
             let py_obj = py_range.into_pyobject(py).unwrap();

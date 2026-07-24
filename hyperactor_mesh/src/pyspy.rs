@@ -11,11 +11,12 @@
 //! See PS-* and PP-* invariants in `introspect` module doc.
 
 use async_trait::async_trait;
-use hyperactor as hyperactor_reference;
 use hyperactor::Actor;
 use hyperactor::Context;
+use hyperactor::Endpoint as _;
 use hyperactor::HandleClient;
 use hyperactor::Handler;
+use hyperactor::OncePortRef;
 use hyperactor::RefClient;
 use serde::Deserialize;
 use serde::Serialize;
@@ -350,9 +351,6 @@ pub(crate) enum ProfileExecOutcome {
         binary: String,
         error: String,
     },
-    WorkerSpawnFailure {
-        error: String,
-    },
     SubprocessSpawnFailure {
         pid: u32,
         binary: String,
@@ -410,9 +408,6 @@ impl From<ProfileExecOutcome> for PySpyProfileResult {
             ProfileExecOutcome::OutputReadFailure { pid, binary, error } => {
                 PySpyProfileResult::OutputReadFailure { pid, binary, error }
             }
-            ProfileExecOutcome::WorkerSpawnFailure { error } => {
-                PySpyProfileResult::WorkerSpawnFailure { error }
-            }
             ProfileExecOutcome::SubprocessSpawnFailure { pid, binary, error } => {
                 PySpyProfileResult::SubprocessSpawnFailure { pid, binary, error }
             }
@@ -439,7 +434,7 @@ pub struct PySpyDump {
     pub opts: PySpyOpts,
     /// Reply port for the result.
     #[reply]
-    pub result: hyperactor_reference::OncePortRef<PySpyResult>,
+    pub result: OncePortRef<PySpyResult>,
 }
 wirevalue::register_type!(PySpyDump);
 
@@ -456,7 +451,7 @@ pub struct PySpyProfile {
     pub request: ValidatedProfileRequest,
     /// Reply port for the result.
     #[reply]
-    pub result: hyperactor_reference::OncePortRef<PySpyProfileResult>,
+    pub result: OncePortRef<PySpyProfileResult>,
 }
 wirevalue::register_type!(PySpyProfile);
 
@@ -550,33 +545,14 @@ impl Actor for PySpyWorker {}
 
 impl PySpyWorker {
     /// Spawn a PySpyWorker, forward the py-spy request, and let
-    /// the worker reply directly to the caller. On spawn failure,
-    /// sends a `Failed` result back via `reply_port`.
+    /// the worker reply directly to the caller.
     pub(crate) fn spawn_and_forward(
         cx: &impl hyperactor::context::Actor,
         opts: PySpyOpts,
         reply_port: hyperactor::OncePortRef<PySpyResult>,
     ) -> Result<(), anyhow::Error> {
-        let worker = match Self.spawn(cx) {
-            Ok(handle) => handle,
-            Err(e) => {
-                let fail = PySpyResult::Failed {
-                    pid: std::process::id(),
-                    binary: String::new(),
-                    exit_code: None,
-                    stderr: format!("failed to spawn pyspy worker: {}", e),
-                };
-                reply_port.send(cx, fail)?;
-                return Ok(());
-            }
-        };
-        // Once reply_port moves into RunPySpyDump, we lose it.
-        // MailboxSenderError does not carry the unsent message, so
-        // on send failure the caller will observe a timeout rather
-        // than an explicit Failed reply.
-        if let Err(e) = worker.send(cx, RunPySpyDump { opts, reply_port }) {
-            tracing::error!("failed to send to pyspy worker: {}", e);
-        }
+        let worker = cx.spawn(Self);
+        worker.post(cx, RunPySpyDump { opts, reply_port });
         Ok(())
     }
 }
@@ -589,7 +565,7 @@ impl Handler<RunPySpyDump> for PySpyWorker {
         message: RunPySpyDump,
     ) -> Result<(), anyhow::Error> {
         let result = PySpyRunner.dump_self(&message.opts).await;
-        message.reply_port.send(cx, result)?;
+        message.reply_port.post(cx, result);
         cx.stop("pyspy dump complete")?;
         Ok(())
     }
@@ -612,36 +588,20 @@ pub struct PySpyProfileWorker;
 impl Actor for PySpyProfileWorker {}
 
 impl PySpyProfileWorker {
-    /// Spawn a profile worker and forward the request. On spawn
-    /// failure, sends `WorkerSpawnFailure` back via `reply_port`.
+    /// Spawn a profile worker and forward the request.
     pub(crate) fn spawn_and_forward(
         cx: &impl hyperactor::context::Actor,
         request: ValidatedProfileRequest,
         reply_port: hyperactor::OncePortRef<PySpyProfileResult>,
     ) -> Result<(), anyhow::Error> {
-        let worker = match Self.spawn(cx) {
-            Ok(handle) => handle,
-            Err(e) => {
-                let fail = ProfileExecOutcome::WorkerSpawnFailure {
-                    error: e.to_string(),
-                };
-                reply_port.send(cx, PySpyProfileResult::from(fail))?;
-                return Ok(());
-            }
-        };
-        // Once reply_port moves into RunPySpyProfile, we lose it.
-        // MailboxSenderError does not carry the unsent message, so
-        // on send failure the caller observes a bridge timeout
-        // rather than a typed error. Same limitation as PySpyWorker.
-        if let Err(e) = worker.send(
+        let worker = cx.spawn(Self);
+        worker.post(
             cx,
             RunPySpyProfile {
                 request,
                 reply_port,
             },
-        ) {
-            tracing::error!("failed to send to profile worker: {}", e);
-        }
+        );
         Ok(())
     }
 }
@@ -656,7 +616,7 @@ impl Handler<RunPySpyProfile> for PySpyProfileWorker {
         let outcome = PySpyRunner.profile_self(&message.request).await;
         message
             .reply_port
-            .send(cx, PySpyProfileResult::from(outcome))?;
+            .post(cx, PySpyProfileResult::from(outcome));
         cx.stop("pyspy profile complete")?;
         Ok(())
     }
@@ -666,11 +626,11 @@ impl Handler<RunPySpyProfile> for PySpyProfileWorker {
 /// See PS-3 in `introspect` module doc.
 fn resolve_candidates(pyspy_bin_env: Option<String>) -> Vec<(String, String)> {
     let mut candidates = vec![];
-    if let Some(path) = pyspy_bin_env {
-        if !path.is_empty() {
-            let label = format!("PYSPY_BIN={}", path);
-            candidates.push((path, label));
-        }
+    if let Some(path) = pyspy_bin_env
+        && !path.is_empty()
+    {
+        let label = format!("PYSPY_BIN={}", path);
+        candidates.push((path, label));
     }
     candidates.push(("py-spy".to_string(), "py-spy on PATH".to_string()));
     candidates
@@ -1110,7 +1070,7 @@ mod tests {
             }],
             warnings: vec![],
         };
-        let any = wirevalue::Any::serialize(&original).expect("serialize");
+        let any: wirevalue::Any = wirevalue::Any::serialize(&original).expect("serialize");
         let restored: PySpyResult = any.deserialized().expect("deserialize");
         assert_eq!(original, restored);
     }
@@ -1732,10 +1692,6 @@ exit 0
             error: "permission denied".into(),
         });
         assert!(matches!(r, PySpyProfileResult::OutputReadFailure { .. }));
-
-        let r =
-            PySpyProfileResult::from(ProfileExecOutcome::WorkerSpawnFailure { error: "w".into() });
-        assert!(matches!(r, PySpyProfileResult::WorkerSpawnFailure { .. }));
 
         let r = PySpyProfileResult::from(ProfileExecOutcome::SubprocessSpawnFailure {
             pid: 1,

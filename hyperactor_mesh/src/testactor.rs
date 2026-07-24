@@ -19,20 +19,20 @@ use std::ops::Deref;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use hyperactor as hyperactor_reference;
 use hyperactor::Actor;
-use hyperactor::Bind;
+use hyperactor::ActorRef;
 use hyperactor::Context;
+use hyperactor::Endpoint as _;
 use hyperactor::Handler;
 use hyperactor::Instance;
 use hyperactor::RefClient;
-use hyperactor::Unbind;
 #[cfg(test)]
 use hyperactor::context;
 use hyperactor::ordering::SEQ_INFO;
 use hyperactor::ordering::SeqInfo;
 use hyperactor::supervision::ActorSupervisionEvent;
 use hyperactor_config::Flattrs;
+use hyperactor_config::attrs::declare_attrs;
 use hyperactor_config::global::Source;
 use ndslice::Point;
 #[cfg(test)]
@@ -47,7 +47,8 @@ use crate::ActorMesh;
 #[cfg(test)]
 use crate::ActorMeshRef;
 use crate::ProcMeshRef;
-use crate::comm::multicast::CastInfo;
+use crate::casting::CAST_POINT;
+use crate::casting::CastInfo;
 use crate::mesh_id::ActorMeshId;
 use crate::supervision::MeshFailure;
 #[cfg(test)]
@@ -56,13 +57,14 @@ use crate::testing;
 /// A simple test actor used by various unit tests.
 #[derive(Default, Debug)]
 #[hyperactor::export(
-    () { cast = true },
-    GetActorId { cast = true },
-    GetCastInfo { cast = true },
-    CauseSupervisionEvent { cast = true },
+    (),
+    GetActorId,
+    GetCastInfo,
+    GetResourceRank,
+    CauseSupervisionEvent,
     Forward,
-    GetConfigAttrs { cast = true },
-    SetConfigAttrs { cast = true },
+    GetConfigAttrs,
+    SetConfigAttrs,
 )]
 #[hyperactor::spawnable]
 pub struct TestActor;
@@ -70,10 +72,8 @@ pub struct TestActor;
 impl Actor for TestActor {}
 
 /// A message that returns the recipient actor's id and cast message's seq info.
-#[derive(Debug, Clone, Named, Bind, Unbind, Serialize, Deserialize)]
-pub struct GetActorId(
-    #[binding(include)] pub hyperactor::PortRef<(hyperactor::ActorAddr, Option<SeqInfo>)>,
-);
+#[derive(Debug, Clone, Named, Serialize, Deserialize)]
+pub struct GetActorId(pub hyperactor::PortRef<(hyperactor::ActorAddr, Option<SeqInfo>)>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SupervisionEventType {
@@ -84,7 +84,7 @@ pub enum SupervisionEventType {
 
 /// A message that causes a supervision event. The one argument determines what
 /// kind of supervision event it'll be.
-#[derive(Debug, Clone, Named, Bind, Unbind, Serialize, Deserialize)]
+#[derive(Debug, Clone, Named, Serialize, Deserialize)]
 pub struct CauseSupervisionEvent {
     pub kind: SupervisionEventType,
     pub send_to_children: bool,
@@ -127,7 +127,7 @@ impl Handler<GetActorId> for TestActor {
         GetActorId(reply): GetActorId,
     ) -> Result<(), anyhow::Error> {
         let seq_info = cx.headers().get(SEQ_INFO);
-        reply.send(cx, (cx.self_id().clone(), seq_info))?;
+        reply.post(cx, (cx.self_addr().clone(), seq_info));
         Ok(())
     }
 }
@@ -198,7 +198,7 @@ impl Handler<std::time::Duration> for SleepActor {
 /// A message to forward to a visit list of ports.
 /// Each port removes the next entry, and adds it to the
 /// 'visited' list.
-#[derive(Debug, Clone, Named, Bind, Unbind, Serialize, Deserialize)]
+#[derive(Debug, Clone, Named, Serialize, Deserialize)]
 pub struct Forward {
     pub to_visit: VecDeque<hyperactor::PortRef<Forward>>,
     pub visited: Vec<hyperactor::PortRef<Forward>>,
@@ -220,31 +220,17 @@ impl Handler<Forward> for TestActor {
         visited.push(this);
         let next = to_visit.front().cloned();
         anyhow::ensure!(next.is_some(), "unexpected forward chain termination");
-        next.unwrap().send(cx, Forward { to_visit, visited })?;
+        next.unwrap().post(cx, Forward { to_visit, visited });
         Ok(())
     }
 }
 
 /// Just return the cast info of the sender.
-#[derive(
-    Debug,
-    Clone,
-    Named,
-    Bind,
-    Unbind,
-    Serialize,
-    Deserialize,
-    Handler,
-    RefClient
-)]
+#[derive(Debug, Clone, Named, Serialize, Deserialize, Handler, RefClient)]
 pub struct GetCastInfo {
     /// Originating actor, point, sender.
     #[reply]
-    pub cast_info: hyperactor::PortRef<(
-        Point,
-        hyperactor_reference::ActorRef<TestActor>,
-        hyperactor::ActorAddr,
-    )>,
+    pub cast_info: hyperactor::PortRef<(Point, ActorRef<TestActor>, hyperactor::ActorAddr)>,
 }
 
 #[async_trait]
@@ -254,7 +240,26 @@ impl Handler<GetCastInfo> for TestActor {
         cx: &Context<Self>,
         GetCastInfo { cast_info }: GetCastInfo,
     ) -> Result<(), anyhow::Error> {
-        cast_info.send(cx, (cx.cast_point(), cx.bind(), cx.sender().clone()))?;
+        cast_info.post(cx, (cx.cast_point(), cx.bind(), cx.sender().clone()));
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Named, Serialize, Deserialize)]
+pub struct GetResourceRank {
+    pub rank: crate::resource::Rank,
+    pub reply: hyperactor::PortRef<(Point, Option<usize>)>,
+}
+
+#[async_trait]
+impl Handler<GetResourceRank> for TestActor {
+    async fn handle(
+        &mut self,
+        cx: &Context<Self>,
+        GetResourceRank { rank, reply }: GetResourceRank,
+    ) -> Result<(), anyhow::Error> {
+        reply.post(cx, (cx.cast_point(), rank.0));
+
         Ok(())
     }
 }
@@ -279,7 +284,94 @@ impl hyperactor::RemoteSpawn for FailingCreateTestActor {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Named, Bind, Unbind)]
+declare_attrs! {
+    /// Persistent sentinel used by actor-environment transport tests.
+    pub attr ACTOR_ENVIRONMENT_TEST_TAG: u64;
+}
+
+/// What an [`ActorEnvironmentProbe`] observed at construction and after its
+/// native instance was installed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Named)]
+pub struct ActorEnvironmentObservation {
+    pub label: String,
+    pub persistent_tag: Option<u64>,
+    pub constructor_tag: Option<u64>,
+    pub constructor_point: Option<Point>,
+    pub stored_point: Option<Point>,
+    pub proc_addr: String,
+}
+wirevalue::register_type!(ActorEnvironmentObservation);
+
+/// Construction parameters for [`ActorEnvironmentProbe`].
+#[derive(Clone, Debug, Serialize, Deserialize, Named)]
+pub struct ActorEnvironmentProbeParams {
+    pub label: String,
+    pub reply: hyperactor::PortRef<ActorEnvironmentObservation>,
+    pub nested: Option<(ProcMeshRef, String, String)>,
+}
+wirevalue::register_type!(ActorEnvironmentProbeParams);
+
+/// A remote-spawn probe that optionally performs one nested ProcMesh spawn.
+#[derive(Debug)]
+#[hyperactor::export(handlers = [])]
+pub struct ActorEnvironmentProbe {
+    label: String,
+    reply: hyperactor::PortRef<ActorEnvironmentObservation>,
+    nested: Option<(ProcMeshRef, String, String)>,
+    constructor_tag: Option<u64>,
+    constructor_point: Option<Point>,
+}
+
+#[async_trait]
+impl Actor for ActorEnvironmentProbe {
+    async fn init(&mut self, this: &Instance<Self>) -> anyhow::Result<()> {
+        self.reply.post(
+            this,
+            ActorEnvironmentObservation {
+                label: self.label.clone(),
+                persistent_tag: this.actor_environment().get(ACTOR_ENVIRONMENT_TEST_TAG),
+                constructor_tag: self.constructor_tag,
+                constructor_point: self.constructor_point.clone(),
+                stored_point: this.actor_environment().get(CAST_POINT),
+                proc_addr: this.proc().proc_addr().to_string(),
+            },
+        );
+
+        if let Some((proc_mesh, name, label)) = self.nested.take() {
+            proc_mesh
+                .spawn_controllerless_service::<Self, _>(
+                    this,
+                    &name,
+                    &ActorEnvironmentProbeParams {
+                        label,
+                        reply: self.reply.clone(),
+                        nested: None,
+                    },
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl hyperactor::RemoteSpawn for ActorEnvironmentProbe {
+    type Params = ActorEnvironmentProbeParams;
+
+    async fn new(params: Self::Params, environment: Flattrs) -> anyhow::Result<Self> {
+        Ok(Self {
+            label: params.label,
+            reply: params.reply,
+            nested: params.nested,
+            constructor_tag: environment.get(ACTOR_ENVIRONMENT_TEST_TAG),
+            constructor_point: environment.get(CAST_POINT),
+        })
+    }
+}
+
+hyperactor::register_spawnable!(ActorEnvironmentProbe);
+
+#[derive(Clone, Debug, Serialize, Deserialize, Named)]
 pub struct SetConfigAttrs(pub Vec<u8>);
 
 #[async_trait]
@@ -296,7 +388,7 @@ impl Handler<SetConfigAttrs> for TestActor {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Named, Bind, Unbind)]
+#[derive(Clone, Debug, Serialize, Deserialize, Named)]
 pub struct GetConfigAttrs(pub hyperactor::PortRef<Vec<u8>>);
 
 #[async_trait]
@@ -310,7 +402,7 @@ impl Handler<GetConfigAttrs> for TestActor {
             hyperactor_config::global::attrs(),
             bincode::config::legacy(),
         )?;
-        reply.send(cx, attrs)?;
+        reply.post(cx, attrs);
         Ok(())
     }
 }
@@ -318,18 +410,14 @@ impl Handler<GetConfigAttrs> for TestActor {
 /// A message to request the next supervision event delivered to WrapperActor.
 /// Replies with None if no supervision event is encountered within a timeout
 /// (10 seconds).
-#[derive(Clone, Debug, Serialize, Deserialize, Named, Bind, Unbind)]
+#[derive(Clone, Debug, Serialize, Deserialize, Named)]
 pub struct NextSupervisionFailure(pub hyperactor::PortRef<Option<MeshFailure>>);
 
 /// A small wrapper to handle supervision messages so they don't
 /// need to reach the client. This just wraps and forwards all messages to TestActor.
 /// The supervision events are sent back to "supervisor".
 #[derive(Debug)]
-#[hyperactor::export(
-    CauseSupervisionEvent { cast = true },
-    MeshFailure { cast = true },
-    NextSupervisionFailure { cast = true },
-)]
+#[hyperactor::export(CauseSupervisionEvent, MeshFailure, NextSupervisionFailure)]
 #[hyperactor::spawnable]
 pub struct WrapperActor {
     proc_mesh: ProcMeshRef,
@@ -399,7 +487,7 @@ impl Handler<NextSupervisionFailure> for WrapperActor {
         let mesh = if let Some(mesh) = self.mesh.as_ref() {
             mesh.deref()
         } else {
-            msg.0.send(cx, None)?;
+            msg.0.post(cx, None);
             return Ok(());
         };
         let failure = match tokio::time::timeout(
@@ -414,7 +502,7 @@ impl Handler<NextSupervisionFailure> for WrapperActor {
             // If we timeout, send back None.
             Err(_) => None,
         };
-        msg.0.send(cx, failure)?;
+        msg.0.post(cx, failure);
         Ok(())
     }
 }
@@ -427,7 +515,7 @@ impl Handler<MeshFailure> for WrapperActor {
         tracing::info!("got supervision event from child: {}", msg);
         // Send to a port so the client can view the messages.
         // Ignore the error if there is one.
-        let _ = self.supervisor.send(cx, msg.clone());
+        let _ = self.supervisor.post(cx, msg.clone());
         Ok(())
     }
 }
@@ -463,7 +551,7 @@ pub async fn assert_casting_correctness(
     actor_mesh.cast(instance, GetActorId(port.bind())).unwrap();
     let expected_actor_ids = actor_mesh
         .values()
-        .map(|actor_ref| actor_ref.actor_id().clone())
+        .map(|actor_ref| actor_ref.actor_addr().clone())
         .collect::<Vec<_>>();
     let mut expected: HashMap<&hyperactor::ActorAddr, Option<SeqInfo>> = match expected_seqs {
         None => expected_actor_ids

@@ -8,142 +8,226 @@
 
 //! Recursive-descent parsing for Hyperactor ids.
 //!
-//! This module parses only the id grammar. It does not validate labels,
-//! base58 uid text, or decimal ports beyond the structural checks that are
-//! needed to distinguish grammar productions. Semantic validation happens when
-//! the parsed parts are converted into concrete `id` types.
+//! This module parses the id grammar and performs semantic validation for
+//! labels, base58 uids, and decimal ports while token spans are still
+//! available.
 
+use crate::id::ActorId;
+use crate::id::Id;
+use crate::id::Label;
+use crate::id::PortId;
+use crate::id::ProcId;
+use crate::id::Uid;
 use crate::parse::error::ParseError;
 use crate::parse::lex::Lexer;
 use crate::parse::lex::Span;
 use crate::parse::lex::Token;
 use crate::parse::lex::TokenKind;
+use crate::port::ControlPort;
+use crate::port::Port;
 
-/// A parsed id component.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum IdComponent<'a> {
-    /// A singleton label.
-    Singleton { label: &'a str, span: Span },
-    /// An instance uid, optionally labeled.
-    Instance {
-        label: Option<&'a str>,
-        uid: &'a str,
-        span: Span,
-    },
-}
+/// Flickr base58 alphabet.
+const BASE58_FLICKR: &[u8; 58] = b"123456789abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ";
 
-/// A parsed proc id.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ProcIdParts<'a> {
-    /// The proc id component.
-    pub(crate) component: IdComponent<'a>,
-}
-
-/// A parsed actor id.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ActorIdParts<'a> {
-    /// The actor id component.
-    pub(crate) actor: IdComponent<'a>,
-    /// The process id component.
-    pub(crate) proc_: IdComponent<'a>,
-}
-
-/// A parsed port id.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PortIdParts<'a> {
-    /// The parsed actor id.
-    pub(crate) actor: ActorIdParts<'a>,
-    /// The raw decimal port text.
-    pub(crate) port: &'a str,
-}
-
-pub(crate) fn parse_proc_id(input: &str) -> Result<ProcIdParts<'_>, ParseError> {
+pub(crate) fn parse_uid_str(input: &str) -> Result<Uid, ParseError> {
     let mut parser = Parser::new(input);
-    let parts = parse_proc_id_parts(&mut parser)?;
+    let uid = parse_uid(&mut parser)?;
     parser.finish()?;
-    Ok(parts)
+    Ok(uid)
 }
 
-pub(crate) fn parse_actor_id(input: &str) -> Result<ActorIdParts<'_>, ParseError> {
+pub(crate) fn parse_id(input: &str) -> Result<Id, ParseError> {
     let mut parser = Parser::new(input);
-    let parts = parse_actor_id_parts(&mut parser)?;
+    let id = parse_id_with_parser(&mut parser)?;
     parser.finish()?;
-    Ok(parts)
+    Ok(id)
 }
 
-pub(crate) fn parse_port_id(input: &str) -> Result<PortIdParts<'_>, ParseError> {
+pub(crate) fn parse_proc_id(input: &str) -> Result<ProcId, ParseError> {
     let mut parser = Parser::new(input);
-    let parts = parse_port_id_parts(&mut parser)?;
+    let id = parse_proc_id_with_parser(&mut parser)?;
     parser.finish()?;
-    Ok(parts)
+    Ok(id)
 }
 
-pub(crate) fn parse_proc_id_parts<'a>(
-    parser: &mut Parser<'a>,
-) -> Result<ProcIdParts<'a>, ParseError> {
-    Ok(ProcIdParts {
-        component: parse_id_component(parser)?,
-    })
+pub(crate) fn parse_actor_id(input: &str) -> Result<ActorId, ParseError> {
+    let mut parser = Parser::new(input);
+    let id = parse_actor_id_with_parser(&mut parser)?;
+    parser.finish()?;
+    Ok(id)
 }
 
-pub(crate) fn parse_actor_id_parts<'a>(
-    parser: &mut Parser<'a>,
-) -> Result<ActorIdParts<'a>, ParseError> {
-    let actor = parse_id_component(parser)?;
-    parser.expect_kind(TokenKind::Dot)?;
-    let proc_ = parse_id_component(parser)?;
-    Ok(ActorIdParts { actor, proc_ })
+pub(crate) fn parse_port_id(input: &str) -> Result<PortId, ParseError> {
+    let mut parser = Parser::new(input);
+    let id = parse_port_id_with_parser(&mut parser)?;
+    parser.finish()?;
+    Ok(id)
 }
 
-pub(crate) fn parse_port_id_parts<'a>(
-    parser: &mut Parser<'a>,
-) -> Result<PortIdParts<'a>, ParseError> {
-    let actor = parse_actor_id_parts(parser)?;
-    parser.expect_kind(TokenKind::Colon)?;
-    let port = parser.expect_text("decimal port")?;
-    if !port.text.bytes().all(|ch| ch.is_ascii_digit()) {
-        return Err(ParseError::invalid_port(port));
+pub(crate) fn parse_uid(parser: &mut Parser<'_>) -> Result<Uid, ParseError> {
+    parse_id_component(parser)
+}
+
+pub(crate) fn parse_id_with_parser(parser: &mut Parser<'_>) -> Result<Id, ParseError> {
+    let first = parse_uid(parser)?;
+    match parser.peek().kind {
+        TokenKind::Dot => {
+            parser.bump();
+            let proc_id = parse_proc_id_with_parser(parser)?;
+            let actor_id = ActorId::new(first, proc_id, None);
+            match parser.peek().kind {
+                TokenKind::Colon => {
+                    parser.bump();
+                    let port = parse_port(parser)?;
+                    Ok(Id::Port(PortId::new(actor_id, port)))
+                }
+                TokenKind::Bang => {
+                    parser.bump();
+                    let port = parse_control_port(parser)?;
+                    Ok(Id::Port(PortId::new(actor_id, port)))
+                }
+                _ => Ok(Id::Actor(actor_id)),
+            }
+        }
+        _ => Ok(Id::Proc(ProcId::new(first, None))),
     }
-    Ok(PortIdParts {
-        actor,
-        port: port.text,
-    })
 }
 
-pub(crate) fn parse_id_component<'a>(
-    parser: &mut Parser<'a>,
-) -> Result<IdComponent<'a>, ParseError> {
+pub(crate) fn parse_proc_id_with_parser(parser: &mut Parser<'_>) -> Result<ProcId, ParseError> {
+    Ok(ProcId::new(parse_uid(parser)?, None))
+}
+
+pub(crate) fn parse_actor_id_with_parser(parser: &mut Parser<'_>) -> Result<ActorId, ParseError> {
+    let actor = parse_uid(parser)?;
+    parser.expect_kind(TokenKind::Dot)?;
+    let proc_id = parse_proc_id_with_parser(parser)?;
+    Ok(ActorId::new(actor, proc_id, None))
+}
+
+pub(crate) fn parse_port_id_with_parser(parser: &mut Parser<'_>) -> Result<PortId, ParseError> {
+    let actor_id = parse_actor_id_with_parser(parser)?;
+    let port = match parser.peek().kind {
+        TokenKind::Colon => {
+            parser.bump();
+            parse_port(parser)?
+        }
+        TokenKind::Bang => {
+            parser.bump();
+            parse_control_port(parser)?
+        }
+        _ => return Err(ParseError::expected(parser.peek(), "\":\" or \"!\"")),
+    };
+    Ok(PortId::new(actor_id, port))
+}
+
+fn parse_port(parser: &mut Parser<'_>) -> Result<Port, ParseError> {
+    match parser.peek().kind {
+        TokenKind::Text => {
+            let port = parser.bump();
+            if port.text.bytes().all(|ch| ch.is_ascii_digit()) {
+                let port: u64 = port
+                    .text
+                    .parse()
+                    .map_err(|_| ParseError::invalid_port(port))?;
+                return Ok(Port::ephemeral(port));
+            }
+
+            let uid = parse_id_component_from_first_text(port, parser)?;
+            parse_handler_port(uid, port)
+        }
+        TokenKind::LessThan => {
+            let port = parser.peek();
+            parse_handler_port(parse_id_component(parser)?, port)
+        }
+        _ => Err(ParseError::expected(parser.peek(), "port")),
+    }
+}
+
+fn parse_handler_port(uid: Uid, token: Token<'_>) -> Result<Port, ParseError> {
+    match uid {
+        Uid::Instance(_, _) => Ok(Port::Handler(uid)),
+        Uid::Singleton(_) => Err(ParseError::invalid_port(token)),
+    }
+}
+
+fn parse_control_port(parser: &mut Parser<'_>) -> Result<Port, ParseError> {
+    let port = parser.expect_text("control port")?;
+    port.text
+        .parse::<ControlPort>()
+        .map(Port::control)
+        .map_err(|_| ParseError::invalid_port(port))
+}
+
+pub(crate) fn parse_id_component(parser: &mut Parser<'_>) -> Result<Uid, ParseError> {
     match parser.peek().kind {
         TokenKind::Text => {
             let label = parser.bump();
-            if parser.peek().kind == TokenKind::LessThan {
-                parser.bump();
-                let uid = parser.expect_text("uid text")?;
-                let end = parser.expect_kind(TokenKind::GreaterThan)?;
-                Ok(IdComponent::Instance {
-                    label: Some(label.text),
-                    uid: uid.text,
-                    span: Span::new(label.span.start, end.span.end),
-                })
-            } else {
-                Ok(IdComponent::Singleton {
-                    label: label.text,
-                    span: label.span,
-                })
-            }
+            parse_id_component_from_first_text(label, parser)
         }
         TokenKind::LessThan => {
-            let start = parser.bump();
+            parser.bump();
             let uid = parser.expect_text("uid text")?;
-            let end = parser.expect_kind(TokenKind::GreaterThan)?;
-            Ok(IdComponent::Instance {
-                label: None,
-                uid: uid.text,
-                span: Span::new(start.span.start, end.span.end),
-            })
+            parser.expect_kind(TokenKind::GreaterThan)?;
+            Ok(Uid::Instance(parse_base58_uid(uid)?, None))
         }
         _ => Err(ParseError::expected(parser.bump(), "\"label\" or \"<\"")),
     }
+}
+
+fn parse_id_component_from_first_text(
+    label: Token<'_>,
+    parser: &mut Parser<'_>,
+) -> Result<Uid, ParseError> {
+    if parser.peek().kind == TokenKind::LessThan {
+        parser.bump();
+        let uid = parser.expect_text("uid text")?;
+        parser.expect_kind(TokenKind::GreaterThan)?;
+        let label = parse_label(label)?;
+        let uid = parse_base58_uid(uid)?;
+        Ok(Uid::Instance(uid, Some(label)))
+    } else {
+        Ok(Uid::Singleton(parse_label(label)?))
+    }
+}
+
+fn parse_label(token: Token<'_>) -> Result<Label, ParseError> {
+    Label::new(token.text).map_err(|err| ParseError::invalid_label(token.span, err.to_string()))
+}
+
+fn parse_base58_uid(token: Token<'_>) -> Result<u64, ParseError> {
+    decode_base58_uid(token.text).map_err(|_| ParseError::invalid_base58_uid(token))
+}
+
+pub(crate) fn encode_base58_uid(mut uid: u64) -> String {
+    if uid == 0 {
+        return "1".to_string();
+    }
+
+    let mut digits = Vec::new();
+    while uid > 0 {
+        digits.push(BASE58_FLICKR[(uid % 58) as usize] as char);
+        uid /= 58;
+    }
+    digits.iter().rev().collect()
+}
+
+pub(crate) fn decode_base58_uid(s: &str) -> Result<u64, ()> {
+    if s.is_empty() {
+        return Err(());
+    }
+
+    let mut uid = 0u64;
+    for ch in s.bytes() {
+        let digit = BASE58_FLICKR
+            .iter()
+            .position(|candidate| *candidate == ch)
+            .ok_or(())? as u64;
+        uid = uid
+            .checked_mul(58)
+            .and_then(|value| value.checked_add(digit))
+            .ok_or(())?;
+    }
+    Ok(uid)
 }
 
 pub(crate) struct Parser<'a> {
@@ -204,10 +288,19 @@ impl<'a> Parser<'a> {
         &self.input[self.peek().span.start..]
     }
 
-    pub(crate) fn take_rest(&mut self) -> &'a str {
-        let rest = self.rest();
-        self.lookahead = Token::eof(self.input.len());
-        rest
+    pub(crate) fn rest_span(&self) -> Span {
+        Span::new(self.peek().span.start, self.input.len())
+    }
+
+    /// Restrict the remaining input to `[current, end)`, synthesizing
+    /// an EOF at `end`. The current position is preserved. Used to
+    /// parse a prefix with the combinator when its tail (e.g. a sniffed
+    /// ZMQ URL) is handled outside the token grammar.
+    pub(crate) fn truncate(&mut self, end: usize) {
+        let start = self.peek().span.start;
+        self.input = &self.input[..end];
+        self.lexer = Lexer::new_at(self.input, start);
+        self.lookahead = self.lexer.next().unwrap_or_else(|| Token::eof(end));
     }
 }
 
@@ -216,87 +309,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_parse_uid_forms() {
+        assert_eq!(parse_uid_str("local").unwrap().to_string(), "local");
+        assert_eq!(
+            parse_uid_str("controller<2>").unwrap().to_string(),
+            "controller<2>"
+        );
+        assert_eq!(parse_uid_str("<2>").unwrap().to_string(), "<2>");
+    }
+
+    #[test]
     fn test_parse_proc_id_forms() {
+        assert_eq!(parse_proc_id("local").unwrap().to_string(), "local");
         assert_eq!(
-            parse_proc_id("local").unwrap(),
-            ProcIdParts {
-                component: IdComponent::Singleton {
-                    label: "local",
-                    span: Span::new(0, 5),
-                },
-            }
+            parse_proc_id("controller<2>").unwrap().to_string(),
+            "controller<2>"
         );
-        assert_eq!(
-            parse_proc_id("controller<abc>").unwrap(),
-            ProcIdParts {
-                component: IdComponent::Instance {
-                    label: Some("controller"),
-                    uid: "abc",
-                    span: Span::new(0, 15),
-                },
-            }
-        );
-        assert_eq!(
-            parse_proc_id("<abc>").unwrap(),
-            ProcIdParts {
-                component: IdComponent::Instance {
-                    label: None,
-                    uid: "abc",
-                    span: Span::new(0, 5),
-                },
-            }
-        );
+        assert_eq!(parse_proc_id("<2>").unwrap().to_string(), "<2>");
     }
 
     #[test]
     fn test_parse_actor_id_forms() {
         assert_eq!(
-            parse_actor_id("controller.local").unwrap(),
-            ActorIdParts {
-                actor: IdComponent::Singleton {
-                    label: "controller",
-                    span: Span::new(0, 10),
-                },
-                proc_: IdComponent::Singleton {
-                    label: "local",
-                    span: Span::new(11, 16),
-                },
-            }
+            parse_actor_id("controller.local").unwrap().to_string(),
+            "controller.local"
         );
         assert_eq!(
-            parse_actor_id("controller<abc>.local").unwrap(),
-            ActorIdParts {
-                actor: IdComponent::Instance {
-                    label: Some("controller"),
-                    uid: "abc",
-                    span: Span::new(0, 15),
-                },
-                proc_: IdComponent::Singleton {
-                    label: "local",
-                    span: Span::new(16, 21),
-                },
-            }
+            parse_actor_id("controller<2>.local").unwrap().to_string(),
+            "controller<2>.local"
         );
     }
 
     #[test]
     fn test_parse_port_id_form() {
         assert_eq!(
-            parse_port_id("controller.local:7").unwrap(),
-            PortIdParts {
-                actor: ActorIdParts {
-                    actor: IdComponent::Singleton {
-                        label: "controller",
-                        span: Span::new(0, 10),
-                    },
-                    proc_: IdComponent::Singleton {
-                        label: "local",
-                        span: Span::new(11, 16),
-                    },
-                },
-                port: "7",
-            }
+            parse_port_id("controller.local:7").unwrap().to_string(),
+            "controller.local:7"
         );
+        assert_eq!(
+            parse_port_id("controller.local:handler<2>")
+                .unwrap()
+                .to_string(),
+            "controller.local:handler<2>"
+        );
+        assert_eq!(
+            parse_port_id("controller.local!introspect")
+                .unwrap()
+                .to_string(),
+            "controller.local!introspect"
+        );
+    }
+
+    #[test]
+    fn test_parse_id_specificity() {
+        assert!(parse_id("local").unwrap().is_proc());
+        assert!(parse_id("controller.local").unwrap().is_actor());
+        assert!(parse_id("controller.local:7").unwrap().is_port());
+    }
+
+    #[test]
+    fn test_parse_uid_reports_invalid_base58_span() {
+        let err = parse_uid_str("controller<0>").unwrap_err();
+        assert_eq!(err.to_string(), "invalid base58 uid: 0");
+        assert_eq!(err.span, Span::new(11, 12));
+    }
+
+    #[test]
+    fn test_parse_uid_reports_invalid_label_span() {
+        let err = parse_uid_str("Controller<2>").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid label: label must start with a lowercase letter"
+        );
+        assert_eq!(err.span, Span::new(0, 10));
     }
 
     #[test]
@@ -326,27 +411,15 @@ mod tests {
     #[test]
     fn test_parse_port_id_reports_missing_port_token() {
         let err = parse_port_id("controller.local:@inproc://0").unwrap_err();
-        assert_eq!(err.to_string(), "expected decimal port, found \"@\"");
+        assert_eq!(err.to_string(), "expected port, found \"@\"");
         assert_eq!(err.span, Span::new(17, 18));
     }
 
     #[test]
     fn test_parser_rest_tracks_location_boundary() {
         let mut parser = Parser::new("controller.local@inproc://0");
-        let actor = parse_actor_id_parts(&mut parser).unwrap();
-        assert_eq!(
-            actor,
-            ActorIdParts {
-                actor: IdComponent::Singleton {
-                    label: "controller",
-                    span: Span::new(0, 10),
-                },
-                proc_: IdComponent::Singleton {
-                    label: "local",
-                    span: Span::new(11, 16),
-                },
-            }
-        );
+        let actor = parse_actor_id_with_parser(&mut parser).unwrap();
+        assert_eq!(actor.to_string(), "controller.local");
         assert_eq!(parser.rest(), "@inproc://0");
     }
 }

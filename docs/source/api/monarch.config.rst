@@ -368,7 +368,7 @@ Message Handling
     Enable reordering buffer in dest actor.
 
     - **Type**: ``bool``
-    - **Default**: ``False``
+    - **Default**: ``True``
     - **Environment**: ``HYPERACTOR_ENABLE_DEST_ACTOR_REORDERING_BUFFER``
 
 
@@ -418,13 +418,6 @@ Mesh Bootstrap
 Runtime and Buffering
 ----------------------
 
-``shared_asyncio_runtime``
-    Share asyncio runtime across actors.
-
-    - **Type**: ``bool``
-    - **Default**: ``False``
-    - **Environment**: ``MONARCH_HYPERACTOR_SHARED_ASYNCIO_RUNTIME``
-
 ``small_write_threshold``
     Threshold below which writes are copied (in bytes).
 
@@ -443,7 +436,7 @@ Actor Configuration
     Enable queue-based dispatch for actor message handling.
 
     - **Type**: ``bool``
-    - **Default**: ``False``
+    - **Default**: ``True``
     - **Environment**: ``HYPERACTOR_ACTOR_QUEUE_DISPATCH``
 
     When ``True``, actor messages are dispatched through a queue rather than

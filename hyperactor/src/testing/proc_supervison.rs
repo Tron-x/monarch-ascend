@@ -52,8 +52,8 @@ impl ProcSupervisionCoordinator {
             tx,
             last: last.clone(),
         };
-        let coordinator = proc.spawn::<ProcSupervisionCoordinator>("coordinator", actor)?;
-        proc.set_supervision_coordinator(coordinator.port())?;
+        let coordinator = proc.spawn(actor);
+        proc.set_supervision_coordinator(coordinator.port().bind())?;
         Ok((ReportedEvent { rx, last }, coordinator))
     }
 }

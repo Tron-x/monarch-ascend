@@ -36,16 +36,15 @@ use hyperactor::Context;
 use hyperactor::HandleClient;
 use hyperactor::Handler;
 use hyperactor::Instance;
-use hyperactor::OncePortRef;
-use hyperactor::RefClient;
-use serde::Deserialize;
-use serde::Serialize;
-use typeuri::Named;
+use hyperactor::OncePortHandle;
 
 use super::HixlBuffer;
 use crate::RdmaOp;
+use crate::RdmaOpType;
 use crate::RdmaTransportLevel;
 use crate::backend::RdmaBackend;
+use crate::backend::RdmaConfig;
+use crate::local_memory::KeepaliveLocalMemory;
 use crate::rdma_manager_actor::EnsurePeerConnectedClient;
 use crate::rdma_manager_actor::RdmaManagerActor;
 
@@ -430,37 +429,36 @@ pub async fn ensure_connected(
 // HixlManagerMessage
 // ============================================================================
 
-#[derive(Handler, HandleClient, RefClient, Debug, Serialize, Deserialize, Named)]
+/// Local-only messages for the child HiXL actor.
+///
+/// Registration carries process-local memory metadata and must reply through a
+/// local handle. Using a serializable `OncePortRef` here can strand the reply
+/// when registration is initiated from the RDMA owner actor.
+#[derive(Handler, HandleClient, Debug)]
 pub enum HixlManagerMessage {
     RequestBuffer {
         remote_buf_id: usize,
         addr: usize,
         size: usize,
         #[reply]
-        reply: OncePortRef<Option<HixlBuffer>>,
+        reply: OncePortHandle<Option<HixlBuffer>>,
     },
     ReleaseBuffer {
         remote_buf_id: usize,
         #[reply]
-        reply: OncePortRef<()>,
+        reply: OncePortHandle<()>,
     },
     GetEngineId {
         #[reply]
-        reply: OncePortRef<String>,
+        reply: OncePortHandle<String>,
     },
 }
-wirevalue::register_type!(HixlManagerMessage);
 
 // ============================================================================
 // HixlManagerActor
 // ============================================================================
 
 #[derive(Debug)]
-#[hyperactor::export(
-    handlers = [
-        HixlManagerMessage,
-    ],
-)]
 pub struct HixlManagerActor {
     engine_id: String,
     device_id: i32,
@@ -696,20 +694,134 @@ impl HixlManagerMessageHandler for HixlManagerActor {
     }
 }
 
+/// Handle used by the upstream backend registry.
+///
+/// The actor owns per-buffer registration bookkeeping while the process-global
+/// [`HixlEngineState`] owns the actual HiXL engine and data plane.
+#[derive(Debug, Clone)]
+pub struct HixlBackend(pub ActorHandle<HixlManagerActor>);
+
 #[async_trait]
-impl RdmaBackend for HixlManagerActor {
+impl RdmaBackend for HixlBackend {
+    type RemoteBackendContext = HixlBuffer;
     type TransportInfo = ();
 
-    async fn submit(
-        &mut self,
-        _cx: &(impl hyperactor::context::Actor + Send + Sync),
-        _ops: Vec<RdmaOp>,
-        _timeout: std::time::Duration,
+    fn available() -> bool {
+        true
+    }
+
+    async fn spawn(
+        cx: &(impl hyperactor::context::Actor + Send + Sync),
+        config: &RdmaConfig,
+    ) -> Result<Self> {
+        let config = config.hixl.clone().unwrap_or_default();
+        Ok(Self(cx.spawn(HixlManagerActor::new(
+            config.engine_id.unwrap_or_default(),
+            config.device_id.unwrap_or(-1),
+        ))))
+    }
+
+    async fn register_remote_buffer(
+        &self,
+        cx: &(impl hyperactor::context::Actor + Send + Sync),
+        remote_buf_id: usize,
+        local: KeepaliveLocalMemory,
+    ) -> Result<HixlBuffer> {
+        self.0
+            .request_buffer(cx, remote_buf_id, local.addr(), local.size())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("HiXL failed to register buffer {remote_buf_id}"))
+    }
+
+    async fn release_buffer(
+        &self,
+        cx: &(impl hyperactor::context::Actor + Send + Sync),
+        remote_buf_id: usize,
     ) -> Result<()> {
-        Err(anyhow::anyhow!(
-            "HixlManagerActor::submit() should not be called directly; \
-             transfers go through the process-global HixlEngineState"
-        ))
+        self.0.release_buffer(cx, remote_buf_id).await
+    }
+
+    async fn submit(
+        &self,
+        cx: &(impl hyperactor::context::Actor + Send + Sync),
+        ops: Vec<RdmaOp>,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+
+        for op in ops {
+            let remote = op
+                .remote
+                .resolve_hixl()
+                .ok_or_else(|| anyhow::anyhow!("op routed to incompatible HiXL backend"))?;
+
+            register_mem_if_needed(op.local.addr(), op.local.size())?;
+            ensure_connected(cx, &op.remote.owner, &remote.engine_id).await?;
+
+            match op.op_type {
+                RdmaOpType::WriteFromLocal => {
+                    with_state(|state| {
+                        state
+                            .engine
+                            .transfer_write(
+                                &remote.engine_id,
+                                op.local.addr(),
+                                remote.addr,
+                                op.local.size(),
+                                timeout_ms,
+                            )
+                            .map_err(|ret| {
+                                anyhow::anyhow!(
+                                    "hixl_transfer_write failed: local={:#x} remote={:#x}@{} len={} ret={}",
+                                    op.local.addr(),
+                                    remote.addr,
+                                    remote.engine_id,
+                                    op.local.size(),
+                                    ret,
+                                )
+                            })
+                    })?;
+                }
+                RdmaOpType::ReadIntoLocal => {
+                    for attempt in 0..3u32 {
+                        let result = with_state(|state| {
+                            state
+                                .engine
+                                .transfer_read(
+                                    &remote.engine_id,
+                                    op.local.addr(),
+                                    remote.addr,
+                                    op.remote.size,
+                                    timeout_ms,
+                                )
+                                .map_err(|ret| {
+                                    anyhow::anyhow!(
+                                        "hixl_transfer_read failed: local={:#x} remote={:#x}@{} len={} ret={}",
+                                        op.local.addr(),
+                                        remote.addr,
+                                        remote.engine_id,
+                                        op.remote.size,
+                                        ret,
+                                    )
+                                })
+                        });
+                        match result {
+                            Ok(()) => break,
+                            Err(_) if attempt < 2 => {
+                                tracing::warn!(
+                                    "[hixl] transfer_read attempt {} failed, retrying in 1s",
+                                    attempt + 1,
+                                );
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn transport_level(&self) -> RdmaTransportLevel {

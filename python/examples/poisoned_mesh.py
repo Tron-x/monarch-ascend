@@ -83,61 +83,59 @@ class Worker(Actor):
 
 
 async def async_main(num_procs: int) -> None:
-    job = (
-        ProcessJob({"hosts": 1})
-        .enable_telemetry(TelemetryConfig(snapshot_interval_secs=30.0))
-        .enable_admin()
-    )
-    state = job.state(cached_path=None)
-    host = state.hosts
-
-    admin_url = state.admin_url
-    assert admin_url is not None
-    mtls_flags = (
-        "--cacert /var/facebook/rootcanal/ca.pem "
-        "--cert /var/facebook/x509_identities/server.pem "
-        "--key /var/facebook/x509_identities/server.pem "
-        if admin_url.startswith("https")
-        else ""
-    )
-    print(f"\nMesh admin server listening on {admin_url}")
-    print(f"  - Root node:     curl {mtls_flags}{admin_url}/v1/root")
-    print(f"  - Mesh tree:     curl {mtls_flags}{admin_url}/v1/tree")
-    print(f"  - API docs:      curl {mtls_flags}{admin_url}/SKILL.md")
-    print(
-        f"  - TUI:           buck2 run fbcode//monarch/hyperactor_mesh_admin_tui:hyperactor_mesh_admin_tui -- --addr {admin_url}"
-    )
-    print(flush=True)
-
-    procs = host.spawn_procs(per_host={"replica": num_procs})
-    workers = procs.spawn("worker", Worker)
-
-    # Let every worker do some work first.
-    await workers.work.call()
-    print(f"\n{num_procs} workers alive and working.", flush=True)
-
-    # Crash worker at rank 0.  The BaseException subclass bypasses the
-    # endpoint handler's Exception catch, killing the actor and
-    # triggering supervision.
-    print("\nCrashing worker[0] with 'GPU memory corruption'...", flush=True)
+    job = ProcessJob({"hosts": 1}).enable_telemetry(TelemetryConfig(dashboard_port=0))
     try:
-        await workers.slice(replica=0).crash.call_one("GPU memory corruption")
-    except Exception:
-        pass  # Expected — the actor died
+        state = job.state(cached_path=None)
+        host = state.hosts
 
-    # Give supervision time to propagate.
-    await asyncio.sleep(3)
+        admin_url = state.admin_url
+        assert admin_url is not None
+        mtls_flags = (
+            "--cacert /var/facebook/rootcanal/ca.pem "
+            "--cert /var/facebook/x509_identities/server.pem "
+            "--key /var/facebook/x509_identities/server.pem "
+            if admin_url.startswith("https")
+            else ""
+        )
+        print(f"\nMesh admin server listening on {admin_url}")
+        print(f"  - Root node:     curl {mtls_flags}{admin_url}/v1/root")
+        print(f"  - Mesh tree:     curl {mtls_flags}{admin_url}/v1/tree")
+        print(f"  - API docs:      curl {mtls_flags}{admin_url}/SKILL.md")
+        print(
+            f"  - TUI:           buck2 run fbcode//monarch/hyperactor_mesh_admin_tui:hyperactor_mesh_admin_tui -- --addr {admin_url}"
+        )
+        print(flush=True)
 
-    print("\nFailure injected. Point the TUI at this mesh to inspect.")
-    print("Press Ctrl+C to exit.\n", flush=True)
+        procs = host.spawn_procs(per_host={"replica": num_procs})
+        workers = procs.spawn("worker", Worker)
 
-    try:
+        # Let every worker do some work first.
+        await workers.work.call()
+        print(f"\n{num_procs} workers alive and working.", flush=True)
+
+        # Crash worker at rank 0.  The BaseException subclass bypasses the
+        # endpoint handler's Exception catch, killing the actor and
+        # triggering supervision.
+        print("\nCrashing worker[0] with 'GPU memory corruption'...", flush=True)
+        try:
+            await workers.slice(replica=0).crash.call_one("GPU memory corruption")
+        except Exception:
+            pass  # Expected — the actor died
+
+        # Give supervision time to propagate.
+        await asyncio.sleep(3)
+
+        print("\nFailure injected. Point the TUI at this mesh to inspect.")
+        print("Press Ctrl+C to exit.\n", flush=True)
+
         await asyncio.sleep(float("inf"))
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
         print("\nShutting down...", flush=True)
-        await procs.stop()
+        # Each ProcessJob worker runs in its own detached session; job.kill()
+        # reaps the whole session -- the worker and every proc it spawned.
+        job.kill()
 
 
 def main() -> None:

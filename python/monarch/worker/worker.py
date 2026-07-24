@@ -168,6 +168,7 @@ class DeviceMesh:
             name += f"_group_{pg}"
         self.process_group_for_stream[stream][key] = (
             SingleControllerProcessGroupWrapper(
+                # pyrefly: ignore [bad-argument-type]
                 _new_process_group(name, ranks, split=True)
             )
         )
@@ -559,6 +560,7 @@ class Borrow:
 
 
 class WorkerMessageQueue(Protocol):
+    # pyrefly: ignore [missing-attribute]
     def _socket(self, kind) -> zmq.Socket: ...
 
     def send(self, message: Any) -> None: ...
@@ -875,6 +877,7 @@ class Worker:
         if in_mesh:
             # Create a split process group
             stream = self.resolve(m.stream).get()
+            # pyrefly: ignore [unbound-name]
             device_mesh.create_process_group(stream, m.dims)
         else:
             # this rank is not in the split group. We still need to participate
@@ -904,6 +907,7 @@ class Worker:
         if in_mesh:
             # Create a split process group
             stream = self.resolve(m.stream).get()
+            # pyrefly: ignore [unbound-name]
             pg.device_mesh.create_process_group(
                 stream, pg.dims, pg=m.remote_process_group
             )
@@ -1069,6 +1073,7 @@ class Worker:
                 # responds to messages, with a strong guarentee of never
                 # getting stuck. For now we just run everything on this thread.
                 monitor(
+                    # pyrefly: ignore [bad-argument-type]
                     lambda: (
                         logger.error(
                             f"possible stall while waiting for message: recent messages: {debugq} "

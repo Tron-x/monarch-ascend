@@ -12,11 +12,10 @@ use std::hash::Hasher;
 use std::time::Duration;
 
 use anyhow::Result;
+use hyperactor::Client;
 use hyperactor::RemoteMessage;
-use hyperactor::actor::Signal;
 use hyperactor::channel::ChannelAddr;
 use hyperactor::mailbox::PortReceiver;
-use hyperactor::proc::Instance;
 use hyperactor::proc::Proc;
 use monarch_types::PickledPyObject;
 use pyo3::exceptions::PyRuntimeError;
@@ -45,27 +44,27 @@ impl PyProc {
     #[pyo3(signature = ())]
     fn new() -> PyResult<Self> {
         Ok(Self {
-            inner: Proc::local(),
+            inner: Proc::isolated(),
         })
     }
 
     #[getter]
     fn addr(&self) -> String {
-        self.inner.proc_id().addr().to_string()
+        self.inner.proc_addr().addr().to_string()
     }
 
     #[getter]
     fn name(&self) -> String {
         self.inner
-            .proc_id()
+            .proc_addr()
             .label()
             .map(|l: &hyperactor::id::Label| l.as_str().to_string())
-            .unwrap_or_else(|| self.inner.proc_id().id().to_string())
+            .unwrap_or_else(|| self.inner.proc_addr().id().to_string())
     }
 
     #[getter]
     fn id(&self) -> String {
-        self.inner.proc_id().to_string()
+        self.inner.proc_addr().to_string()
     }
 
     fn destroy<'py>(
@@ -76,7 +75,7 @@ impl PyProc {
         let mut inner = self.inner.clone();
         let (_stopped, aborted) = signal_safe_block_on(py, async move {
             inner
-                .destroy_and_wait::<()>(Duration::from_secs(timeout_in_secs), None, "destroy")
+                .destroy_and_wait(Duration::from_secs(timeout_in_secs), "destroy")
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })??;
@@ -99,11 +98,9 @@ impl PyProc {
         let proc = self.inner.clone();
         let pickled_type = PickledPyObject::pickle(actor.as_any())?;
         crate::runtime::future_into_py(py, async move {
+            let actor = PythonActor::new(pickled_type, None, None, None)?;
             Ok(PythonActorHandle {
-                inner: proc.spawn(
-                    name.as_deref().unwrap_or("anon"),
-                    PythonActor::new(pickled_type, None, None, None)?,
-                )?,
+                inner: proc.spawn_with_label(name.as_deref().unwrap_or("anon"), actor),
             })
         })
     }
@@ -119,12 +116,11 @@ impl PyProc {
         let pickled_type = PickledPyObject::pickle(actor.as_any())?;
         Ok(PythonActorHandle {
             inner: signal_safe_block_on(py, async move {
-                proc.spawn(
-                    name.as_deref().unwrap_or("anon"),
-                    PythonActor::new(pickled_type, None, None, None)?,
-                )
+                let actor = PythonActor::new(pickled_type, None, None, None)?;
+                Ok(proc.spawn_with_label(name.as_deref().unwrap_or("anon"), actor))
             })
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))??,
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            .map_err(|e: anyhow::Error| PyRuntimeError::new_err(e.to_string()))?,
         })
     }
 }
@@ -166,7 +162,7 @@ impl PyActorAddr {
             PyValueError::new_err(format!("Failed to parse channel address '{}': {}", addr, e))
         })?;
         Ok(Self {
-            inner: hyperactor::ProcAddr::from_resource_name(addr, proc_name).actor_id(actor_name),
+            inner: hyperactor::ProcAddr::singleton(addr, proc_name).actor_addr(actor_name),
         })
     }
 
@@ -184,16 +180,16 @@ impl PyActorAddr {
 
     #[getter]
     fn addr(&self) -> String {
-        self.inner.proc_id().addr().to_string()
+        self.inner.proc_addr().addr().to_string()
     }
 
     #[getter]
     fn proc_name(&self) -> String {
         self.inner
-            .proc_id()
+            .proc_addr()
             .label()
             .map(|l: &hyperactor::id::Label| l.as_str().to_string())
-            .unwrap_or_else(|| self.inner.proc_id().id().to_string())
+            .unwrap_or_else(|| self.inner.proc_addr().id().to_string())
     }
 
     #[getter]
@@ -214,7 +210,7 @@ impl PyActorAddr {
     #[getter]
     fn proc_label(&self) -> Option<String> {
         self.inner
-            .proc_id()
+            .proc_addr()
             .label()
             .map(|l: &hyperactor::id::Label| l.as_str().to_string())
     }
@@ -231,7 +227,7 @@ impl PyActorAddr {
 
     #[getter]
     fn proc_id(&self) -> String {
-        self.inner.proc_id().to_string()
+        self.inner.proc_addr().to_string()
     }
 
     #[getter]
@@ -290,7 +286,7 @@ enum InstanceStatus {
 #[derive(Debug)]
 pub struct PySerialized {
     inner: wirevalue::Any,
-    /// The message port (type) of the message.
+    /// The handler port for this message type.
     port: u64,
 }
 
@@ -314,7 +310,7 @@ impl PySerialized {
         })
     }
 
-    /// The message port (type) of the message.
+    /// The handler port for this message type.
     pub fn port(&self) -> u64 {
         self.port
     }
@@ -324,27 +320,23 @@ impl PySerialized {
 /// a python actor. This helps by allowing users to specialize the actor to the
 /// message type they want to handle.
 pub struct InstanceWrapper<M: RemoteMessage> {
-    instance: Instance<()>,
+    instance: Client,
     message_receiver: PortReceiver<M>,
-    signal_receiver: PortReceiver<Signal>,
     status: InstanceStatus,
     actor_id: hyperactor::ActorAddr,
 }
 
 impl<M: RemoteMessage> InstanceWrapper<M> {
     pub fn new(proc: &PyProc, actor_name: &str) -> Result<Self> {
-        let instance = proc.inner.instance(actor_name)?.0;
-        // TEMPORARY: remove after using fixed message ports.
-        let (_message_port, message_receiver) = instance.bind_actor_port::<M>();
+        let instance = proc.inner.client(actor_name);
+        // TEMPORARY: remove after using fixed handler ports.
+        let (_handler_port, message_receiver) = instance.bind_handler_port::<M>();
 
-        let (_signal_port, signal_receiver) = instance.bind_actor_port::<Signal>();
-
-        let actor_id = instance.self_id().clone();
+        let actor_id = instance.self_addr().clone();
 
         Ok(Self {
             instance,
             message_receiver,
-            signal_receiver,
             status: InstanceStatus::Running,
             actor_id,
         })
@@ -355,46 +347,30 @@ impl<M: RemoteMessage> InstanceWrapper<M> {
     pub fn send(&self, actor_id: &PyActorAddr, message: &PySerialized) -> PyResult<()> {
         hyperactor::internal_macro_support::tracing::debug!(
             name = "py_send_message",
-            actor_id = hyperactor::internal_macro_support::tracing::field::display(self.actor_id()),
+            actor_id =
+                hyperactor::internal_macro_support::tracing::field::display(self.actor_addr()),
             receiver_actor_id = tracing::field::display(&actor_id.inner),
             ?message,
         );
         actor_id
             .inner
-            .port_ref(message.port().into())
+            .port_addr(hyperactor::Port::handler_id(message.port(), None))
             .send(&self.instance, message.inner.clone());
         Ok(())
     }
 
-    /// Make sure the actor is running in detached mode and is alive.
-    fn ensure_detached_and_alive(&mut self) -> Result<()> {
+    /// Make sure the actor is still alive (in the `Running` state).
+    fn ensure_alive(&self) -> Result<()> {
         anyhow::ensure!(
             self.status == InstanceStatus::Running,
             "actor is not running"
         );
-
-        // This is a little weird as we are potentially stopping before responding to messages
-        // but in reality if we receive stop signal and not stop and drain in most cases its
-        // probably ok to stop early.
-        // Also an implicit assumption here is that is the signal is stop and drain we allow things
-        // to continue as there will hopefully not be new messages coming in. But need a proper draining
-        // flow for this.
-        // TODO: T208289078
-        let signals = self.signal_receiver.drain();
-        if signals
-            .into_iter()
-            .any(|sig| matches!(sig, Signal::Stop(_)))
-        {
-            self.status = InstanceStatus::Stopped;
-            anyhow::bail!("actor has been stopped");
-        }
-
         Ok(())
     }
 
     /// Get the next message from the queue. It will wait until a message is received
     /// or the timeout is reached in which case it will return None.
-    #[hyperactor::instrument(level = "trace", fields(actor_id = hyperactor::internal_macro_support::tracing::field::display(self.actor_id())))]
+    #[hyperactor::instrument(level = "trace", fields(actor_id = hyperactor::internal_macro_support::tracing::field::display(self.actor_addr())))]
     pub async fn next_message(&mut self, timeout_msec: Option<u64>) -> Result<Option<M>> {
         hyperactor::declare_static_timer!(
             PY_NEXT_MESSAGE_TIMER,
@@ -402,12 +378,12 @@ impl<M: RemoteMessage> InstanceWrapper<M> {
             hyperactor_telemetry::TimeUnit::Nanos
         );
         let _ = PY_NEXT_MESSAGE_TIMER
-            .start(hyperactor::kv_pairs!("actor_id" => self.actor_id().to_string(), "mode" => match timeout_msec{
+            .start(hyperactor::kv_pairs!("actor_id" => self.actor_addr().to_string(), "mode" => match timeout_msec{
                 None => "blocking",
                 Some(0) => "polling",
                 Some(_) => "blocking_with_timeout",
             }));
-        self.ensure_detached_and_alive()?;
+        self.ensure_alive()?;
         match timeout_msec {
             // Blocking wait for next message.
             None => {
@@ -432,29 +408,29 @@ impl<M: RemoteMessage> InstanceWrapper<M> {
         }
         .map_err(|err| err.into())
         .inspect_err(|err| {
-            hyperactor::metrics::ACTOR_MESSAGE_RECEIVE_ERRORS.add(1, hyperactor::kv_pairs!("actor_id" => self.actor_id().to_string()));
-            tracing::error!(err=?err, actor_id=%self.actor_id(), "unable to receive next py message");
+            hyperactor::metrics::ACTOR_MESSAGE_RECEIVE_ERRORS.add(1, hyperactor::kv_pairs!("actor_id" => self.actor_addr().to_string()));
+            tracing::error!(err=?err, actor_id=%self.actor_addr(), "unable to receive next py message");
         })
         .inspect(|_|{
-            hyperactor::metrics::ACTOR_MESSAGES_RECEIVED.add(1, hyperactor::kv_pairs!("actor_id" => self.actor_id().to_string()));
+            hyperactor::metrics::ACTOR_MESSAGES_RECEIVED.add(1, hyperactor::kv_pairs!("actor_id" => self.actor_addr().to_string()));
         })
     }
 
     /// Put the actor in stopped mode and return any messages that were received.
-    #[hyperactor::instrument(fields(actor_id=hyperactor::internal_macro_support::tracing::field::display(self.actor_id())))]
+    #[hyperactor::instrument(fields(actor_id=hyperactor::internal_macro_support::tracing::field::display(self.actor_addr())))]
     pub fn drain_and_stop(&mut self) -> Result<Vec<M>> {
-        self.ensure_detached_and_alive()?;
+        self.ensure_alive()?;
         let messages: Vec<M> = self.message_receiver.drain().into_iter().collect();
         tracing::info!("stopping the client actor in Python client");
         self.status = InstanceStatus::Stopped;
         Ok(messages)
     }
 
-    pub fn instance(&self) -> &Instance<()> {
+    pub fn instance(&self) -> &Client {
         &self.instance
     }
 
-    pub fn actor_id(&self) -> &hyperactor::ActorAddr {
+    pub fn actor_addr(&self) -> &hyperactor::ActorAddr {
         &self.actor_id
     }
 }

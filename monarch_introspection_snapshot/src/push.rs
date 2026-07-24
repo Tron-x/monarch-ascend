@@ -9,14 +9,14 @@
 //! Drain [`SnapshotData`] into [`TableStore`] tables.
 //!
 //! The shared infrastructure is [`drain_to_batches`], which converts
-//! a [`SnapshotData`] into 9 named `RecordBatch` pairs. The public
+//! a [`SnapshotData`] into 13 named `RecordBatch` pairs. The public
 //! entry point [`push_snapshot`] uses this to ingest all tables into
 //! a [`TableStore`].
 //!
 //! # Push-snapshot invariants (PS-*)
 //!
 //! - **PS-1 (full table coverage):** Every `push_snapshot` call
-//!   ingests all nine logical tables, including empty ones.
+//!   ingests all thirteen logical tables, including empty ones.
 //! - **PS-2 (canonical routing):** Each row family goes only to its
 //!   canonical table.
 //! - **PS-3 (append-preserving counts):** Each table's row count
@@ -38,11 +38,15 @@ use monarch_distributed_telemetry::database_scanner::TableStore;
 use monarch_record_batch::RecordBatchBuffer;
 
 use crate::capture::SnapshotData;
+use crate::schema::ActiveHandlerRowBuffer;
+use crate::schema::ActorExecutionRowBuffer;
 use crate::schema::ActorFailureRowBuffer;
+use crate::schema::ActorInboundOrderingRowBuffer;
 use crate::schema::ActorNodeRowBuffer;
 use crate::schema::ChildRowBuffer;
 use crate::schema::HostNodeRowBuffer;
 use crate::schema::NodeRowBuffer;
+use crate::schema::OrderingSessionRowBuffer;
 use crate::schema::ProcNodeRowBuffer;
 use crate::schema::ResolutionErrorRowBuffer;
 use crate::schema::RootNodeRowBuffer;
@@ -50,14 +54,18 @@ use crate::schema::SnapshotRowBuffer;
 
 /// Canonical table names in sorted order.
 ///
-/// Every snapshot contains exactly these 9 tables. Both
+/// Every snapshot contains exactly these 13 tables. Both
 /// [`drain_to_batches`] and [`push_snapshot`] use this ordering.
 pub const SNAPSHOT_TABLE_NAMES: &[&str] = &[
+    "active_handlers",
+    "actor_executions",
     "actor_failures",
+    "actor_inbound_orderings",
     "actor_nodes",
     "children",
     "host_nodes",
     "nodes",
+    "ordering_sessions",
     "proc_nodes",
     "resolution_errors",
     "root_nodes",
@@ -69,7 +77,7 @@ pub type NamedBatch = (&'static str, RecordBatch);
 
 /// Drain all row families in `data` to named `RecordBatch` pairs.
 ///
-/// Returns exactly 9 pairs, one per table, in
+/// Returns exactly 13 pairs, one per table, in
 /// [`SNAPSHOT_TABLE_NAMES`] order. Empty families produce zero-row
 /// batches with correct schemas (PS-4).
 pub fn drain_to_batches(data: SnapshotData) -> anyhow::Result<Vec<NamedBatch>> {
@@ -79,6 +87,11 @@ pub fn drain_to_batches(data: SnapshotData) -> anyhow::Result<Vec<NamedBatch>> {
     let mut failure_buf = ActorFailureRowBuffer::default();
     for row in data.actor_failures {
         failure_buf.insert(row);
+    }
+
+    let mut io_buf = ActorInboundOrderingRowBuffer::default();
+    for row in data.actor_inbound_orderings {
+        io_buf.insert(row);
     }
 
     let mut actor_buf = ActorNodeRowBuffer::default();
@@ -99,6 +112,11 @@ pub fn drain_to_batches(data: SnapshotData) -> anyhow::Result<Vec<NamedBatch>> {
     let mut node_buf = NodeRowBuffer::default();
     for row in data.nodes {
         node_buf.insert(row);
+    }
+
+    let mut session_buf = OrderingSessionRowBuffer::default();
+    for row in data.ordering_sessions {
+        session_buf.insert(row);
     }
 
     let mut proc_buf = ProcNodeRowBuffer::default();
@@ -123,12 +141,26 @@ pub fn drain_to_batches(data: SnapshotData) -> anyhow::Result<Vec<NamedBatch>> {
     let mut snapshot_buf = SnapshotRowBuffer::default();
     snapshot_buf.insert(data.snapshot);
 
+    let mut execution_buf = ActorExecutionRowBuffer::default();
+    for row in data.actor_executions {
+        execution_buf.insert(row);
+    }
+
+    let mut handler_buf = ActiveHandlerRowBuffer::default();
+    for row in data.active_handlers {
+        handler_buf.insert(row);
+    }
+
     Ok(vec![
+        ("active_handlers", handler_buf.drain_to_record_batch()?),
+        ("actor_executions", execution_buf.drain_to_record_batch()?),
         ("actor_failures", failure_buf.drain_to_record_batch()?),
+        ("actor_inbound_orderings", io_buf.drain_to_record_batch()?),
         ("actor_nodes", actor_buf.drain_to_record_batch()?),
         ("children", child_buf.drain_to_record_batch()?),
         ("host_nodes", host_buf.drain_to_record_batch()?),
         ("nodes", node_buf.drain_to_record_batch()?),
+        ("ordering_sessions", session_buf.drain_to_record_batch()?),
         ("proc_nodes", proc_buf.drain_to_record_batch()?),
         ("resolution_errors", error_buf.drain_to_record_batch()?),
         ("root_nodes", root_buf.drain_to_record_batch()?),
@@ -168,11 +200,11 @@ mod tests {
     const ACTOR_NAME: &str = "test_actor";
 
     fn test_proc_id() -> ProcAddr {
-        ProcAddr::from_resource_name(ChannelAddr::Local(0), PROC_NAME)
+        hyperactor_mesh::mesh_id::ResourceId::proc_addr_from_name(ChannelAddr::Local(0), PROC_NAME)
     }
 
     fn test_host_ref() -> NodeRef {
-        NodeRef::Host(test_proc_id().actor_id(HOST_MESH_AGENT_ACTOR_NAME))
+        NodeRef::Host(test_proc_id().actor_addr(HOST_MESH_AGENT_ACTOR_NAME))
     }
 
     fn test_proc_ref() -> NodeRef {
@@ -180,7 +212,7 @@ mod tests {
     }
 
     fn test_actor_ref() -> NodeRef {
-        NodeRef::Actor(test_proc_id().actor_id(ACTOR_NAME))
+        NodeRef::Actor(test_proc_id().actor_addr(ACTOR_NAME))
     }
 
     /// Expected table names in sorted order (PS-1). Alias for the
@@ -230,9 +262,22 @@ mod tests {
             proc_nodes: vec![],
             actor_nodes: vec![],
             actor_failures: vec![],
+            actor_inbound_orderings: vec![],
+            ordering_sessions: vec![],
+            actor_executions: vec![],
+            active_handlers: vec![],
             resolution_errors: vec![],
         }
     }
+
+    /// Stable UUID-shaped value for the populated fixture's
+    /// `instance_id`. PS-2 asserts on format (36 chars, UUID layout).
+    const FIXTURE_INSTANCE_ID: &str = "019e5661-7d33-7380-9afe-699ffc567531";
+
+    /// Stable session UUIDs for the populated fixture's
+    /// `ordering_sessions` rows.
+    const FIXTURE_SESSION_STALLED: &str = "00000000-0000-0000-0000-000000000001";
+    const FIXTURE_SESSION_CLEAN: &str = "00000000-0000-0000-0000-000000000002";
 
     /// Build a representative populated snapshot for count tests.
     ///
@@ -242,8 +287,8 @@ mod tests {
         let host_id = test_host_ref().to_string();
         let proc_id = test_proc_ref().to_string();
         let actor_id = test_actor_ref().to_string();
-        let failed_actor_id = NodeRef::Actor(test_proc_id().actor_id("failed_actor")).to_string();
-        let error_id = NodeRef::Actor(test_proc_id().actor_id("missing")).to_string();
+        let failed_actor_id = NodeRef::Actor(test_proc_id().actor_addr("failed_actor")).to_string();
+        let error_id = NodeRef::Actor(test_proc_id().actor_addr("missing")).to_string();
 
         SnapshotData {
             snapshot: SnapshotRow {
@@ -355,13 +400,18 @@ mod tests {
             actor_nodes: vec![
                 ActorNodeRow {
                     snapshot_id: id.to_owned(),
-                    node_id: actor_id,
+                    node_id: actor_id.clone(),
                     actor_status: "running".to_owned(),
                     actor_type: ACTOR_NAME.to_owned(),
+                    // Fixture upgrade: stable UUID-shaped instance_id
+                    // and non-zero queue_depth so PS-2 assertions on
+                    // the running actor are meaningful.
+                    instance_id: FIXTURE_INSTANCE_ID.to_owned(),
                     messages_processed: 42,
                     created_at: Some(900_000),
                     last_message_handler: Some("handle_msg".to_owned()),
                     total_processing_time_us: 5000,
+                    queue_depth: 8,
                     is_system: false,
                 },
                 ActorNodeRow {
@@ -369,10 +419,15 @@ mod tests {
                     node_id: failed_actor_id.clone(),
                     actor_status: "failed".to_owned(),
                     actor_type: "failed_actor".to_owned(),
+                    // Failed actor stays at defaults: PS-2 uses
+                    // WHERE actor_status = 'running', so this row's
+                    // defaults are fine for IO-1 negative coverage.
+                    instance_id: String::new(),
                     messages_processed: 1,
                     created_at: Some(800_000),
                     last_message_handler: None,
                     total_processing_time_us: 100,
+                    queue_depth: 0,
                     is_system: false,
                 },
             ],
@@ -385,6 +440,74 @@ mod tests {
                 failure_occurred_at: 850_000,
                 failure_is_propagated: false,
             }],
+            // One rollup row for the running actor (CV-8 Some case).
+            // The failed actor exercises CV-8 None case (no row here).
+            actor_inbound_orderings: vec![ActorInboundOrderingRow {
+                snapshot_id: id.to_owned(),
+                node_id: actor_id.clone(),
+                enabled: true,
+                snapshot_complete: true,
+                skipped_session_count: 0,
+                // IO-5: 2 returned + 0 skipped = 2.
+                known_session_count: 2,
+                // IO-6: rollups over the 2 returned sessions only.
+                returned_buffered_session_count: 1,
+                returned_buffered_message_count: 5,
+                returned_max_buffered_count: 5,
+            }],
+            // Two session rows (CV-9). One stalled (drives PS-9 +
+            // JOIN test) and one clean (covers buffered_count == 0).
+            ordering_sessions: vec![
+                OrderingSessionRow {
+                    snapshot_id: id.to_owned(),
+                    node_id: actor_id.clone(),
+                    session_id: FIXTURE_SESSION_STALLED.to_owned(),
+                    sender: Some("sender_a".to_owned()),
+                    last_released_seq: 0,
+                    expected_next_seq: 1,
+                    buffered_count: 5,
+                    oldest_buffered_seq: Some(2),
+                    newest_buffered_seq: Some(6),
+                },
+                OrderingSessionRow {
+                    snapshot_id: id.to_owned(),
+                    node_id: actor_id.clone(),
+                    session_id: FIXTURE_SESSION_CLEAN.to_owned(),
+                    sender: Some("client".to_owned()),
+                    last_released_seq: 3,
+                    expected_next_seq: 4,
+                    buffered_count: 0,
+                    oldest_buffered_seq: None,
+                    newest_buffered_seq: None,
+                },
+            ],
+            // One execution rollup for the running actor (CV-10 Some);
+            // the failed actor exercises CV-10 None (no row here).
+            actor_executions: vec![ActorExecutionRow {
+                snapshot_id: id.to_owned(),
+                node_id: actor_id.clone(),
+                active_count: 2,
+                complete: true,
+                truncated: false,
+            }],
+            // Two in-flight handler rows (CV-11), oldest-first. Drives
+            // PS-11 + the execution JOIN test.
+            active_handlers: vec![
+                ActiveHandlerRow {
+                    snapshot_id: id.to_owned(),
+                    node_id: actor_id.clone(),
+                    name: "endpoint_slow".to_owned(),
+                    active_count: 1,
+                    oldest_since: 2,
+                },
+                ActiveHandlerRow {
+                    snapshot_id: id.to_owned(),
+                    node_id: actor_id,
+                    name: "endpoint_fast".to_owned(),
+                    active_count: 1,
+                    oldest_since: 6,
+                },
+            ],
             resolution_errors: vec![ResolutionErrorRow {
                 snapshot_id: id.to_owned(),
                 node_id: error_id,
@@ -394,7 +517,8 @@ mod tests {
         }
     }
 
-    // PS-1: every push ingests all nine tables, including empty ones.
+    // PS-1: every push ingests all thirteen tables, including empty
+    // ones.
     #[tokio::test]
     async fn test_push_snapshot_registers_all_tables() {
         let store = TableStore::new_empty();
@@ -407,7 +531,7 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>(),
-            "PS-1: all nine tables should be registered"
+            "PS-1: all thirteen tables should be registered"
         );
     }
 
@@ -431,7 +555,16 @@ mod tests {
         assert_eq!(query_row_count(&ctx, "proc_nodes").await.unwrap(), 1);
         assert_eq!(query_row_count(&ctx, "actor_nodes").await.unwrap(), 2);
         assert_eq!(query_row_count(&ctx, "actor_failures").await.unwrap(), 1);
+        assert_eq!(
+            query_row_count(&ctx, "actor_inbound_orderings")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(query_row_count(&ctx, "ordering_sessions").await.unwrap(), 2);
         assert_eq!(query_row_count(&ctx, "resolution_errors").await.unwrap(), 1);
+        assert_eq!(query_row_count(&ctx, "actor_executions").await.unwrap(), 1);
+        assert_eq!(query_row_count(&ctx, "active_handlers").await.unwrap(), 2);
     }
 
     // PS-3: cumulative counts after two pushes into the same store.
@@ -457,7 +590,16 @@ mod tests {
         assert_eq!(query_row_count(&ctx, "proc_nodes").await.unwrap(), 2);
         assert_eq!(query_row_count(&ctx, "actor_nodes").await.unwrap(), 4);
         assert_eq!(query_row_count(&ctx, "actor_failures").await.unwrap(), 2);
+        assert_eq!(
+            query_row_count(&ctx, "actor_inbound_orderings")
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(query_row_count(&ctx, "ordering_sessions").await.unwrap(), 4);
         assert_eq!(query_row_count(&ctx, "resolution_errors").await.unwrap(), 2);
+        assert_eq!(query_row_count(&ctx, "actor_executions").await.unwrap(), 2);
+        assert_eq!(query_row_count(&ctx, "active_handlers").await.unwrap(), 4);
     }
 
     // PS-4, PS-6: empty subtype tables are still queryable.
@@ -474,6 +616,13 @@ mod tests {
         assert_eq!(query_row_count(&ctx, "nodes").await.unwrap(), 0);
         assert_eq!(query_row_count(&ctx, "actor_nodes").await.unwrap(), 0);
         assert_eq!(query_row_count(&ctx, "actor_failures").await.unwrap(), 0);
+        assert_eq!(
+            query_row_count(&ctx, "actor_inbound_orderings")
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(query_row_count(&ctx, "ordering_sessions").await.unwrap(), 0);
         assert_eq!(query_row_count(&ctx, "resolution_errors").await.unwrap(), 0);
     }
 
@@ -519,6 +668,62 @@ mod tests {
             .downcast_ref::<datafusion::arrow::array::StringArray>()
             .ok_or_else(|| anyhow::anyhow!("column '{}' not Utf8", column))?;
         Ok(arr.value(0).to_owned())
+    }
+
+    /// Helper: run a SQL query and return the first row's value for
+    /// the named column as an i64.
+    async fn query_i64_scalar(
+        ctx: &SessionContext,
+        sql: &str,
+        column: &str,
+    ) -> anyhow::Result<i64> {
+        let df = ctx.sql(sql).await?;
+        let batches = df.collect().await?;
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].num_rows() >= 1);
+        let col = batches[0]
+            .column_by_name(column)
+            .ok_or_else(|| anyhow::anyhow!("column '{}' not found", column))?;
+        let arr = col
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .ok_or_else(|| anyhow::anyhow!("column '{}' not Int64", column))?;
+        Ok(arr.value(0))
+    }
+
+    /// Helper: run a SQL query and return the first row's value for
+    /// the named column as a bool.
+    async fn query_bool_scalar(
+        ctx: &SessionContext,
+        sql: &str,
+        column: &str,
+    ) -> anyhow::Result<bool> {
+        let df = ctx.sql(sql).await?;
+        let batches = df.collect().await?;
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].num_rows() >= 1);
+        let col = batches[0]
+            .column_by_name(column)
+            .ok_or_else(|| anyhow::anyhow!("column '{}' not found", column))?;
+        let arr = col
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::BooleanArray>()
+            .ok_or_else(|| anyhow::anyhow!("column '{}' not Boolean", column))?;
+        Ok(arr.value(0))
+    }
+
+    /// Canonical-UUID shape check: 36 chars with hyphens at positions
+    /// 8/13/18/23 and hex digits elsewhere. Used for PS-9 and the
+    /// PS-2 sweep on `instance_id`.
+    fn is_uuid_canonical(s: &str) -> bool {
+        s.len() == 36
+            && s.as_bytes()[8] == b'-'
+            && s.as_bytes()[13] == b'-'
+            && s.as_bytes()[18] == b'-'
+            && s.as_bytes()[23] == b'-'
+            && s.chars()
+                .enumerate()
+                .all(|(i, c)| matches!(i, 8 | 13 | 18 | 23) || c.is_ascii_hexdigit())
     }
 
     // PS-2: each row family lands in its canonical table, not a
@@ -600,16 +805,318 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(error_code, "not_found", "PS-2: resolution_errors table");
+
+        // actor_inbound_orderings — distinguishing column:
+        // known_session_count (i64).
+        let known = query_i64_scalar(
+            &ctx,
+            "SELECT known_session_count FROM actor_inbound_orderings LIMIT 1",
+            "known_session_count",
+        )
+        .await
+        .unwrap();
+        assert_eq!(known, 2, "PS-2: actor_inbound_orderings table");
+
+        // ordering_sessions — distinguishing column: session_id.
+        let session_id = query_string_scalar(
+            &ctx,
+            "SELECT session_id FROM ordering_sessions ORDER BY session_id LIMIT 1",
+            "session_id",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            session_id, FIXTURE_SESSION_STALLED,
+            "PS-2: ordering_sessions table",
+        );
+    }
+
+    // PS-2 sweep extension: instance_id on actor_nodes returns a
+    // canonical UUID-shaped string for the running actor.
+    #[tokio::test]
+    async fn test_push_snapshot_actor_instance_id_uuid() {
+        let store = TableStore::new_empty();
+        push_snapshot(&store, populated_snapshot("s1"))
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        register_all(&store, &ctx).await.unwrap();
+
+        let instance_id = query_string_scalar(
+            &ctx,
+            "SELECT instance_id FROM actor_nodes \
+             WHERE actor_status = 'running' LIMIT 1",
+            "instance_id",
+        )
+        .await
+        .unwrap();
+        assert_eq!(instance_id, FIXTURE_INSTANCE_ID);
+        assert!(
+            is_uuid_canonical(&instance_id),
+            "PS-2: instance_id must be UUID-shaped, got {:?}",
+            instance_id,
+        );
+    }
+
+    // PS-2 sweep extension: queue_depth on actor_nodes returns the
+    // fixture's non-zero i64.
+    #[tokio::test]
+    async fn test_push_snapshot_actor_queue_depth() {
+        let store = TableStore::new_empty();
+        push_snapshot(&store, populated_snapshot("s1"))
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        register_all(&store, &ctx).await.unwrap();
+
+        let qd = query_i64_scalar(
+            &ctx,
+            "SELECT queue_depth FROM actor_nodes \
+             WHERE actor_status = 'running' LIMIT 1",
+            "queue_depth",
+        )
+        .await
+        .unwrap();
+        assert_eq!(qd, 8, "PS-2: queue_depth from running actor fixture");
+    }
+
+    // PS-8: when the populated fixture contains an actor with
+    // `inbound_ordering: Some(...)`, the snapshot publish path
+    // produces an `actor_inbound_orderings` row queryable via
+    // `SELECT enabled FROM actor_inbound_orderings`.
+    #[tokio::test]
+    async fn test_push_snapshot_actor_inbound_orderings_presence() {
+        let store = TableStore::new_empty();
+        push_snapshot(&store, populated_snapshot("s1"))
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        register_all(&store, &ctx).await.unwrap();
+
+        let enabled = query_bool_scalar(
+            &ctx,
+            "SELECT enabled FROM actor_inbound_orderings LIMIT 1",
+            "enabled",
+        )
+        .await
+        .unwrap();
+        assert!(enabled, "PS-8: fixture's rollup must have enabled = true");
+    }
+
+    // PS-9: when the populated fixture contains an actor with
+    // `inbound_ordering: Some({sessions: [non-empty]})`, the snapshot
+    // publish path produces `ordering_sessions` rows queryable via
+    // `SELECT session_id FROM ordering_sessions`. Asserts the
+    // session_id is canonical-UUID-shaped.
+    #[tokio::test]
+    async fn test_push_snapshot_ordering_sessions_presence() {
+        let store = TableStore::new_empty();
+        push_snapshot(&store, populated_snapshot("s1"))
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        register_all(&store, &ctx).await.unwrap();
+
+        let session_id = query_string_scalar(
+            &ctx,
+            "SELECT session_id FROM ordering_sessions LIMIT 1",
+            "session_id",
+        )
+        .await
+        .unwrap();
+        assert!(
+            is_uuid_canonical(&session_id),
+            "PS-9: session_id must be UUID-shaped, got {:?}",
+            session_id,
+        );
+    }
+
+    // Diagnostic JOIN test: the MIT-78 "who is blocking what seq?"
+    // diagnosis is now answerable in SQL across the three tables.
+    // Asserts the stalled session surfaces with its sender, seq, and
+    // backlog, while the clean session is excluded by the
+    // `buffered_count > 0` filter.
+    #[tokio::test]
+    async fn test_push_snapshot_inbound_ordering_join() {
+        let store = TableStore::new_empty();
+        push_snapshot(&store, populated_snapshot("s1"))
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        register_all(&store, &ctx).await.unwrap();
+
+        let df = ctx
+            .sql(
+                "SELECT a.actor_type, \
+                        io.returned_buffered_session_count, \
+                        s.buffered_count, \
+                        s.expected_next_seq \
+                 FROM actor_nodes a \
+                 JOIN actor_inbound_orderings io \
+                   USING (snapshot_id, node_id) \
+                 JOIN ordering_sessions s \
+                   USING (snapshot_id, node_id) \
+                 WHERE s.buffered_count > 0 \
+                 ORDER BY s.buffered_count DESC",
+            )
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 1,
+            "JOIN must surface exactly one stalled-session row from the fixture",
+        );
+        let batch = &batches[0];
+
+        let actor_type = batch
+            .column_by_name("actor_type")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(actor_type.value(0), ACTOR_NAME);
+
+        let buffered = batch
+            .column_by_name("buffered_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(buffered.value(0), 5);
+
+        let expected = batch
+            .column_by_name("expected_next_seq")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(expected.value(0), 1);
+    }
+
+    // PS-10: when the populated fixture contains an actor with
+    // `execution: Some(...)`, the snapshot publish path produces an
+    // `actor_executions` row queryable via `SELECT complete FROM
+    // actor_executions`.
+    #[tokio::test]
+    async fn test_push_snapshot_actor_executions_presence() {
+        let store = TableStore::new_empty();
+        push_snapshot(&store, populated_snapshot("s1"))
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        register_all(&store, &ctx).await.unwrap();
+
+        let complete = query_bool_scalar(
+            &ctx,
+            "SELECT complete FROM actor_executions LIMIT 1",
+            "complete",
+        )
+        .await
+        .unwrap();
+        assert!(
+            complete,
+            "PS-10: fixture's rollup must have complete = true"
+        );
+    }
+
+    // PS-11: when the populated fixture contains an actor with
+    // `execution: Some({active_handlers: [non-empty]})`, the snapshot
+    // publish path produces `active_handlers` rows queryable via
+    // `SELECT name FROM active_handlers`. Asserts the oldest in-flight
+    // handler surfaces first (CV-11 oldest-first detail).
+    #[tokio::test]
+    async fn test_push_snapshot_active_handlers_presence() {
+        let store = TableStore::new_empty();
+        push_snapshot(&store, populated_snapshot("s1"))
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        register_all(&store, &ctx).await.unwrap();
+
+        let name = query_string_scalar(
+            &ctx,
+            "SELECT name FROM active_handlers ORDER BY oldest_since LIMIT 1",
+            "name",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            name, "endpoint_slow",
+            "PS-11: oldest in-flight handler must surface first",
+        );
+    }
+
+    // Diagnostic JOIN test: "which in-flight handler is oldest on
+    // which actor?" is answerable in SQL across the three tables.
+    // Asserts the running actor's two handlers surface alongside the
+    // rollup total, oldest-first; the failed actor (no execution row)
+    // is excluded by the inner join.
+    #[tokio::test]
+    async fn test_push_snapshot_execution_join() {
+        let store = TableStore::new_empty();
+        push_snapshot(&store, populated_snapshot("s1"))
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        register_all(&store, &ctx).await.unwrap();
+
+        let df = ctx
+            .sql(
+                "SELECT a.actor_type, \
+                        ae.active_count AS total, \
+                        h.name, \
+                        h.oldest_since \
+                 FROM actor_nodes a \
+                 JOIN actor_executions ae \
+                   USING (snapshot_id, node_id) \
+                 JOIN active_handlers h \
+                   USING (snapshot_id, node_id) \
+                 ORDER BY h.oldest_since ASC",
+            )
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 2,
+            "JOIN must surface both in-flight handler rows from the fixture",
+        );
+        let batch = &batches[0];
+
+        let actor_type = batch
+            .column_by_name("actor_type")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(actor_type.value(0), ACTOR_NAME);
+
+        let total = batch
+            .column_by_name("total")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(total.value(0), 2);
+
+        let name = batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(name.value(0), "endpoint_slow");
     }
 
     // --- drain_to_batches tests ---
 
-    // PS-1, PS-2: exactly 9 pairs in canonical order.
+    // PS-1, PS-2: exactly 13 pairs in canonical order.
     #[test]
-    fn test_drain_to_batches_produces_nine_pairs() {
+    fn test_drain_to_batches_produces_thirteen_pairs() {
         let batches = drain_to_batches(populated_snapshot("d1")).unwrap();
         let names: Vec<&str> = batches.iter().map(|(n, _)| *n).collect();
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 13);
         assert_eq!(names, SNAPSHOT_TABLE_NAMES.to_vec(),);
     }
 
@@ -618,7 +1125,7 @@ mod tests {
     #[test]
     fn test_drain_to_batches_empty_families() {
         let batches = drain_to_batches(minimal_snapshot("d2")).unwrap();
-        assert_eq!(batches.len(), 9);
+        assert_eq!(batches.len(), 13);
         // All tables except "snapshots" should have 0 rows.
         for (name, batch) in &batches {
             if *name == "snapshots" {
@@ -650,6 +1157,8 @@ mod tests {
         assert_eq!(counts["proc_nodes"], 1);
         assert_eq!(counts["actor_nodes"], 2);
         assert_eq!(counts["actor_failures"], 1);
+        assert_eq!(counts["actor_inbound_orderings"], 1);
+        assert_eq!(counts["ordering_sessions"], 2);
         assert_eq!(counts["resolution_errors"], 1);
     }
 }

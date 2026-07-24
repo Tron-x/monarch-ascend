@@ -8,6 +8,32 @@
 
 //! This modules defines a set of common message types used for managing resources
 //! in hyperactor meshes.
+//!
+//! # Rank-status positioning (`RSP-*`)
+//!
+//! Status queries ([`GetRankStatus`], [`WaitRankStatus`]) reply with a
+//! [`StatusOverlay`] — a sparse, rank-indexed patch the caller merges into an
+//! accumulator over its own view. Positioning that overlay is the contract this
+//! registry names; each invariant is cited at the sites that must uphold it.
+//!
+//! - **RSP-1** — an overlay is positioned at the recipient's dense rank in the
+//!   *consuming* view (the one the caller accumulates over), never the rank the
+//!   resource was first created under. Reusing the creation rank mis-attributes
+//!   or drops the reply over a renumbered or sliced view.
+//! - **RSP-2** — the positioning rank travels as the [`Rank`] message field. Cast
+//!   sites leave it `Rank::default()` and the cast layer late-binds it in transit
+//!   with the delivered dense rank; direct (non-cast) delivery supplies it
+//!   explicitly with `Rank::new(view_rank)`.
+//! - **RSP-3** — a deferred waiter (a [`WaitRankStatus`] below its threshold, or
+//!   one registered before its resource exists) retains its registration rank
+//!   until it is flushed; the flush never rewrites it to a creation rank.
+//! - **RSP-4** — when a handler reports absence *immediately*, it returns an
+//!   empty overlay; the message's [`Rank`] is never overloaded as an absence
+//!   signal. `WaitRankStatus` may instead defer when later creation is expected
+//!   (RSP-3), replying once the resource exists.
+//!
+//! `ActorState` streaming supervision must satisfy the analogous positioning
+//! contract; extending this registry to cover `ActorState` is future work.
 
 pub mod mesh;
 
@@ -24,17 +50,12 @@ use std::ops::Range;
 use std::time::Duration;
 
 use enum_as_inner::EnumAsInner;
-use hyperactor::Bind;
 use hyperactor::HandleClient;
 use hyperactor::Handler;
 use hyperactor::PortRef;
 use hyperactor::RefClient;
 use hyperactor::RemoteMessage;
-use hyperactor::Unbind;
 use hyperactor::mailbox::PortReceiver;
-use hyperactor::message::Bind;
-use hyperactor::message::Bindings;
-use hyperactor::message::Unbind;
 use hyperactor_config::attrs::Attrs;
 use ndslice::Region;
 use ndslice::ViewExt;
@@ -43,6 +64,7 @@ use serde::Serialize;
 use typeuri::Named;
 
 use crate::StatusOverlay;
+use crate::ValueMesh;
 use crate::bootstrap;
 use crate::bootstrap::BootstrapCommand;
 use crate::bootstrap::ProcBind;
@@ -64,9 +86,7 @@ use crate::proc_agent::ActorState;
     Eq,
     Hash,
     EnumAsInner,
-    strum::Display,
-    Bind,
-    Unbind
+    strum::Display
 )]
 pub enum Status {
     /// The resource does not exist.
@@ -157,11 +177,38 @@ impl From<crate::host::LocalProcStatus> for Status {
 }
 
 /// Data type used to communicate ranks.
-/// Implements [`Bind`] and [`Unbind`]; the comm actor replaces
-/// instances with the delivered rank.
-#[derive(Clone, Debug, Serialize, Deserialize, Named, PartialEq, Eq, Default)]
+/// Serialized as a typed multipart part so comm actors can replace instances
+/// with the delivered rank while the message is in transit.
+#[derive(Clone, Debug, Named, PartialEq, Eq, Default)]
 pub struct Rank(pub Option<usize>);
 wirevalue::register_type!(Rank);
+
+/// Serialized representation for [`Rank`] multipart parts.
+#[derive(Clone, Debug, Serialize, Deserialize, Named, PartialEq, Eq)]
+pub struct RankRepr(pub Option<usize>);
+
+impl TryFrom<&Rank> for RankRepr {
+    type Error = serde_multipart::Error;
+
+    fn try_from(rank: &Rank) -> serde_multipart::Result<Self> {
+        Ok(Self(rank.0))
+    }
+}
+
+impl TryFrom<RankRepr> for Rank {
+    type Error = serde_multipart::Error;
+
+    fn try_from(repr: RankRepr) -> serde_multipart::Result<Self> {
+        Ok(Self(repr.0))
+    }
+}
+
+serde_multipart::part_codec! {
+    impl Rank
+    {
+        type Repr = RankRepr;
+    }
+}
 
 impl Rank {
     /// Create a new rank with the provided value.
@@ -175,26 +222,12 @@ impl Rank {
     }
 }
 
-impl Unbind for Rank {
-    fn unbind(&self, bindings: &mut Bindings) -> anyhow::Result<()> {
-        bindings.push_back(self)
-    }
-}
-
-impl Bind for Rank {
-    fn bind(&mut self, bindings: &mut Bindings) -> anyhow::Result<()> {
-        let bound = bindings.try_pop_front::<Rank>()?;
-        self.0 = bound.0;
-        Ok(())
-    }
-}
-
-/// Get the status of a resource across the mesh.
+/// Get the status of a resource.
 ///
-/// This message is cast to all ranks; each rank replies with a sparse
-/// status **overlay**. The comm reducer merges overlays (right-wins)
-/// and the accumulator applies them to produce **full StatusMesh
-/// snapshots** on the receiver side.
+/// Delivered either by cast to every rank or by direct point-to-point send to a
+/// chosen recipient. Each recipient replies with a sparse status **overlay**.
+/// The comm reducer merges overlays (right-wins) and the accumulator applies
+/// them to produce **full StatusMesh snapshots** on the receiver side.
 #[derive(
     Clone,
     Debug,
@@ -203,15 +236,17 @@ impl Bind for Rank {
     Named,
     Handler,
     HandleClient,
-    RefClient,
-    Bind,
-    Unbind
+    RefClient
 )]
 pub struct GetRankStatus {
     /// The resource identifier.
     pub id: ResourceId,
+    /// The rank at which the recipient positions its reply overlay, in the
+    /// caller's view (RSP-1, RSP-2). Cast sites leave this `Rank::default()` and
+    /// the cast layer rewrites it in transit with the delivered dense rank;
+    /// direct (non-cast) callers set it explicitly with `Rank::new(...)`.
+    pub rank: Rank,
     /// Sparse status updates (overlays) from a rank.
-    #[binding(include)]
     pub reply: PortRef<StatusOverlay>,
 }
 
@@ -226,79 +261,88 @@ pub struct GetRankStatus {
     Named,
     Handler,
     HandleClient,
-    RefClient,
-    Bind,
-    Unbind
+    RefClient
 )]
 pub struct WaitRankStatus {
     /// The resource identifier.
     pub id: ResourceId,
+    /// The rank at which the recipient positions its reply overlay, in the
+    /// caller's view (RSP-1, RSP-2). Cast sites leave this `Rank::default()` and
+    /// the cast layer rewrites it in transit with the delivered dense rank;
+    /// direct (non-cast) callers set it explicitly with `Rank::new(...)`. A
+    /// deferred waiter retains this rank until it is flushed (RSP-3).
+    pub rank: Rank,
     /// The minimum status the caller wants to observe.
     /// The handler will not reply until the resource's status
     /// is >= this threshold.
     pub min_status: Status,
     /// Sparse status updates (overlays) from a rank.
-    #[binding(include)]
     pub reply: PortRef<StatusOverlay>,
+}
+
+/// Collect an accumulated [`ValueMesh<T>`] from `rx` until every rank has been
+/// reported or `max_idle_time` elapses with no update.
+///
+/// `reported` decides whether a rank's current value counts as "reported" (e.g.
+/// moved off a `NotExist`/`Timeout` placeholder). The accumulator emits the full
+/// mesh over the target region, so completion is "every cell reported". Returns
+/// `Ok(mesh)` once all ranks are reported, or `Err(mesh)` carrying the latest
+/// snapshot (or `fallback` if nothing arrived) on idle timeout / channel close.
+pub async fn wait_mesh<T>(
+    mut rx: PortReceiver<ValueMesh<T>>,
+    max_idle_time: Duration,
+    fallback: ValueMesh<T>,
+    reported: impl Fn(&T) -> bool,
+) -> Result<ValueMesh<T>, ValueMesh<T>>
+where
+    T: Send + Sync + Clone + 'static,
+{
+    let mut alarm = hyperactor::time::Alarm::new();
+    alarm.arm(max_idle_time);
+
+    // Latest-wins snapshot; `fallback` stands in until the first update arrives.
+    let mut snapshot = fallback;
+
+    loop {
+        let mut sleeper = alarm.sleeper();
+        tokio::select! {
+            _ = sleeper.sleep() => return Err(snapshot),
+            next = rx.recv() => {
+                match next {
+                    Ok(mesh) => { snapshot = mesh; }   // latest-wins snapshot
+                    Err(_)   => return Err(snapshot),
+                }
+            }
+        }
+
+        alarm.arm(max_idle_time);
+
+        // Short-circuit: done as soon as no rank is still unreported.
+        if snapshot.values().all(|v| reported(&v)) {
+            break Ok(snapshot);
+        }
+    }
 }
 
 impl GetRankStatus {
     pub async fn wait(
-        mut rx: PortReceiver<crate::StatusMesh>,
+        rx: PortReceiver<crate::StatusMesh>,
         num_ranks: usize,
         max_idle_time: Duration,
         region: Region, // used only for fallback
     ) -> Result<crate::StatusMesh, crate::StatusMesh> {
         debug_assert_eq!(region.num_ranks(), num_ranks, "region/num_ranks mismatch");
 
-        let mut alarm = hyperactor::time::Alarm::new();
-        alarm.arm(max_idle_time);
-
-        // Fallback snapshot if we time out before receiving anything.
-        let mut snapshot =
-            crate::StatusMesh::from_single(region, crate::resource::Status::NotExist);
-
-        loop {
-            let mut sleeper = alarm.sleeper();
-            tokio::select! {
-                _ = sleeper.sleep() => return Err(snapshot),
-                next = rx.recv() => {
-                    match next {
-                        Ok(mesh) => { snapshot = mesh; }   // latest-wins snapshot
-                        Err(_)   => return Err(snapshot),
-                    }
-                }
-            }
-
-            alarm.arm(max_idle_time);
-
-            // Completion: once every rank (among the first
-            // `num_ranks`) has reported at least something (i.e.
-            // moved off NotExist).
-            if snapshot
-                .values()
-                .take(num_ranks)
-                .all(|s| !matches!(s, crate::resource::Status::NotExist))
-            {
-                break Ok(snapshot);
-            }
-        }
+        let fallback = crate::StatusMesh::from_single(region, crate::resource::Status::NotExist);
+        wait_mesh(rx, max_idle_time, fallback, |s| {
+            !matches!(s, crate::resource::Status::NotExist)
+        })
+        .await
     }
 }
 
 /// The state of a resource.
-#[derive(
-    Clone,
-    Debug,
-    Serialize,
-    Deserialize,
-    Named,
-    PartialEq,
-    Eq,
-    Handler,
-    Bind,
-    Unbind
-)]
+#[derive(Clone, Debug, Serialize, Deserialize, Named, PartialEq, Eq, Handler)]
 pub struct State<S> {
     /// The resource identifier.
     pub id: ResourceId,
@@ -312,6 +356,7 @@ pub struct State<S> {
     pub timestamp: std::time::SystemTime,
 }
 wirevalue::register_type!(State<ActorState>);
+wirevalue::register_type!(State<ProcState>);
 
 impl<S: Serialize> fmt::Display for State<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -332,15 +377,12 @@ impl<S: Serialize> fmt::Display for State<S> {
     Named,
     Handler,
     HandleClient,
-    RefClient,
-    Bind,
-    Unbind
+    RefClient
 )]
 pub struct CreateOrUpdate<S> {
     /// The resource identifier.
     pub id: ResourceId,
     /// The rank of the resource, when available.
-    #[binding(include)]
     pub rank: Rank,
     /// The specification of the resource.
     pub spec: S,
@@ -357,9 +399,7 @@ wirevalue::register_type!(CreateOrUpdate<ActorSpec>);
     Named,
     Handler,
     HandleClient,
-    RefClient,
-    Bind,
-    Unbind
+    RefClient
 )]
 pub struct Stop {
     /// The resource identifier.
@@ -380,9 +420,7 @@ wirevalue::register_type!(Stop);
     Named,
     Handler,
     HandleClient,
-    RefClient,
-    Bind,
-    Unbind
+    RefClient
 )]
 pub struct StopAll {
     /// The reason for stopping.
@@ -392,6 +430,7 @@ wirevalue::register_type!(StopAll);
 
 /// Retrieve the current state of the resource.
 #[derive(Debug, Serialize, Deserialize, Named, Handler, HandleClient, RefClient)]
+#[serde(bound(serialize = "S: Named", deserialize = "S: Named"))]
 pub struct GetState<S> {
     /// The resource identifier.
     pub id: ResourceId,
@@ -401,27 +440,6 @@ pub struct GetState<S> {
 }
 wirevalue::register_type!(GetState<ProcState>);
 wirevalue::register_type!(GetState<ActorState>);
-
-// Cannot derive Bind and Unbind for this generic, implement manually.
-impl<S> Unbind for GetState<S>
-where
-    S: RemoteMessage,
-    S: Unbind,
-{
-    fn unbind(&self, bindings: &mut Bindings) -> anyhow::Result<()> {
-        self.reply.unbind(bindings)
-    }
-}
-
-impl<S> Bind for GetState<S>
-where
-    S: RemoteMessage,
-    S: Bind,
-{
-    fn bind(&mut self, bindings: &mut Bindings) -> anyhow::Result<()> {
-        self.reply.bind(bindings)
-    }
-}
 
 impl<S> Clone for GetState<S>
 where
@@ -438,6 +456,7 @@ where
 /// Same as GetState, but additionally tells the receiver that the owner is still alive.
 /// If the receiver does not receive this message for a while, it might assume the owner is dead.
 #[derive(Debug, Serialize, Deserialize, Named, Handler, HandleClient, RefClient)]
+#[serde(bound(serialize = "S: Named", deserialize = "S: Named"))]
 pub struct KeepaliveGetState<S> {
     /// The time at which the actor should be considered expired if no further
     /// keepalive is received.
@@ -447,71 +466,35 @@ pub struct KeepaliveGetState<S> {
 wirevalue::register_type!(KeepaliveGetState<ProcState>);
 wirevalue::register_type!(KeepaliveGetState<ActorState>);
 
-// Cannot derive Bind and Unbind for this generic, implement manually.
-impl<S> Unbind for KeepaliveGetState<S>
-where
-    S: RemoteMessage,
-    S: Unbind,
-{
-    fn unbind(&self, bindings: &mut Bindings) -> anyhow::Result<()> {
-        self.get_state.unbind(bindings)
-    }
-}
-
-impl<S> Bind for KeepaliveGetState<S>
-where
-    S: RemoteMessage,
-    S: Bind,
-{
-    fn bind(&mut self, bindings: &mut Bindings) -> anyhow::Result<()> {
-        self.get_state.bind(bindings)
-    }
-}
-
 impl<S> Clone for KeepaliveGetState<S>
 where
     S: RemoteMessage,
 {
     fn clone(&self) -> Self {
         Self {
-            expires_after: self.expires_after.clone(),
+            expires_after: self.expires_after,
             get_state: self.get_state.clone(),
         }
     }
 }
 
 /// Subscribe to streaming state updates for a named resource.
-/// The subscriber port will receive `State<S>` whenever the resource's
+/// The subscriber port will receive `RankedState<S>` whenever the resource's
 /// state changes. The current state is sent immediately upon subscription.
 #[derive(Debug, Serialize, Deserialize, Named, Handler, HandleClient, RefClient)]
+#[serde(bound(serialize = "S: Named", deserialize = "S: Named"))]
 pub struct StreamState<S> {
     /// The resource identifier.
     pub id: ResourceId,
+    /// The recipient's rank in the subscriber's view. Cast callers leave this
+    /// unset so the comm layer can fill it for each recipient; direct callers
+    /// set it explicitly.
+    pub subscriber_rank: Rank,
     /// A streaming port that will receive state updates.
-    pub subscriber: PortRef<State<S>>,
+    pub subscriber: PortRef<RankedState<S>>,
 }
 wirevalue::register_type!(StreamState<ActorState>);
-
-// Cannot derive Bind and Unbind for this generic, implement manually.
-impl<S> Unbind for StreamState<S>
-where
-    S: RemoteMessage,
-    S: Unbind,
-{
-    fn unbind(&self, bindings: &mut Bindings) -> anyhow::Result<()> {
-        self.subscriber.unbind(bindings)
-    }
-}
-
-impl<S> Bind for StreamState<S>
-where
-    S: RemoteMessage,
-    S: Bind,
-{
-    fn bind(&mut self, bindings: &mut Bindings) -> anyhow::Result<()> {
-        self.subscriber.bind(bindings)
-    }
-}
+wirevalue::register_type!(StreamState<ProcState>);
 
 impl<S> Clone for StreamState<S>
 where
@@ -520,10 +503,22 @@ where
     fn clone(&self) -> Self {
         Self {
             id: self.id.clone(),
+            subscriber_rank: self.subscriber_rank.clone(),
             subscriber: self.subscriber.clone(),
         }
     }
 }
+
+/// A state update positioned in the subscriber's current view.
+#[derive(Clone, Debug, Serialize, Deserialize, Named, PartialEq, Eq, Handler)]
+pub struct RankedState<S> {
+    /// The resource's rank in the consuming view.
+    pub rank: Rank,
+    /// The state observed at that rank.
+    pub state: State<S>,
+}
+wirevalue::register_type!(RankedState<ActorState>);
+wirevalue::register_type!(RankedState<ProcState>);
 
 /// List the set of resources managed by the controller.
 #[derive(Debug, Serialize, Deserialize, Named, Handler, HandleClient, RefClient)]
@@ -812,12 +807,26 @@ pub(crate) struct ProcSpec {
     /// `DrainHost` to selectively drain only procs belonging to a
     /// specific mesh.
     pub(crate) host_mesh_id: Option<crate::mesh_id::HostMeshId>,
+    /// The id of the ProcMesh that owns this proc. A host agent can hold procs
+    /// from several proc meshes, so this lets per-mesh queries (e.g.
+    /// `StreamState`) scope to a single mesh rather than every proc on the host.
+    pub(crate) proc_mesh_id: Option<crate::mesh_id::ProcMeshId>,
 }
 wirevalue::register_type!(ProcSpec);
 
 #[cfg(test)]
 mod tests {
+    use hyperactor::port::Port;
+
     use super::*;
+
+    #[test]
+    fn handler_ports_are_distinct_for_resource_messages() {
+        assert_ne!(
+            Port::handler::<CreateOrUpdate<ProcSpec>>(),
+            Port::handler::<Stop>(),
+        );
+    }
 
     #[test]
     fn test_ranked_values_merge() {

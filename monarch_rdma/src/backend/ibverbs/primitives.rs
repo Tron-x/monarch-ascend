@@ -17,25 +17,33 @@
 //! - `IbvConfig`: Represents ibverbs specific configurations, holding parameters required to establish and
 //!   manage an RDMA connection, including settings for the RDMA device, queue pair attributes, and other
 //!   connection-specific parameters.
-//! - `IbvDevice`: Represents an RDMA device, i.e. 'mlx5_0'. Contains information about the device, such as:
+//! - `IbvDeviceInfo`: Represents an RDMA device, i.e. 'mlx5_0'. Contains information about the device, such as:
 //!   its name, vendor ID, vendor part ID, hardware version, firmware version, node GUID, and capabilities.
 //! - `IbvPort`: Represents information about the port of an RDMA device, including state, physical state,
 //!   LID (Local Identifier), and GID (Global Identifier) information.
-//! - `IbvMemoryRegionView`: Represents a memory region that can be registered with an RDMA device for direct
-//!   memory access operations.
 //! - `IbvOperation`: Represents the type of RDMA operation to perform (Read or Write).
 //! - `IbvQpInfo`: Contains connection information needed to establish an RDMA connection with a remote endpoint.
 //! - `IbvWc`: Wrapper around ibverbs work completion structure, used to track the status of RDMA operations.
+use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::fmt;
+use std::io::Error;
+use std::net::Ipv6Addr;
+use std::sync::Arc;
 use std::sync::OnceLock;
 
+use anyhow::Context;
 use serde::Deserialize;
 use serde::Serialize;
 use typeuri::Named;
 
+use crate::backend::ibverbs::device::IbvDeviceImpl;
+use crate::backend::ibverbs::device::list_all_devices;
+use crate::backend::ibverbs::device_selection::IbvDeviceTarget;
+use crate::backend::ibverbs::device_selection::resolve_target;
+use crate::device_selection::MemoryLocation;
+
 #[derive(
-    Default,
     Copy,
     Clone,
     Debug,
@@ -45,12 +53,48 @@ use typeuri::Named;
     serde::Serialize,
     serde::Deserialize
 )]
-#[repr(transparent)]
+// `AsRef`/`AsMut`/`From<Gid>` reinterpret the leading `raw` bytes in place as an
+// `ibv_gid` (which is 8-aligned, holding `__be64`s). `repr(C, align(8))` keeps
+// `raw` first and 8-aligned so that pointer cast is well-defined; without it the
+// derived layout can place `raw` at a misaligned offset, faulting on that read.
+#[repr(C, align(8))]
 pub struct Gid {
     raw: [u8; 16],
+    /// The GID's index in its port's GID table.
+    index: u8,
+    /// Address scope, classified from `raw` at construction.
+    scope: GidScope,
+    /// RoCE type, from the port's `gid_attrs/types` sysfs entry.
+    gid_type: GidType,
 }
 
 impl Gid {
+    /// Builds a GID from its IPv6 address, RoCE type, and GID-table index,
+    /// classifying the address's scope.
+    fn new(addr: Ipv6Addr, gid_type: GidType, index: u8) -> Self {
+        Self {
+            raw: addr.octets(),
+            index,
+            scope: GidScope::of(addr),
+            gid_type,
+        }
+    }
+
+    /// The GID's index in its port's GID table.
+    pub(crate) fn index(&self) -> u8 {
+        self.index
+    }
+
+    /// The GID's address scope.
+    fn scope(&self) -> GidScope {
+        self.scope
+    }
+
+    /// The GID's RoCE type.
+    fn gid_type(&self) -> GidType {
+        self.gid_type
+    }
+
     #[allow(dead_code)]
     fn subnet_prefix(&self) -> u64 {
         u64::from_be_bytes(self.raw[..8].try_into().unwrap())
@@ -59,13 +103,6 @@ impl Gid {
     #[allow(dead_code)]
     fn interface_id(&self) -> u64 {
         u64::from_be_bytes(self.raw[8..].try_into().unwrap())
-    }
-}
-impl From<rdmaxcel_sys::ibv_gid> for Gid {
-    fn from(gid: rdmaxcel_sys::ibv_gid) -> Self {
-        Self {
-            raw: unsafe { gid.raw },
-        }
     }
 }
 
@@ -84,6 +121,98 @@ impl AsRef<rdmaxcel_sys::ibv_gid> for Gid {
 impl AsMut<rdmaxcel_sys::ibv_gid> for Gid {
     fn as_mut(&mut self) -> &mut rdmaxcel_sys::ibv_gid {
         unsafe { &mut *self.raw.as_mut_ptr().cast::<rdmaxcel_sys::ibv_gid>() }
+    }
+}
+
+impl fmt::Display for Gid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&format_gid(&self.raw))
+    }
+}
+
+/// Scope of an IPv6-form GID. RoCE encodes the source GID as an IPv6 address, so
+/// the usual IPv6 scopes apply.
+///
+/// - [`Loopback`](GidScope::Loopback): `::1`, or IPv4-mapped loopback
+///   (`::ffff:127.0.0.0/8`).
+/// - [`LinkLocal`](GidScope::LinkLocal): `fe80::/10` (the default GID prefix), or
+///   IPv4-mapped link-local (`::ffff:169.254.0.0/16`).
+/// - [`SiteLocal`](GidScope::SiteLocal): `fec0::/10`, deprecated by RFC 3879.
+/// - [`Global`](GidScope::Global): everything else, including globally-routable
+///   IPv4-mapped, global, and ULA IPv6.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub(crate) enum GidScope {
+    Loopback,
+    LinkLocal,
+    SiteLocal,
+    Global,
+}
+
+impl GidScope {
+    /// Classifies an IPv6 address by scope. IPv4-mapped addresses
+    /// (`::ffff:a.b.c.d`) are classified by their embedded IPv4 address, so an
+    /// IPv4 loopback/link-local GID is not mistaken for a global one.
+    fn of(addr: Ipv6Addr) -> Self {
+        if addr.is_loopback() {
+            return GidScope::Loopback;
+        }
+        if let Some(v4) = addr.to_ipv4_mapped() {
+            return if v4.is_loopback() {
+                GidScope::Loopback
+            } else if v4.is_link_local() {
+                GidScope::LinkLocal
+            } else {
+                GidScope::Global
+            };
+        }
+        let [a, b, ..] = addr.octets();
+        if a == 0xfe && b & 0xc0 == 0x80 {
+            GidScope::LinkLocal
+        } else if a == 0xfe && b & 0xc0 == 0xc0 {
+            GidScope::SiteLocal
+        } else {
+            GidScope::Global
+        }
+    }
+}
+
+/// RoCE type of a GID, from its `gid_attrs/types` sysfs entry.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub(crate) enum GidType {
+    /// `IB/RoCE v1`.
+    RoCEv1,
+    /// `RoCE v2`.
+    RoCEv2,
+    /// Any other or unrecognized type.
+    Unknown,
+}
+
+impl GidType {
+    /// Classifies a `gid_attrs/types` sysfs value.
+    fn of(gid_type: &str) -> Self {
+        match gid_type.trim() {
+            "RoCE v2" => GidType::RoCEv2,
+            "IB/RoCE v1" => GidType::RoCEv1,
+            _ => GidType::Unknown,
+        }
     }
 }
 
@@ -128,14 +257,15 @@ pub fn resolve_qp_type(qp_type: IbvQpType) -> u32 {
 /// parameters.
 #[derive(Debug, Named, Clone, Serialize, Deserialize)]
 pub struct IbvConfig {
-    /// `device` - The RDMA device to use for the connection.
-    pub device: IbvDevice,
+    /// `target` - An explicit RDMA device target, resolved to a concrete
+    /// device via [`resolve_target`]. When `None`, the consumer picks the
+    /// device itself (the co-located NIC for GPU memory, or a hash-assigned
+    /// NIC for host memory).
+    pub target: Option<IbvDeviceTarget>,
     /// `cq_entries` - The number of completion queue entries.
     pub cq_entries: i32,
     /// `port_num` - The physical port number on the device.
     pub port_num: u8,
-    /// `gid_index` - The GID index for the RDMA device.
-    pub gid_index: u8,
     /// `max_send_wr` - The maximum number of outstanding send work requests.
     pub max_send_wr: u32,
     /// `max_recv_wr` - The maximum number of outstanding receive work requests.
@@ -169,19 +299,23 @@ pub struct IbvConfig {
     pub hw_init_delay_ms: u64,
     /// `qp_type` - The type of queue pair to create (Auto, Standard, or Mlx5dv).
     pub qp_type: IbvQpType,
+    /// Test-only override for `register_segments`'s `max_sge`. `<= 0`
+    /// (default) uses `ibv_query_device`; small positive values force
+    /// `RDMAXCEL_MKEY_REG_LIMIT` to exercise the dmabuf fallback.
+    pub max_sge_override: i32,
 }
 wirevalue::register_type!(IbvConfig);
 
-/// Default RDMA parameters below are based on common values from rdma-core examples
-/// For high-performance or production use, consider tuning
-/// based on ibv_query_device() results and workload characteristics
+/// rdma-core defaults below come from common rdma-core examples; tune for
+/// production based on `ibv_query_device()` results and workload
+/// characteristics. The default target is `None`, leaving device selection to
+/// the consumer.
 impl Default for IbvConfig {
     fn default() -> Self {
-        let mut config = Self {
-            device: IbvDevice::default(),
+        Self {
+            target: None,
             cq_entries: 1024,
             port_num: 1,
-            gid_index: 3,
             max_send_wr: 512,
             max_recv_wr: 512,
             max_send_sge: 30,
@@ -198,46 +332,17 @@ impl Default for IbvConfig {
             use_gpu_direct: false, // nv_peermem enabled for cuda
             hw_init_delay_ms: 2,
             qp_type: IbvQpType::Auto,
-        };
-        if crate::efa::is_efa_device() {
-            crate::efa::apply_efa_defaults(&mut config);
+            max_sge_override: 0,
         }
-        config
     }
 }
 
 impl IbvConfig {
-    /// Create a new IbvConfig targeting a specific device
-    ///
-    /// Device targets use a unified "type:id" format:
-    /// - "cpu:N" -> finds RDMA device closest to NUMA node N
-    /// - "cuda:N" -> finds RDMA device closest to CUDA device N
-    /// - "nic:mlx5_N" -> returns the specified NIC directly
-    ///
-    /// Shortcuts:
-    /// - "cpu" -> defaults to "cpu:0"
-    /// - "cuda" -> defaults to "cuda:0"
-    ///
-    /// # Arguments
-    ///
-    /// * `target` - Target device specification
-    ///
-    /// # Returns
-    ///
-    /// * `IbvConfig` with resolved device, or default device if resolution fails
-    pub fn targeting(target: &str) -> Self {
-        // Normalize shortcuts
-        let normalized_target = match target {
-            "cpu" => "cpu:0",
-            "cuda" => "cuda:0",
-            _ => target,
-        };
-
-        let device = super::device_selection::select_optimal_ibv_device(Some(normalized_target))
-            .unwrap_or_else(IbvDevice::default);
-
+    /// An [`IbvConfig`] with default parameters whose device
+    /// [`target`](Self::target) is `target` (see [`IbvDeviceTarget`]).
+    pub fn targeting(target: IbvDeviceTarget) -> Self {
         Self {
-            device,
+            target: Some(target),
             ..Default::default()
         }
     }
@@ -247,10 +352,9 @@ impl std::fmt::Display for IbvConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "IbvConfig {{ device: {}, port_num: {}, gid_index: {}, max_send_wr: {}, max_recv_wr: {}, max_send_sge: {}, max_recv_sge: {}, path_mtu: {:?}, retry_cnt: {}, rnr_retry: {}, qp_timeout: {}, min_rnr_timer: {}, max_dest_rd_atomic: {}, max_rd_atomic: {}, pkey_index: {}, psn: 0x{:x} }}",
-            self.device.name(),
+            "IbvConfig {{ target: {:?}, port_num: {}, max_send_wr: {}, max_recv_wr: {}, max_send_sge: {}, max_recv_sge: {}, path_mtu: {:?}, retry_cnt: {}, rnr_retry: {}, qp_timeout: {}, min_rnr_timer: {}, max_dest_rd_atomic: {}, max_rd_atomic: {}, pkey_index: {}, psn: 0x{:x} }}",
+            self.target,
             self.port_num,
-            self.gid_index,
             self.max_send_wr,
             self.max_recv_wr,
             self.max_send_sge,
@@ -277,9 +381,9 @@ impl std::fmt::Display for IbvConfig {
 /// # Examples
 ///
 /// ```
-/// use monarch_rdma::get_all_devices;
+/// use monarch_rdma::backend::ibverbs::device::list_all_devices;
 ///
-/// let devices = get_all_devices();
+/// let devices = list_all_devices();
 /// if let Some(device) = devices.first() {
 ///     // Access device name and firmware version
 ///     let device_name = device.name();
@@ -287,7 +391,7 @@ impl std::fmt::Display for IbvConfig {
 /// }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IbvDevice {
+pub struct IbvDeviceInfo {
     /// `name` - The name of the RDMA device (e.g., "mlx5_0").
     pub name: String,
     /// `vendor_id` - The vendor ID of the device.
@@ -316,20 +420,15 @@ pub struct IbvDevice {
     max_sge: i32,
 }
 
-impl IbvDevice {
+impl IbvDeviceInfo {
     /// Returns the name of the RDMA device.
     pub fn name(&self) -> &String {
         &self.name
     }
 
     /// Returns the first available RDMA device, if any.
-    pub fn first_available() -> Option<IbvDevice> {
-        let devices = get_all_devices();
-        if devices.is_empty() {
-            None
-        } else {
-            Some(devices.into_iter().next().unwrap())
-        }
+    pub fn first_available() -> Option<IbvDeviceInfo> {
+        list_all_devices().into_iter().next()
     }
 
     /// Returns the vendor ID of the RDMA device.
@@ -360,6 +459,71 @@ impl IbvDevice {
     /// Returns a reference to the vector of ports available on the RDMA device.
     pub fn ports(&self) -> &Vec<IbvPort> {
         &self.ports
+    }
+
+    /// Returns the port with the given `port_num`, if present.
+    pub fn port(&self, port_num: u8) -> Option<&IbvPort> {
+        self.ports.iter().find(|port| port.port_num == port_num)
+    }
+
+    /// The lowest-indexed GID on `port_num` matching `scope` (if `Some`) and
+    /// `gid_type` (if `Some`); a `None` filter matches any value. Errors if the
+    /// device has no such port or no GID matches.
+    pub(crate) fn select_gid(
+        &self,
+        port_num: u8,
+        scope: Option<GidScope>,
+        gid_type: Option<GidType>,
+    ) -> Result<Gid, anyhow::Error> {
+        let port = self
+            .port(port_num)
+            .ok_or_else(|| anyhow::anyhow!("device {} has no port {}", self.name, port_num))?;
+        port.gids
+            .values()
+            .find(|gid| {
+                scope.is_none_or(|s| gid.scope() == s)
+                    && gid_type.is_none_or(|t| gid.gid_type() == t)
+            })
+            .copied()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "device {} port {} has no GID with scope {:?} and type {:?}",
+                    self.name,
+                    port_num,
+                    scope,
+                    gid_type
+                )
+            })
+    }
+
+    /// The GID at `index` on `port_num`. Errors if the device has no such port
+    /// or the port has no GID at that index.
+    pub(crate) fn gid_at(&self, port_num: u8, index: u8) -> Result<Gid, anyhow::Error> {
+        let port = self
+            .port(port_num)
+            .ok_or_else(|| anyhow::anyhow!("device {} has no port {}", self.name, port_num))?;
+        port.gids.get(&index).copied().ok_or_else(|| {
+            anyhow::anyhow!(
+                "device {} port {} has no GID at index {}",
+                self.name,
+                port_num,
+                index
+            )
+        })
+    }
+
+    /// Aggregate bandwidth (MB/s) of the device's fastest active port,
+    /// derived from its IB `active_speed` / `active_width`. 0 if no port
+    /// is active, which ranks the device at the worst case.
+    pub fn port_speed_mbytes_per_sec(&self) -> u32 {
+        self.ports
+            .iter()
+            .filter(|port| port.state == rdmaxcel_sys::ibv_port_state::IBV_PORT_ACTIVE)
+            .map(|port| {
+                ib_width_lanes(port.active_width) * ib_speed_mbits_per_lane(port.active_speed) / 8
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     /// Returns the maximum number of queue pairs supported by the RDMA device.
@@ -393,17 +557,37 @@ impl IbvDevice {
     }
 }
 
-impl Default for IbvDevice {
-    fn default() -> Self {
-        // Try to get a smart default using device selection logic (defaults to cpu:0)
-        if let Some(device) = super::device_selection::select_optimal_ibv_device(Some("cpu:0")) {
-            device
-        } else {
-            // Fallback to first available device
-            get_all_devices()
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| panic!("No RDMA devices found"))
+impl IbvDeviceInfo {
+    /// The optimal default device of backend `I`: the best NIC for CPU
+    /// memory on any NUMA node. Panics if `I` has no devices.
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "generic over the backend impl, so it cannot be the parameterless Default::default"
+    )]
+    pub fn default<I: IbvDeviceImpl>() -> Self {
+        resolve_target::<I>(&IbvDeviceTarget::MemoryLocation(MemoryLocation::Cpu(None)))
+            .unwrap_or_else(|| panic!("no RDMA device for backend {}", I::backend_name()))
+    }
+
+    /// Construct an [`IbvDeviceInfo`] with only `name` set (all other
+    /// fields zeroed/empty), for tests that need a named device without
+    /// touching hardware.
+    #[cfg(test)]
+    pub(crate) fn for_test_named(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            vendor_id: 0,
+            vendor_part_id: 0,
+            hw_ver: 0,
+            fw_ver: String::new(),
+            node_guid: 0,
+            ports: Vec::new(),
+            max_qp: 0,
+            max_cq: 0,
+            max_mr: 0,
+            max_pd: 0,
+            max_qp_wr: 0,
+            max_sge: 0,
         }
     }
 }
@@ -412,8 +596,8 @@ impl Default for IbvDevice {
 pub struct IbvPort {
     /// `port_num` - The physical port number on the device.
     port_num: u8,
-    /// `state` - The current state of the port.
-    state: String,
+    /// `state` - The raw `ibv_port_state` of the port.
+    state: rdmaxcel_sys::ibv_port_state::Type,
     /// `physical_state` - The physical state of the port.
     physical_state: String,
     /// `base_lid` - Base Local Identifier for the port.
@@ -426,13 +610,18 @@ pub struct IbvPort {
     capability_mask: u32,
     /// `link_layer` - The link layer type (e.g., InfiniBand, Ethernet).
     link_layer: String,
-    /// `gid` - Global Identifier for the port.
-    gid: String,
+    /// `gids` - The port's populated GID-table entries, keyed by table index
+    /// (empty slots omitted).
+    gids: BTreeMap<u8, Gid>,
     /// `gid_tbl_len` - Length of the GID table.
     gid_tbl_len: i32,
+    /// `active_speed` - IB active speed bitmask (one bit set).
+    active_speed: u8,
+    /// `active_width` - IB active width bitmask (one bit set).
+    active_width: u8,
 }
 
-impl fmt::Display for IbvDevice {
+impl fmt::Display for IbvDeviceInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "{}", self.name)?;
         writeln!(f, "\tNumber of ports: {}", self.ports.len())?;
@@ -456,20 +645,63 @@ impl fmt::Display for IbvDevice {
     }
 }
 
+impl IbvPort {
+    /// The port's populated GID-table entries, keyed by table index.
+    pub fn gids(&self) -> &BTreeMap<u8, Gid> {
+        &self.gids
+    }
+}
+
 impl fmt::Display for IbvPort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "\tPort {}:", self.port_num)?;
-        writeln!(f, "\t\tState: {}", self.state)?;
+        writeln!(f, "\t\tState: {}", get_port_state_str(self.state))?;
         writeln!(f, "\t\tPhysical state: {}", self.physical_state)?;
         writeln!(f, "\t\tBase lid: {}", self.base_lid)?;
         writeln!(f, "\t\tLMC: {}", self.lmc)?;
         writeln!(f, "\t\tSM lid: {}", self.sm_lid)?;
         writeln!(f, "\t\tCapability mask: 0x{:08x}", self.capability_mask)?;
         writeln!(f, "\t\tLink layer: {}", self.link_layer)?;
-        writeln!(f, "\t\tGID: {}", self.gid)?;
         writeln!(f, "\t\tGID table length: {}", self.gid_tbl_len)?;
+        for (index, gid) in &self.gids {
+            writeln!(
+                f,
+                "\t\tGID[{}]: {} ({:?}, {:?})",
+                index,
+                gid,
+                gid.scope(),
+                gid.gid_type()
+            )?;
+        }
         Ok(())
     }
+}
+
+/// Per-lane IB bandwidth (Mbit/s) for an `active_speed` bitmask,
+/// indexed by its lowest set bit (SDR, DDR, QDR, QDR, FDR, EDR, HDR, NDR).
+/// Values match NCCL's `ibvSpeeds` (`transport/net_ib/init.cc`). The
+/// `active_speed` field is a `u8`, so NCCL's 9th rate (XDR, bit 8) is not
+/// representable here; an unset value yields 0.
+fn ib_speed_mbits_per_lane(active_speed: u8) -> u32 {
+    const RATES: [u32; 8] = [2500, 5000, 10000, 10000, 14000, 25000, 50000, 100000];
+    first_set_bit(active_speed)
+        .and_then(|bit| RATES.get(bit).copied())
+        .unwrap_or(0)
+}
+
+/// IB link width in lanes for an `active_width` bitmask, indexed by its
+/// lowest set bit (1x, 4x, 8x, 12x, 2x); values match NCCL's `ibvWidths`
+/// (`transport/net_ib/init.cc`). An unset value yields 0.
+fn ib_width_lanes(active_width: u8) -> u32 {
+    const WIDTHS: [u32; 5] = [1, 4, 8, 12, 2];
+    first_set_bit(active_width)
+        .and_then(|bit| WIDTHS.get(bit).copied())
+        .unwrap_or(0)
+}
+
+/// Index of the lowest set bit, or `None` if `v` is 0.
+fn first_set_bit(v: u8) -> Option<usize> {
+    (v != 0).then(|| v.trailing_zeros() as usize)
 }
 
 /// Converts the given port state to a human-readable string.
@@ -562,115 +794,119 @@ pub fn format_gid(gid: &[u8; 16]) -> String {
     )
 }
 
-/// Retrieves information about all available RDMA devices in the system.
-///
-/// This function queries the system for all available RDMA devices and returns
-/// detailed information about each device, including its capabilities, ports,
-/// and attributes.
-///
-/// # Returns
-///
-/// A vector of `IbvDevice` structures, each representing an RDMA device in the system.
-/// Returns an empty vector if no devices are found or if there was an error querying
-/// the devices.
-pub fn get_all_devices() -> Vec<IbvDevice> {
-    let mut devices = Vec::new();
-
-    // SAFETY: We are calling several C functions from libibverbs.
-    unsafe {
-        let mut num_devices = 0;
-        let device_list = rdmaxcel_sys::ibv_get_device_list(&mut num_devices);
-        if device_list.is_null() || num_devices == 0 {
-            return devices;
+/// Reads the populated GID-table entries under
+/// `/sys/class/infiniband/{device}/ports/{port}/gids/`, keyed by table index.
+/// Scans indices `0..gid_tbl_len` (capped at the `u8` GID-index range). Empty
+/// slots read as the all-zero GID and have no readable `gid_attrs/types`
+/// attribute, so they are skipped before that file is touched. Errors if a
+/// populated entry's GID or type sysfs file cannot be read.
+fn read_port_gids(
+    device: &str,
+    port: u8,
+    gid_tbl_len: i32,
+) -> Result<BTreeMap<u8, Gid>, anyhow::Error> {
+    let mut gids = BTreeMap::new();
+    for index in 0..gid_tbl_len.min(u8::MAX as i32 + 1) {
+        let gid_path = format!("/sys/class/infiniband/{device}/ports/{port}/gids/{index}");
+        let gid_str =
+            std::fs::read_to_string(&gid_path).with_context(|| format!("reading {gid_path}"))?;
+        // Skip empty (all-zero) or malformed slots before reading the type
+        // attribute, which the kernel leaves unreadable for empty slots.
+        let Ok(addr) = gid_str.trim().parse::<Ipv6Addr>() else {
+            continue;
+        };
+        if addr.is_unspecified() {
+            continue;
         }
-
-        for i in 0..num_devices {
-            let device = *device_list.add(i as usize);
-            if device.is_null() {
-                continue;
-            }
-
-            let context = rdmaxcel_sys::ibv_open_device(device);
-            if context.is_null() {
-                continue;
-            }
-
-            let device_name = CStr::from_ptr(rdmaxcel_sys::ibv_get_device_name(device))
-                .to_string_lossy()
-                .into_owned();
-
-            let mut device_attr = rdmaxcel_sys::ibv_device_attr::default();
-            if rdmaxcel_sys::ibv_query_device(context, &mut device_attr) != 0 {
-                rdmaxcel_sys::ibv_close_device(context);
-                continue;
-            }
-
-            let fw_ver = CStr::from_ptr(device_attr.fw_ver.as_ptr())
-                .to_string_lossy()
-                .into_owned();
-
-            let mut rdma_device = IbvDevice {
-                name: device_name,
-                vendor_id: device_attr.vendor_id,
-                vendor_part_id: device_attr.vendor_part_id,
-                hw_ver: device_attr.hw_ver,
-                fw_ver,
-                node_guid: device_attr.node_guid,
-                ports: Vec::new(),
-                max_qp: device_attr.max_qp,
-                max_cq: device_attr.max_cq,
-                max_mr: device_attr.max_mr,
-                max_pd: device_attr.max_pd,
-                max_qp_wr: device_attr.max_qp_wr,
-                max_sge: device_attr.max_sge,
-            };
-
-            for port_num in 1..=device_attr.phys_port_cnt {
-                let mut port_attr = rdmaxcel_sys::ibv_port_attr::default();
-                if rdmaxcel_sys::ibv_query_port(
-                    context,
-                    port_num,
-                    &mut port_attr as *mut rdmaxcel_sys::ibv_port_attr as *mut _,
-                ) != 0
-                {
-                    continue;
-                }
-                let state = get_port_state_str(port_attr.state);
-                let physical_state = get_port_phy_state_str(port_attr.phys_state);
-
-                let link_layer = get_link_layer_str(port_attr.link_layer);
-
-                let mut gid = rdmaxcel_sys::ibv_gid::default();
-                let gid_str = if rdmaxcel_sys::ibv_query_gid(context, port_num, 0, &mut gid) == 0 {
-                    format_gid(&gid.raw)
-                } else {
-                    "N/A".to_string()
-                };
-
-                let rdma_port = IbvPort {
-                    port_num,
-                    state,
-                    physical_state,
-                    base_lid: port_attr.lid,
-                    lmc: port_attr.lmc,
-                    sm_lid: port_attr.sm_lid,
-                    capability_mask: port_attr.port_cap_flags,
-                    link_layer,
-                    gid: gid_str,
-                    gid_tbl_len: port_attr.gid_tbl_len,
-                };
-
-                rdma_device.ports.push(rdma_port);
-            }
-
-            devices.push(rdma_device);
-            rdmaxcel_sys::ibv_close_device(context);
-        }
-
-        rdmaxcel_sys::ibv_free_device_list(device_list);
+        let type_path =
+            format!("/sys/class/infiniband/{device}/ports/{port}/gid_attrs/types/{index}");
+        let type_str =
+            std::fs::read_to_string(&type_path).with_context(|| format!("reading {type_path}"))?;
+        let index = index as u8;
+        gids.insert(index, Gid::new(addr, GidType::of(&type_str), index));
     }
+    Ok(gids)
+}
 
-    devices
+/// Builds an [`IbvDeviceInfo`] from an already-open `ibv_context`. Errors if
+/// `ibv_query_device` or any GID sysfs read fails.
+///
+/// # Safety
+///
+/// `device` and `context` must both be non-null and valid for
+/// the duration of the call; `context` must be the result of
+/// `ibv_open_device(device)`.
+pub(super) unsafe fn query_device_info(
+    device: *mut rdmaxcel_sys::ibv_device,
+    context: *mut rdmaxcel_sys::ibv_context,
+) -> Result<IbvDeviceInfo, anyhow::Error> {
+    // SAFETY: `device` is non-null per the caller's contract;
+    // `ibv_get_device_name` returns a null-terminated C string
+    // owned by the device list.
+    let device_name = unsafe { CStr::from_ptr(rdmaxcel_sys::ibv_get_device_name(device)) }
+        .to_string_lossy()
+        .into_owned();
+    let mut device_attr = rdmaxcel_sys::ibv_device_attr::default();
+    // SAFETY: `context` is a non-null context per the caller's
+    // contract; `&mut device_attr` is a writable, properly
+    // aligned `ibv_device_attr`.
+    let rc = unsafe { rdmaxcel_sys::ibv_query_device(context, &mut device_attr) };
+    if rc != 0 {
+        anyhow::bail!("ibv_query_device failed for device {device_name}: {rc}");
+    }
+    // SAFETY: `device_attr.fw_ver` is a null-terminated C buffer
+    // populated by `ibv_query_device`.
+    let fw_ver = unsafe { CStr::from_ptr(device_attr.fw_ver.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    let mut info = IbvDeviceInfo {
+        name: device_name,
+        vendor_id: device_attr.vendor_id,
+        vendor_part_id: device_attr.vendor_part_id,
+        hw_ver: device_attr.hw_ver,
+        fw_ver,
+        node_guid: device_attr.node_guid,
+        ports: Vec::new(),
+        max_qp: device_attr.max_qp,
+        max_cq: device_attr.max_cq,
+        max_mr: device_attr.max_mr,
+        max_pd: device_attr.max_pd,
+        max_qp_wr: device_attr.max_qp_wr,
+        max_sge: device_attr.max_sge,
+    };
+    for port_num in 1..=device_attr.phys_port_cnt {
+        let mut port_attr = rdmaxcel_sys::ibv_port_attr::default();
+        // SAFETY: `context` is a valid context; `port_attr` is
+        // a writable, properly aligned `ibv_port_attr`.
+        if unsafe {
+            rdmaxcel_sys::ibv_query_port(
+                context,
+                port_num,
+                &mut port_attr as *mut rdmaxcel_sys::ibv_port_attr as *mut _,
+            )
+        } != 0
+        {
+            continue;
+        }
+        let physical_state = get_port_phy_state_str(port_attr.phys_state);
+        let link_layer = get_link_layer_str(port_attr.link_layer);
+        let gids = read_port_gids(&info.name, port_num, port_attr.gid_tbl_len)?;
+        info.ports.push(IbvPort {
+            port_num,
+            state: port_attr.state,
+            physical_state,
+            base_lid: port_attr.lid,
+            lmc: port_attr.lmc,
+            sm_lid: port_attr.sm_lid,
+            capability_mask: port_attr.port_cap_flags,
+            link_layer,
+            gids,
+            gid_tbl_len: port_attr.gid_tbl_len,
+            active_speed: port_attr.active_speed,
+            active_width: port_attr.active_width,
+        });
+    }
+    Ok(info)
 }
 
 /// Cached result of mlx5dv support check.
@@ -735,83 +971,6 @@ fn ibverbs_supported_impl() -> bool {
             rdmaxcel_sys::ibv_free_device_list(device_list);
         }
         num_devices > 0
-    }
-}
-
-/// Represents a view of a memory region that can be registered with an RDMA device.
-///
-/// This is a 'view' of a registered Memory Region, allowing multiple views into a single
-/// large MR registration. This is commonly used with PyTorch's caching allocator, which
-/// reserves large memory blocks and provides different data pointers into that space.
-///
-/// # Example
-/// PyTorch Caching Allocator creates a 16GB segment at virtual address `0x01000000`.
-/// The underlying Memory Region registers 16GB but at RDMA address `0x0`.
-/// To access virtual address `0x01100000`, we return a view at RDMA address `0x100000`.
-///
-/// # Safety
-/// The caller must ensure the memory remains valid and is not freed, moved, or
-/// overwritten while RDMA operations are in progress.
-
-#[derive(
-    Debug,
-    PartialEq,
-    Eq,
-    std::hash::Hash,
-    Serialize,
-    Deserialize,
-    Clone,
-    Copy
-)]
-pub struct IbvMemoryRegionView {
-    // id should be unique with a given rdmam manager
-    pub id: usize,
-    /// Virtual address in the process address space.
-    /// This is the pointer/address as seen by the local process.
-    pub virtual_addr: usize,
-    /// Memory address assigned after Memory Region (MR) registration.
-    /// This is the address may be offset a base MR addr.
-    pub rdma_addr: usize,
-    pub size: usize,
-    pub lkey: u32,
-    pub rkey: u32,
-}
-
-// SAFETY: IbvMemoryRegionView can be safely sent between threads because it only
-// contains address and size information without any thread-local state. However,
-// this DOES NOT provide any protection against data races in the underlying memory.
-// If one thread initiates an RDMA operation while another thread modifies the same
-// memory region, undefined behavior will occur. The caller is responsible for proper
-// synchronization of access to the underlying memory.
-unsafe impl Send for IbvMemoryRegionView {}
-
-// SAFETY: IbvMemoryRegionView is safe for concurrent access by multiple threads
-// as it only provides a view into memory without modifying its own state. However,
-// it provides NO PROTECTION against concurrent access to the underlying memory region.
-// The caller must ensure proper synchronization when:
-// 1. Initiating RDMA operations while local code reads/writes the same memory
-// 2. Performing multiple overlapping RDMA operations on the same memory region
-// 3. Freeing or reallocating memory that has in-flight RDMA operations
-unsafe impl Sync for IbvMemoryRegionView {}
-
-impl IbvMemoryRegionView {
-    /// Creates a new `IbvMemoryRegionView` with the given address and size.
-    pub fn new(
-        id: usize,
-        virtual_addr: usize,
-        rdma_addr: usize,
-        size: usize,
-        lkey: u32,
-        rkey: u32,
-    ) -> Self {
-        Self {
-            id,
-            virtual_addr,
-            rdma_addr,
-            size,
-            lkey,
-            rkey,
-        }
     }
 }
 
@@ -957,6 +1116,416 @@ impl IbvWc {
     pub fn is_valid(&self) -> bool {
         self.valid
     }
+
+    #[cfg(test)]
+    pub(super) fn for_test(wr_id: u64, valid: bool) -> Self {
+        Self {
+            wr_id,
+            len: 0,
+            valid,
+            error: None,
+            opcode: rdmaxcel_sys::ibv_wc_opcode::IBV_WC_RDMA_WRITE,
+            bytes: None,
+            qp_num: 0,
+            src_qp: 0,
+            pkey_index: 0,
+            slid: 0,
+            sl: 0,
+            dlid_path_bits: 0,
+        }
+    }
+}
+
+/// Owns an `ibv_cq` together with the `Arc<IbvContext>` it was created on,
+/// destroying the CQ on drop (a no-op if null) before releasing the context.
+/// Holding the context keeps it open across `ibv_destroy_cq`.
+#[derive(Debug)]
+pub(super) struct IbvCq {
+    cq: *mut rdmaxcel_sys::ibv_cq,
+    /// Keeps the context open until after `ibv_destroy_cq`. Never read.
+    _context: Arc<IbvContext>,
+}
+
+// SAFETY: the only raw member is the `ibv_cq` pointer. The ibverbs CQ it names is
+// not thread-affine — it may be created on one thread and used or destroyed on
+// another (`Send`) — and `IbvCq` exposes no operation that mutates the CQ through
+// a shared `&` (`as_ptr` only hands back the pointer value), so sharing a
+// `&IbvCq` cannot race (`Sync`).
+unsafe impl Send for IbvCq {}
+// SAFETY: as for `Send` above.
+unsafe impl Sync for IbvCq {}
+
+impl IbvCq {
+    /// Creates a completion queue with `cq_entries` entries on `context`,
+    /// retaining `context` for the CQ's lifetime.
+    ///
+    /// # Safety
+    ///
+    /// `context` must wrap a live `ibv_context`; a null context yields `Err`.
+    pub(super) unsafe fn create(
+        context: Arc<IbvContext>,
+        cq_entries: i32,
+    ) -> Result<Self, anyhow::Error> {
+        if context.as_ptr().is_null() {
+            anyhow::bail!("cannot create a completion queue on a null context");
+        }
+        // SAFETY: `context.as_ptr()` is non-null (checked above) and live (caller
+        // contract); `ibv_create_cq` returns null on failure.
+        let cq = unsafe {
+            rdmaxcel_sys::ibv_create_cq(
+                context.as_ptr(),
+                cq_entries,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if cq.is_null() {
+            anyhow::bail!(
+                "failed to create completion queue: {}",
+                Error::last_os_error()
+            );
+        }
+        Ok(Self {
+            cq,
+            _context: context,
+        })
+    }
+
+    /// The raw `ibv_cq`; null for a placeholder that holds no queue.
+    pub(super) fn as_ptr(&self) -> *mut rdmaxcel_sys::ibv_cq {
+        self.cq
+    }
+
+    /// A placeholder holding no completion queue: `as_ptr` returns null and
+    /// `Drop` is a no-op.
+    #[cfg(test)]
+    pub(super) fn null() -> Self {
+        Self {
+            cq: std::ptr::null_mut(),
+            _context: Arc::new(IbvContext::null()),
+        }
+    }
+}
+
+impl Drop for IbvCq {
+    fn drop(&mut self) {
+        if self.cq.is_null() {
+            return;
+        }
+        // SAFETY: a non-null `self.cq` was returned by `ibv_create_cq` and, since
+        // `IbvCq` is not `Clone`, is destroyed exactly once. `_context` drops only
+        // after this returns, so the device is still open here.
+        let ret = unsafe { rdmaxcel_sys::ibv_destroy_cq(self.cq) };
+        if ret != 0 {
+            tracing::error!(
+                "failed to destroy completion queue {:p}: error code {}",
+                self.cq,
+                ret
+            );
+        }
+    }
+}
+
+/// Owns an `ibv_qp` together with the resources it is built against: its two
+/// completion queues and the protection domain. The QP is destroyed on drop (a
+/// no-op if null) before the CQs and PD, so the destruction order is correct by
+/// construction and holders need not track the CQs or PD separately.
+#[derive(Debug)]
+pub(super) struct IbvQp {
+    qp: *mut rdmaxcel_sys::ibv_qp,
+    /// Declared after `qp` so the QP is destroyed before its completion queues.
+    send_cq: IbvCq,
+    recv_cq: IbvCq,
+    /// Keeps the PD alive for the QP's lifetime and is the source of the QP's
+    /// device context (via [`IbvPd::context`]).
+    pd: Arc<IbvPd>,
+}
+
+// SAFETY: the only raw member is the `ibv_qp` pointer (the other fields are
+// already `Send`/`Sync`). The ibverbs QP it names is not thread-affine — it may
+// be created on one thread and used or destroyed on another (`Send`) — and
+// `IbvQp` exposes no operation that mutates the QP through a shared `&`, so
+// sharing a `&IbvQp` cannot race (`Sync`).
+unsafe impl Send for IbvQp {}
+// SAFETY: as for `Send` above.
+unsafe impl Sync for IbvQp {}
+
+impl IbvQp {
+    /// Takes ownership of a raw `ibv_qp` and the `send_cq`/`recv_cq`/`pd` it was
+    /// built against, destroying the QP on drop.
+    ///
+    /// # Safety
+    ///
+    /// `qp`, if non-null, must be a live `ibv_qp` owned solely by the returned
+    /// value (its `Drop` calls `ibv_destroy_qp` once), built against `pd` with
+    /// `send_cq`/`recv_cq` as its completion queues.
+    pub(super) unsafe fn from_raw(
+        qp: *mut rdmaxcel_sys::ibv_qp,
+        send_cq: IbvCq,
+        recv_cq: IbvCq,
+        pd: Arc<IbvPd>,
+    ) -> Self {
+        Self {
+            qp,
+            send_cq,
+            recv_cq,
+            pd,
+        }
+    }
+
+    /// The raw `ibv_qp`; null for a placeholder that holds no queue pair.
+    pub(super) fn as_ptr(&self) -> *mut rdmaxcel_sys::ibv_qp {
+        self.qp
+    }
+
+    /// The send completion queue.
+    pub(super) fn send_cq(&self) -> &IbvCq {
+        &self.send_cq
+    }
+
+    /// The receive completion queue.
+    pub(super) fn recv_cq(&self) -> &IbvCq {
+        &self.recv_cq
+    }
+
+    /// The device context this QP was created on, sourced from its PD.
+    pub(super) fn context(&self) -> &IbvContext {
+        self.pd.context()
+    }
+
+    /// A placeholder holding no queue pair: `as_ptr` returns null and `Drop` is
+    /// a no-op.
+    #[cfg(test)]
+    pub(super) fn null() -> Self {
+        Self {
+            qp: std::ptr::null_mut(),
+            send_cq: IbvCq::null(),
+            recv_cq: IbvCq::null(),
+            pd: Arc::new(IbvPd::null()),
+        }
+    }
+}
+
+impl Drop for IbvQp {
+    fn drop(&mut self) {
+        if self.qp.is_null() {
+            return;
+        }
+        // SAFETY: a non-null `self.qp` was handed to `from_raw` as a live `ibv_qp`
+        // and, since `IbvQp` is not `Clone`, is destroyed exactly once. Its CQs
+        // and PD drop only after this returns, so they outlive the destruction.
+        let ret = unsafe { rdmaxcel_sys::ibv_destroy_qp(self.qp) };
+        if ret != 0 {
+            tracing::error!(
+                "failed to destroy queue pair {:p}: error code {}",
+                self.qp,
+                ret
+            );
+        }
+    }
+}
+
+/// RAII owner of a raw `ibv_context*`, closing it in [`Drop`] (a no-op if
+/// null).
+#[derive(Debug)]
+pub struct IbvContext(*mut rdmaxcel_sys::ibv_context);
+
+// SAFETY: libibverbs treats `ibv_context*` as thread-safe for the
+// operations we perform.
+unsafe impl Send for IbvContext {}
+unsafe impl Sync for IbvContext {}
+
+impl IbvContext {
+    /// Wraps a raw `ibv_context*`. A null pointer yields a no-op context
+    /// (its `Drop` does nothing).
+    ///
+    /// # Safety
+    ///
+    /// `context` must be either null or a pointer returned by
+    /// `ibv_open_device` that has not been (and will not be) closed elsewhere:
+    /// the resulting `IbvContext` takes sole ownership and its `Drop` calls
+    /// `ibv_close_device` exactly once.
+    pub(super) unsafe fn from_raw(context: *mut rdmaxcel_sys::ibv_context) -> Self {
+        Self(context)
+    }
+
+    /// Returns the raw `ibv_context*`. The pointer is valid for
+    /// the lifetime of `&self`.
+    pub fn as_ptr(&self) -> *mut rdmaxcel_sys::ibv_context {
+        self.0
+    }
+
+    /// A placeholder holding no context: `as_ptr` returns null and `Drop` is a
+    /// no-op. Used by the test-only `null()` constructors of the pointer
+    /// wrappers that hold a context.
+    #[cfg(test)]
+    pub(super) fn null() -> Self {
+        // SAFETY: a null context is explicitly allowed; `Drop` skips
+        // `ibv_close_device` for null.
+        unsafe { Self::from_raw(std::ptr::null_mut()) }
+    }
+}
+
+impl Drop for IbvContext {
+    fn drop(&mut self) {
+        if self.0.is_null() {
+            return;
+        }
+        // SAFETY: `self.0` was returned by `ibv_open_device` and
+        // has not been closed elsewhere.
+        let result = unsafe { rdmaxcel_sys::ibv_close_device(self.0) };
+        if result != 0 {
+            tracing::error!(
+                "ibv_close_device failed for context {:p}: error code {}",
+                self.0,
+                result
+            );
+        }
+    }
+}
+
+/// Owns an `ibv_pd` together with the `Arc<IbvContext>` it was allocated
+/// against, deallocating the PD on drop (a no-op if null) before releasing the
+/// context.
+#[derive(Debug)]
+pub(super) struct IbvPd {
+    pd: *mut rdmaxcel_sys::ibv_pd,
+    /// The context the PD was allocated against, kept open until after
+    /// `ibv_dealloc_pd` and reached by holders via [`Self::context`].
+    context: Arc<IbvContext>,
+}
+
+// SAFETY: the only raw member is the `ibv_pd` pointer. The ibverbs PD it names is
+// not thread-affine — it may be allocated on one thread and used or deallocated
+// on another (`Send`) — and `IbvPd` exposes no operation that mutates the PD
+// through a shared `&` (`as_ptr` only hands back the pointer value), so sharing a
+// `&IbvPd` cannot race (`Sync`).
+unsafe impl Send for IbvPd {}
+// SAFETY: as for `Send` above.
+unsafe impl Sync for IbvPd {}
+
+impl IbvPd {
+    /// Allocates a protection domain against `context`.
+    ///
+    /// # Safety
+    ///
+    /// `context` must wrap a live `ibv_context`; a null context yields `Err`.
+    pub(super) unsafe fn create(context: Arc<IbvContext>) -> Result<Self, anyhow::Error> {
+        if context.as_ptr().is_null() {
+            anyhow::bail!("cannot allocate a protection domain on a null context");
+        }
+        // SAFETY: `context.as_ptr()` is non-null (checked above) and live (caller
+        // contract); `ibv_alloc_pd` returns null on failure.
+        let pd = unsafe { rdmaxcel_sys::ibv_alloc_pd(context.as_ptr()) };
+        if pd.is_null() {
+            anyhow::bail!("ibv_alloc_pd failed: {}", Error::last_os_error());
+        }
+        Ok(Self { pd, context })
+    }
+
+    /// The raw `ibv_pd`; null for a placeholder that holds no protection domain.
+    pub(super) fn as_ptr(&self) -> *mut rdmaxcel_sys::ibv_pd {
+        self.pd
+    }
+
+    /// The context this PD was allocated against.
+    pub(super) fn context(&self) -> &Arc<IbvContext> {
+        &self.context
+    }
+
+    /// A placeholder holding no protection domain (and a no-op context): both
+    /// `Drop`s are no-ops.
+    #[cfg(test)]
+    pub(super) fn null() -> Self {
+        Self {
+            pd: std::ptr::null_mut(),
+            context: Arc::new(IbvContext::null()),
+        }
+    }
+}
+
+impl Drop for IbvPd {
+    fn drop(&mut self) {
+        if self.pd.is_null() {
+            return;
+        }
+        // SAFETY: a non-null `self.pd` was returned by `ibv_alloc_pd` and, since
+        // `IbvPd` is not `Clone`, is deallocated exactly once. `context` is
+        // dropped only after this returns, so the device is still open here.
+        let ret = unsafe { rdmaxcel_sys::ibv_dealloc_pd(self.pd) };
+        if ret != 0 {
+            tracing::error!(
+                "failed to deallocate protection domain {:p}: error code {}",
+                self.pd,
+                ret
+            );
+        }
+    }
+}
+
+/// Owns an `ibv_mr` together with the `Arc<IbvPd>` it was registered against,
+/// deregistering the MR on drop (a no-op if null) before releasing the PD.
+/// Holding the PD keeps it (and, through it, the context) alive across
+/// `ibv_dereg_mr`, so an `IbvMr` is a self-contained registration callers can
+/// keep alive on its own.
+#[derive(Debug)]
+pub(super) struct IbvMr {
+    mr: *mut rdmaxcel_sys::ibv_mr,
+    /// Keeps the PD open until after `ibv_dereg_mr`. Never read.
+    _pd: Arc<IbvPd>,
+}
+
+// SAFETY: the only raw member is the `ibv_mr` pointer. The ibverbs MR it names is
+// not thread-affine — it may be registered on one thread and used or
+// deregistered on another (`Send`) — and `IbvMr` exposes no operation that
+// mutates the MR through a shared `&` (`as_ptr` only hands back the pointer
+// value), so sharing a `&IbvMr` cannot race (`Sync`).
+unsafe impl Send for IbvMr {}
+// SAFETY: as for `Send` above.
+unsafe impl Sync for IbvMr {}
+
+impl IbvMr {
+    /// Takes ownership of a raw `ibv_mr` and the `pd` it was registered against,
+    /// deregistering the MR on drop.
+    ///
+    /// # Safety
+    ///
+    /// `mr`, if non-null, must be a live `ibv_mr` owned solely by the returned
+    /// value (its `Drop` calls `ibv_dereg_mr` once), registered against `pd`.
+    pub(super) unsafe fn from_raw(mr: *mut rdmaxcel_sys::ibv_mr, pd: Arc<IbvPd>) -> Self {
+        Self { mr, _pd: pd }
+    }
+
+    /// The raw `ibv_mr`; null for a placeholder that holds no region.
+    pub(super) fn as_ptr(&self) -> *mut rdmaxcel_sys::ibv_mr {
+        self.mr
+    }
+
+    /// A placeholder holding no memory region (and a no-op PD): both `Drop`s are
+    /// no-ops.
+    #[cfg(test)]
+    pub(super) fn null() -> Self {
+        Self {
+            mr: std::ptr::null_mut(),
+            _pd: Arc::new(IbvPd::null()),
+        }
+    }
+}
+
+impl Drop for IbvMr {
+    fn drop(&mut self) {
+        if self.mr.is_null() {
+            return;
+        }
+        // SAFETY: a non-null `self.mr` was handed to `from_raw` as a live
+        // `ibv_mr` and, since `IbvMr` is not `Clone`, is deregistered exactly
+        // once. `_pd` drops only after this returns, so the PD is still alive.
+        let ret = unsafe { rdmaxcel_sys::ibv_dereg_mr(self.mr) };
+        if ret != 0 {
+            tracing::error!("failed to deregister MR {:p}: error code {}", self.mr, ret);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -964,9 +1533,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_get_all_devices() {
+    fn test_list_all_devices() {
         // Skip test if RDMA devices are not available
-        let devices = get_all_devices();
+        let devices = list_all_devices();
         if devices.is_empty() {
             println!("Skipping test: RDMA devices not available");
             return;
@@ -983,7 +1552,7 @@ mod tests {
     #[test]
     fn test_first_available() {
         // Skip test if RDMA is not available
-        let devices = get_all_devices();
+        let devices = list_all_devices();
         if devices.is_empty() {
             println!("Skipping test: RDMA devices not available");
             return;
@@ -1008,7 +1577,7 @@ mod tests {
 
     #[test]
     fn test_device_display() {
-        if let Some(device) = IbvDevice::first_available() {
+        if let Some(device) = IbvDeviceInfo::first_available() {
             let display_output = format!("{}", device);
             assert!(
                 display_output.contains(&device.name),
@@ -1023,20 +1592,109 @@ mod tests {
 
     #[test]
     fn test_port_display() {
-        if let Some(device) = IbvDevice::first_available() {
-            if !device.ports().is_empty() {
-                let port = &device.ports()[0];
-                let display_output = format!("{}", port);
-                assert!(
-                    display_output.contains(&port.state),
-                    "display should include port state"
-                );
-                assert!(
-                    display_output.contains(&port.link_layer),
-                    "display should include link layer"
-                );
+        if let Some(device) = IbvDeviceInfo::first_available()
+            && !device.ports().is_empty()
+        {
+            let port = &device.ports()[0];
+            let display_output = format!("{}", port);
+            assert!(
+                display_output.contains(&get_port_state_str(port.state)),
+                "display should include port state"
+            );
+            assert!(
+                display_output.contains(&port.link_layer),
+                "display should include link layer"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ib_speed_mbits_per_lane() {
+        // `active_speed` is a one-hot bitmask, indexed by its lowest set
+        // bit. Values mirror NCCL's `ibvSpeeds` (SDR..NDR).
+        assert_eq!(ib_speed_mbits_per_lane(1), 2500); // SDR
+        assert_eq!(ib_speed_mbits_per_lane(2), 5000); // DDR
+        assert_eq!(ib_speed_mbits_per_lane(4), 10000); // QDR
+        assert_eq!(ib_speed_mbits_per_lane(8), 10000); // QDR / FDR10
+        assert_eq!(ib_speed_mbits_per_lane(16), 14000); // FDR
+        assert_eq!(ib_speed_mbits_per_lane(32), 25000); // EDR
+        assert_eq!(ib_speed_mbits_per_lane(64), 50000); // HDR
+        assert_eq!(ib_speed_mbits_per_lane(128), 100000); // NDR
+        assert_eq!(ib_speed_mbits_per_lane(0), 0); // unset → unknown
+    }
+
+    #[test]
+    fn test_ib_width_lanes() {
+        assert_eq!(ib_width_lanes(1), 1); // 1x
+        assert_eq!(ib_width_lanes(2), 4); // 4x
+        assert_eq!(ib_width_lanes(4), 8); // 8x
+        assert_eq!(ib_width_lanes(8), 12); // 12x
+        assert_eq!(ib_width_lanes(16), 2); // 2x
+        assert_eq!(ib_width_lanes(0), 0); // unset → unknown
+    }
+
+    #[test]
+    fn test_port_speed_mbytes_per_sec() {
+        use rdmaxcel_sys::ibv_port_state::IBV_PORT_ACTIVE;
+        use rdmaxcel_sys::ibv_port_state::IBV_PORT_DOWN;
+        fn mk_port(
+            state: rdmaxcel_sys::ibv_port_state::Type,
+            active_speed: u8,
+            active_width: u8,
+        ) -> IbvPort {
+            IbvPort {
+                port_num: 1,
+                state,
+                physical_state: String::new(),
+                base_lid: 0,
+                lmc: 0,
+                sm_lid: 0,
+                capability_mask: 0,
+                link_layer: String::new(),
+                gids: BTreeMap::new(),
+                gid_tbl_len: 0,
+                active_speed,
+                active_width,
             }
         }
+        fn mk_device(ports: Vec<IbvPort>) -> IbvDeviceInfo {
+            IbvDeviceInfo {
+                name: "test".to_string(),
+                vendor_id: 0,
+                vendor_part_id: 0,
+                hw_ver: 0,
+                fw_ver: String::new(),
+                node_guid: 0,
+                ports,
+                max_qp: 0,
+                max_cq: 0,
+                max_mr: 0,
+                max_pd: 0,
+                max_qp_wr: 0,
+                max_sge: 0,
+            }
+        }
+
+        // NDR (128) x4 (width bit 2): 100000 * 4 / 8 = 50000 MB/s.
+        assert_eq!(
+            mk_device(vec![mk_port(IBV_PORT_ACTIVE, 128, 2)]).port_speed_mbytes_per_sec(),
+            50000
+        );
+
+        // The fastest port is DOWN, so it is ignored; the result is the
+        // fastest ACTIVE port, not the (faster) down one.
+        let mixed = mk_device(vec![
+            mk_port(IBV_PORT_ACTIVE, 32, 2), // EDR x4 = 12500
+            mk_port(IBV_PORT_ACTIVE, 64, 2), // HDR x4 = 25000 (fastest ACTIVE)
+            mk_port(IBV_PORT_DOWN, 128, 2),  // NDR x4 = 50000, but DOWN → ignored
+        ]);
+        assert_eq!(mixed.port_speed_mbytes_per_sec(), 25000);
+
+        // No ACTIVE port → 0 (treated as unknown, no cap).
+        assert_eq!(
+            mk_device(vec![mk_port(IBV_PORT_DOWN, 128, 2)]).port_speed_mbytes_per_sec(),
+            0
+        );
     }
 
     #[test]
@@ -1093,6 +1751,46 @@ mod tests {
         let ibv_wc = IbvWc::from(wc);
         assert_eq!(ibv_wc.wr_id(), 42);
         assert!(ibv_wc.is_valid());
+    }
+
+    #[test]
+    fn test_gid_scope_of() {
+        fn scope(addr: &str) -> GidScope {
+            GidScope::of(addr.parse().expect("valid IPv6"))
+        }
+
+        // Loopback: `::1` and IPv4-mapped loopback (`::ffff:127.0.0.0/8`) — the
+        // latter must not be classified as global.
+        assert_eq!(scope("::1"), GidScope::Loopback);
+        assert_eq!(scope("::ffff:127.0.0.1"), GidScope::Loopback);
+
+        // Link-local: `fe80::/10` (the default GID prefix) and IPv4-mapped
+        // link-local (`::ffff:169.254.0.0/16`).
+        assert_eq!(scope("fe80::1"), GidScope::LinkLocal);
+        assert_eq!(scope("::ffff:169.254.1.1"), GidScope::LinkLocal);
+
+        // Site-local `fec0::/10`.
+        assert_eq!(scope("fec0::1"), GidScope::SiteLocal);
+
+        // Global: IPv4-mapped (the common RoCE v2 form, in both sysfs hextet and
+        // dotted-quad forms), ULA, and global IPv6.
+        assert_eq!(
+            scope("0000:0000:0000:0000:0000:ffff:0a1e:0f44"),
+            GidScope::Global
+        );
+        assert_eq!(scope("::ffff:10.30.15.68"), GidScope::Global);
+        assert_eq!(scope("fd00::1"), GidScope::Global);
+        assert_eq!(scope("2001:db8::1"), GidScope::Global);
+    }
+
+    #[test]
+    fn test_gid_type_of() {
+        // Matches the sysfs `gid_attrs/types` strings (trailing newline and all);
+        // anything else is `Unknown`.
+        assert_eq!(GidType::of("RoCE v2\n"), GidType::RoCEv2);
+        assert_eq!(GidType::of("IB/RoCE v1\n"), GidType::RoCEv1);
+        assert_eq!(GidType::of(""), GidType::Unknown);
+        assert_eq!(GidType::of("something else"), GidType::Unknown);
     }
 
     #[test]

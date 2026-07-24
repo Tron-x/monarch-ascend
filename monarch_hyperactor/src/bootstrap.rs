@@ -7,6 +7,7 @@
  */
 
 use futures::future::try_join_all;
+use hyperactor::Gateway;
 use hyperactor::channel::ChannelAddr;
 use hyperactor::id::Label;
 use hyperactor_mesh::bootstrap::BootstrapCommand;
@@ -29,13 +30,15 @@ use pyo3::wrap_pyfunction;
 
 use crate::host_mesh::PyHostMesh;
 use crate::pytokio::PyPythonTask;
+use crate::runtime::GilSite;
 use crate::runtime::monarch_with_gil;
 
 #[pyfunction]
 #[pyo3(signature = ())]
 pub fn bootstrap_main(py: Python) -> PyResult<Bound<PyAny>> {
+    #[cfg(fbcode_build)]
     // SAFETY: this is a correct use of this function.
-    let _ = unsafe {
+    unsafe {
         fbinit::perform_init();
     };
 
@@ -45,6 +48,7 @@ pub fn bootstrap_main(py: Python) -> PyResult<Bound<PyAny>> {
         // - Only one of these is ever created.
         // - This is the entry point of this program, so this will be dropped when
         // no more FB C++ code is running.
+        #[cfg(fbcode_build)]
         let _destroy_guard = unsafe { fbinit::DestroyGuard::new() };
         bootstrap()
             .await
@@ -103,9 +107,10 @@ pub fn run_worker_loop_forever(_py: Python<'_>, address: &str) -> PyResult<PyPyt
     });
 
     PyPythonTask::new(async move {
-        let (_agent_handle, shutdown) = host(addr, command, None, true, listener)
-            .await
-            .map_pyerr()?;
+        let (_agent_handle, shutdown) =
+            host(addr, command, None, true, listener, Gateway::new(), None)
+                .await
+                .map_pyerr()?;
         shutdown.join().await;
         halt::<()>().await;
         Ok(())
@@ -113,9 +118,9 @@ pub fn run_worker_loop_forever(_py: Python<'_>, address: &str) -> PyResult<PyPyt
 }
 
 #[pyfunction]
-pub fn attach_to_workers<'py>(
+pub fn attach_to_workers(
     instance: &crate::context::PyInstance,
-    workers: Vec<Bound<'py, PyPythonTask>>,
+    workers: Vec<Bound<'_, PyPythonTask>>,
     name: Option<&str>,
 ) -> PyResult<PyPythonTask> {
     let tasks = workers
@@ -127,21 +132,22 @@ pub fn attach_to_workers<'py>(
     // drops illegal characters, falls back to "nil" if empty. Callers pass names
     // derived from experiment / job names that may contain uppercase or punctuation;
     // rejecting them surfaces as an opaque PyException far from the input site.
-    let name = HostMeshId::unique(Label::strip(name.unwrap_or("hosts")));
+    let name = HostMeshId::instance(Label::strip(name.unwrap_or("hosts")));
     let instance = instance.clone();
     PyPythonTask::new(async move {
         let results = try_join_all(tasks).await?;
 
-        let addresses: Result<Vec<ChannelAddr>, anyhow::Error> = monarch_with_gil(|py| {
-            results
-                .into_iter()
-                .map(|result| {
-                    let url_str: String = result.bind(py).extract()?;
-                    ChannelAddr::from_zmq_url(&url_str)
-                })
-                .collect()
-        })
-        .await;
+        let addresses: Result<Vec<ChannelAddr>, anyhow::Error> =
+            monarch_with_gil(GilSite::Bootstrap, |py| {
+                results
+                    .into_iter()
+                    .map(|result| {
+                        let url_str: String = result.bind(py).extract()?;
+                        Ok(ChannelAddr::from_zmq_url(&url_str)?.into_dial_addr())
+                    })
+                    .collect()
+            })
+            .await;
         let addresses = addresses?;
 
         let host_mesh = HostMesh::attach(&*instance, name, addresses)

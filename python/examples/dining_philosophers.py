@@ -64,6 +64,7 @@ class Philosopher(Actor):
     """A philosopher that alternates between thinking and eating."""
 
     def __init__(self, size: int) -> None:
+        # pyrefly: ignore [bad-assignment, bad-override]
         self.size = size
         self.rank: int = 0
         self.left_status = ChopstickStatus.NONE
@@ -72,7 +73,9 @@ class Philosopher(Actor):
         self.meals_eaten: int = 0
 
     def _chopstick_indices(self) -> tuple[int, int]:
+        # pyrefly: ignore [unsupported-operation]
         left = self.rank % self.size
+        # pyrefly: ignore [unsupported-operation]
         right = (self.rank + 1) % self.size
         return left, right
 
@@ -164,52 +167,58 @@ NUM_PHILOSOPHERS = 5
 
 async def async_main(
     dashboard: bool = False,
-    dashboard_port: int = 8265,
+    dashboard_port: int | None = None,
     kill_waiter_after: float | None = None,
+    telemetry: bool = True,
 ) -> None:
     job = ProcessJob({"hosts": 1})
-    job.enable_admin()
-    job.enable_telemetry(
-        TelemetryConfig(
-            include_dashboard=dashboard,
-            dashboard_port=dashboard_port,
-            snapshot_interval_secs=30.0,
+    if telemetry:
+        resolved_dashboard_port = dashboard_port
+        if resolved_dashboard_port is None:
+            resolved_dashboard_port = 8265 if dashboard else 0
+
+        job.enable_telemetry(
+            TelemetryConfig(
+                include_dashboard=dashboard,
+                dashboard_port=resolved_dashboard_port,
+            )
         )
-    )
-    state = job.state(cached_path=None)
-    host = state.hosts
-
-    admin_url = state.admin_url
-    assert admin_url is not None
-    mtls_flags = (
-        "--cacert /var/facebook/rootcanal/ca.pem "
-        "--cert /var/facebook/x509_identities/server.pem "
-        "--key /var/facebook/x509_identities/server.pem "
-        if admin_url.startswith("https")
-        else ""
-    )
-    print(f"\nMesh admin server listening on {admin_url}")
-    print(f"  - Root node:     curl {mtls_flags}{admin_url}/v1/root")
-    print(f"  - Mesh tree:     curl {mtls_flags}{admin_url}/v1/tree")
-    print(f"  - API docs:      curl {mtls_flags}{admin_url}/SKILL.md")
-    print(
-        f"  - TUI:           buck2 run fbcode//monarch/hyperactor_mesh_admin_tui:hyperactor_mesh_admin_tui -- --addr {admin_url}"
-    )
-    print("\nPress Ctrl+C to stop.\n", flush=True)
-
-    # Spawn philosopher processes and actors.
-    procs = host.spawn_procs(per_host={"replica": NUM_PHILOSOPHERS})
-
-    # Spawn waiter on its own proc mesh so it appears in the dashboard hierarchy.
-    waiter_proc = host.spawn_procs(name="waiter")
-    philosophers = procs.spawn("philosopher", Philosopher, NUM_PHILOSOPHERS)
-    waiter = waiter_proc.spawn("waiter", Waiter, philosophers)
-
-    # Start all philosophers — each will begin requesting chopsticks.
-    philosophers.start.broadcast(waiter)
-
-    # Run until interrupted.
+    else:
+        job.enable_admin()
     try:
+        state = job.state(cached_path=None)
+        host = state.hosts
+
+        admin_url = state.admin_url
+        assert admin_url is not None
+        mtls_flags = (
+            "--cacert /var/facebook/rootcanal/ca.pem "
+            "--cert /var/facebook/x509_identities/server.pem "
+            "--key /var/facebook/x509_identities/server.pem "
+            if admin_url.startswith("https")
+            else ""
+        )
+        print(f"\nMesh admin server listening on {admin_url}")
+        print(f"  - Root node:     curl {mtls_flags}{admin_url}/v1/root")
+        print(f"  - Mesh tree:     curl {mtls_flags}{admin_url}/v1/tree")
+        print(f"  - API docs:      curl {mtls_flags}{admin_url}/SKILL.md")
+        print(
+            f"  - TUI:           buck2 run fbcode//monarch/hyperactor_mesh_admin_tui:hyperactor_mesh_admin_tui -- --addr {admin_url}"
+        )
+        print("\nPress Ctrl+C to stop.\n", flush=True)
+
+        # Spawn philosopher processes and actors.
+        procs = host.spawn_procs(per_host={"replica": NUM_PHILOSOPHERS})
+
+        # Spawn waiter on its own proc mesh so it appears in the dashboard hierarchy.
+        waiter_proc = host.spawn_procs(name="waiter")
+        philosophers = procs.spawn("philosopher", Philosopher, NUM_PHILOSOPHERS)
+        waiter = waiter_proc.spawn("waiter", Waiter, philosophers)
+
+        # Start all philosophers — each will begin requesting chopsticks.
+        philosophers.start.broadcast(waiter)
+
+        # Run until interrupted.
         if kill_waiter_after is not None:
             await asyncio.sleep(kill_waiter_after)
             print("Killing the waiter...")
@@ -219,8 +228,9 @@ async def async_main(
         pass
     finally:
         print("\nShutting down...", flush=True)
-        await waiter_proc.stop()
-        await procs.stop()
+        # Each ProcessJob worker runs in its own detached session; job.kill()
+        # reaps the whole session -- the worker and every proc it spawned.
+        job.kill()
 
 
 def main() -> None:
@@ -233,8 +243,13 @@ def main() -> None:
     parser.add_argument(
         "--dashboard-port",
         type=int,
-        default=8265,
-        help="Dashboard port (default: 8265)",
+        default=None,
+        help="Dashboard port (default: 8265 with --dashboard, ephemeral otherwise)",
+    )
+    parser.add_argument(
+        "--no-telemetry",
+        action="store_true",
+        help="Disable telemetry and mesh-admin query proxy support",
     )
     parser.add_argument(
         "--kill-waiter-after",
@@ -250,6 +265,7 @@ def main() -> None:
                 dashboard=args.dashboard,
                 dashboard_port=args.dashboard_port,
                 kill_waiter_after=args.kill_waiter_after,
+                telemetry=not args.no_telemetry,
             )
         )
     except KeyboardInterrupt:

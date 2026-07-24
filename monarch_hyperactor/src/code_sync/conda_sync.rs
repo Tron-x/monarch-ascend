@@ -16,10 +16,9 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use hyperactor as reference;
 use hyperactor::Actor;
-use hyperactor::Bind;
+use hyperactor::Endpoint as _;
 use hyperactor::Handler;
 use hyperactor::Instance;
-use hyperactor::Unbind;
 use hyperactor::context::Mailbox;
 use hyperactor_mesh::ActorMeshRef;
 use hyperactor_mesh::connect::Connect;
@@ -48,7 +47,7 @@ pub struct CondaSyncResult {
 }
 wirevalue::register_type!(CondaSyncResult);
 
-#[derive(Debug, Clone, Named, Serialize, Deserialize, Bind, Unbind)]
+#[derive(Debug, Clone, Named, Serialize, Deserialize)]
 pub struct CondaSyncMessage {
     /// The connect message to create a duplex bytestream with the client.
     pub connect: reference::PortRef<Connect>,
@@ -66,7 +65,7 @@ pub struct CondaSyncParams {}
 wirevalue::register_type!(CondaSyncParams);
 
 #[derive(Debug, Default)]
-#[hyperactor::export(handlers = [CondaSyncMessage { cast = true }])]
+#[hyperactor::export(handlers = [CondaSyncMessage])]
 #[hyperactor::spawnable]
 pub struct CondaSyncActor {}
 
@@ -86,8 +85,8 @@ impl Handler<CondaSyncMessage> for CondaSyncActor {
     ) -> Result<(), anyhow::Error> {
         let res = async {
             let workspace = workspace.resolve()?;
-            let (connect_msg, completer) = Connect::allocate(cx.self_id().clone().into(), cx);
-            connect.send(cx, connect_msg)?;
+            let (connect_msg, completer) = Connect::allocate(cx.self_addr().clone(), cx);
+            connect.post(cx, connect_msg);
             let (mut read, mut write) = completer.complete().await?.into_split();
             let path_prefix_replacements = path_prefix_replacements
                 .into_iter()
@@ -109,7 +108,7 @@ impl Handler<CondaSyncMessage> for CondaSyncActor {
             })
         }
         .await;
-        result.send(cx, res.map_err(|e| format!("{:#?}", e)))?;
+        result.post(cx, res.map_err(|e| format!("{:#?}", e)));
         Ok(())
     }
 }
@@ -128,10 +127,9 @@ pub async fn conda_sync_mesh(
             .take(actor_mesh.region().slice().len())
             .err_into::<anyhow::Error>()
             .try_for_each_concurrent(None, |connect| async {
-                let (mut read, mut write) =
-                    accept(instance, instance.self_id().clone().into(), connect)
-                        .await?
-                        .into_split();
+                let (mut read, mut write) = accept(instance, instance.self_addr().clone(), connect)
+                    .await?
+                    .into_split();
                 let res = sender(&local_workspace, &mut read, &mut write).await;
 
                 // Shutdown our end, then read from the other end till exhaustion to avoid undeliverable

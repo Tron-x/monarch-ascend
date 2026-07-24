@@ -11,6 +11,7 @@
 
 use core::net::SocketAddr;
 use std::fmt;
+use std::future::Future;
 use std::net::IpAddr;
 use std::net::Ipv6Addr;
 #[cfg(target_os = "linux")]
@@ -18,17 +19,26 @@ use std::os::linux::net::SocketAddrExt;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::io::RawFd;
 use std::panic::Location;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
 
 use async_trait::async_trait;
 use enum_as_inner::EnumAsInner;
+use futures::task::AtomicWaker;
 use hyperactor_config::attrs::AttrValue;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tokio::sync::watch;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use crate as hyperactor;
 use crate::RemoteMessage;
@@ -97,6 +107,27 @@ pub enum ChannelError {
     Timeout(std::time::Duration),
 }
 
+/// Structured context for a send error.
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+pub enum SendErrorReason {
+    /// The serialized frame exceeded the configured channel frame limit.
+    #[error(
+        "rejecting oversize frame: len={len} > max={max}. \
+        ack will not arrive before timeout; increase CODEC_MAX_FRAME_LENGTH to allow."
+    )]
+    OversizedFrame {
+        /// The serialized frame length.
+        len: usize,
+
+        /// The configured frame limit.
+        max: usize,
+    },
+
+    /// Other human-readable context.
+    #[error("{0}")]
+    Other(String),
+}
+
 /// An error that occurred during send. Returns the message that failed to send.
 #[derive(thiserror::Error, Debug)]
 #[error("{error} for reason {reason:?}")]
@@ -107,12 +138,280 @@ pub struct SendError<M: RemoteMessage> {
     /// Message that couldn't be sent
     pub message: M,
     /// Reason that message couldn't be sent, if any.
-    pub reason: Option<String>,
+    pub reason: Option<SendErrorReason>,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionStatus {
+    Pending = 0,
+    Accepted = 1,
+    Rejected = 2,
+}
+
+impl CompletionStatus {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            value if value == Self::Pending as u8 => Self::Pending,
+            value if value == Self::Accepted as u8 => Self::Accepted,
+            value if value == Self::Rejected as u8 => Self::Rejected,
+            _ => panic!("invalid completion state"),
+        }
+    }
+}
+
+struct CompletionState<M: RemoteMessage> {
+    state: AtomicU8,
+    waker: AtomicWaker,
+    rejected: Mutex<Option<Box<SendError<M>>>>,
+}
+
+pub(crate) struct CompletionSender<M: RemoteMessage> {
+    inner: Arc<CompletionState<M>>,
+}
+
+/// Future that resolves when a posted message is accepted or rejected.
+pub struct CompletionReceipt<M: RemoteMessage> {
+    inner: Arc<CompletionState<M>>,
+}
+
+impl<M: RemoteMessage> CompletionSender<M> {
+    fn pair() -> (Self, CompletionReceipt<M>) {
+        let inner = Arc::new(CompletionState {
+            state: AtomicU8::new(CompletionStatus::Pending as u8),
+            waker: AtomicWaker::new(),
+            rejected: Mutex::new(None),
+        });
+
+        (
+            Self {
+                inner: Arc::clone(&inner),
+            },
+            CompletionReceipt { inner },
+        )
+    }
+
+    fn accept(self) {
+        self.inner
+            .state
+            .store(CompletionStatus::Accepted as u8, Ordering::Release);
+        self.inner.waker.wake();
+    }
+
+    fn reject(self, error: SendError<M>) {
+        *self.inner.rejected.lock().unwrap() = Some(Box::new(error));
+        self.inner
+            .state
+            .store(CompletionStatus::Rejected as u8, Ordering::Release);
+        self.inner.waker.wake();
+    }
+}
+
+impl<M: RemoteMessage> Drop for CompletionSender<M> {
+    fn drop(&mut self) {
+        if CompletionStatus::from_u8(self.inner.state.load(Ordering::Acquire))
+            == CompletionStatus::Pending
+        {
+            self.inner
+                .state
+                .store(CompletionStatus::Accepted as u8, Ordering::Release);
+            self.inner.waker.wake();
+        }
+    }
+}
+
+impl<M: RemoteMessage> Future for CompletionReceipt<M> {
+    type Output = Result<(), SendError<M>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.poll_ready() {
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending => {
+                self.inner.waker.register(cx.waker());
+                self.poll_ready()
+            }
+        }
+    }
+}
+
+impl<M: RemoteMessage> CompletionReceipt<M> {
+    fn poll_ready(&self) -> Poll<Result<(), SendError<M>>> {
+        match CompletionStatus::from_u8(self.inner.state.load(Ordering::Acquire)) {
+            CompletionStatus::Accepted => Poll::Ready(Ok(())),
+            CompletionStatus::Rejected => {
+                let error = self
+                    .inner
+                    .rejected
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("rejected completion should store send error");
+                Poll::Ready(Err(*error))
+            }
+            CompletionStatus::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Shared completion counter for sinks that need to wake flush waiters.
+pub(crate) struct CompletionTracker {
+    completed: Arc<AtomicUsize>,
+    completed_notify: Arc<tokio::sync::Notify>,
+}
+
+impl CompletionTracker {
+    pub(crate) fn new(
+        completed: Arc<AtomicUsize>,
+        completed_notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            completed,
+            completed_notify,
+        }
+    }
+
+    fn complete(&self) {
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        self.completed_notify.notify_waiters();
+    }
+}
+
+enum CompletionSinkInner<M: RemoteMessage> {
+    Ignore,
+    Receipt(CompletionSender<M>),
+    OnReject(Box<dyn FnOnce(SendError<M>) + Send + Sync>),
+    Tracked {
+        tracker: CompletionTracker,
+        on_reject: Box<dyn FnOnce(SendError<M>) + Send + Sync>,
+    },
+}
+
+/// Sink for the terminal outcome of a posted message.
+pub struct CompletionSink<M: RemoteMessage>(CompletionSinkInner<M>);
+
+impl<M: RemoteMessage> CompletionSink<M> {
+    /// Ignore the message completion.
+    pub fn ignore() -> Self {
+        Self(CompletionSinkInner::Ignore)
+    }
+
+    /// Invoke `f` only when the channel rejects the message.
+    pub fn on_reject(f: impl FnOnce(SendError<M>) + Send + Sync + 'static) -> Self {
+        Self(CompletionSinkInner::OnReject(Box::new(f)))
+    }
+
+    /// Return a completion sink and a receipt that observes its terminal outcome.
+    pub fn receipt() -> (Self, CompletionReceipt<M>) {
+        let (sender, receipt) = CompletionSender::pair();
+        (Self(CompletionSinkInner::Receipt(sender)), receipt)
+    }
+
+    /// Track every completion and invoke `on_reject` only for rejected messages.
+    pub(crate) fn tracked(
+        tracker: CompletionTracker,
+        on_reject: impl FnOnce(SendError<M>) + Send + Sync + 'static,
+    ) -> Self {
+        Self(CompletionSinkInner::Tracked {
+            tracker,
+            on_reject: Box::new(on_reject),
+        })
+    }
+
+    /// Adapt rejected send errors for a wrapped message type.
+    pub fn contramap_rejected<N: RemoteMessage>(
+        self,
+        f: impl FnOnce(SendError<N>) -> Option<SendError<M>> + Send + Sync + 'static,
+    ) -> CompletionSink<N> {
+        match self.0 {
+            CompletionSinkInner::Ignore => CompletionSink::ignore(),
+            CompletionSinkInner::Receipt(sender) => CompletionSink::on_reject(move |error| {
+                if let Some(error) = f(error) {
+                    sender.reject(error);
+                } else {
+                    sender.accept();
+                }
+            }),
+            CompletionSinkInner::OnReject(on_reject) => CompletionSink::on_reject(move |error| {
+                if let Some(error) = f(error) {
+                    on_reject(error);
+                }
+            }),
+            CompletionSinkInner::Tracked { tracker, on_reject } => {
+                CompletionSink::tracked(tracker, move |error| {
+                    if let Some(error) = f(error) {
+                        on_reject(error);
+                    }
+                })
+            }
+        }
+    }
+
+    /// Report that the channel accepted the message.
+    pub fn accept(self) {
+        match self.0 {
+            CompletionSinkInner::Ignore => {}
+            CompletionSinkInner::Receipt(sender) => sender.accept(),
+            CompletionSinkInner::OnReject(_) => {}
+            CompletionSinkInner::Tracked { tracker, .. } => tracker.complete(),
+        }
+    }
+
+    /// Report that the channel rejected the message.
+    pub fn reject(self, error: SendError<M>) {
+        match self.0 {
+            CompletionSinkInner::Ignore => {}
+            CompletionSinkInner::Receipt(sender) => sender.reject(error),
+            CompletionSinkInner::OnReject(on_reject) => on_reject(error),
+            CompletionSinkInner::Tracked { tracker, on_reject } => {
+                on_reject(error);
+                tracker.complete();
+            }
+        }
+    }
 }
 
 impl<M: RemoteMessage> From<SendError<M>> for ChannelError {
     fn from(error: SendError<M>) -> Self {
         error.error
+    }
+}
+
+/// Reason a [`TxStatus`] transitioned to `Closed`. Callers should branch on
+/// the typed variants for cases they care about (e.g. cache-eviction logic in
+/// `DialMailboxRouter` keys on `SequenceMismatch`); everything else falls
+/// into `Other` and is for display/logging only.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CloseReason {
+    /// The peer rejected our session because our sequence number did not
+    /// match what the peer's dispatcher expected — the K8s "out-of-sequence
+    /// message, expected seq 0, got N" case where the peer GC'd the
+    /// `SessionId` while we still hold an `Outbox.next_seq` past 0.
+    /// Re-dialing produces a fresh session that the peer accepts.
+    SequenceMismatch(String),
+    /// The peer rejected a frame whose length exceeded
+    /// `config::CODEC_MAX_FRAME_LENGTH`. Re-dialing will not help — the
+    /// message itself is the problem.
+    OversizedFrame {
+        /// Actual frame length in bytes.
+        size: usize,
+        /// `CODEC_MAX_FRAME_LENGTH` at the time of rejection.
+        max: usize,
+    },
+    /// Any close reason the transport hasn't classified further. The string
+    /// is for display/logging only — do not parse it. If a caller needs to
+    /// branch on a sub-case, lift it into its own variant on this enum.
+    Other(String),
+}
+
+impl fmt::Display for CloseReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SequenceMismatch(s) => write!(f, "stale session: {}", s),
+            Self::OversizedFrame { size, max } => {
+                write!(f, "oversized frame: len={size} > max={max}")
+            }
+            Self::Other(s) => f.write_str(s),
+        }
     }
 }
 
@@ -122,47 +421,35 @@ pub enum TxStatus {
     /// The tx is good.
     Active,
     /// The tx cannot be used for message delivery.
-    Closed(Arc<str>),
+    Closed(CloseReason),
 }
 
 /// The transmit end of an M-typed channel.
 #[async_trait]
 pub trait Tx<M: RemoteMessage> {
-    /// Post a message; returning failed deliveries on the return channel, if provided.
-    /// If provided, the sender is dropped when the message has been
-    /// enqueued at the channel endpoint.
+    /// Post a message and report its terminal outcome to `completion`.
     ///
     /// Users should use the `try_post`, and `post` variants directly.
-    fn do_post(&self, message: M, return_channel: Option<oneshot::Sender<SendError<M>>>);
+    fn do_post(&self, message: M, completion: CompletionSink<M>);
 
-    /// Enqueue a `message` on the local end of the channel. The
-    /// message is either delivered, or we eventually discover that
-    /// the channel has failed and it will be sent back on `return_channel`.
-    #[allow(clippy::result_large_err)] // TODO: Consider reducing the size of `SendError`.
-    #[tracing::instrument(level = "debug", skip_all)]
-    fn try_post(&self, message: M, return_channel: oneshot::Sender<SendError<M>>) {
-        self.do_post(message, Some(return_channel));
+    /// Enqueue a `message` on the local end of the channel and return a receipt
+    /// that resolves when the message is accepted or rejected.
+    fn try_post(&self, message: M) -> CompletionReceipt<M> {
+        let (completion, receipt) = CompletionSink::receipt();
+        self.do_post(message, completion);
+        receipt
     }
 
     /// Enqueue a message to be sent on the channel.
     #[hyperactor::instrument_infallible]
     fn post(&self, message: M) {
-        self.do_post(message, None);
+        self.do_post(message, CompletionSink::ignore());
     }
 
     /// Send a message synchronously, returning when the message has
     /// been delivered to the remote end of the channel.
     async fn send(&self, message: M) -> Result<(), SendError<M>> {
-        let (tx, rx) = oneshot::channel();
-        self.try_post(message, tx);
-        match rx.await {
-            // Channel was closed; the message was not delivered.
-            Ok(err) => Err(err),
-
-            // Channel was dropped; the message was successfully enqueued
-            // on the remote end of the channel.
-            Err(_) => Ok(()),
-        }
+        self.try_post(message).await
     }
 
     /// The channel address to which this Tx is sending.
@@ -190,97 +477,6 @@ pub trait Rx<M: RemoteMessage> {
         Self: Sized;
 }
 
-#[allow(dead_code)] // Not used outside tests.
-struct MpscTx<M: RemoteMessage> {
-    tx: mpsc::UnboundedSender<M>,
-    addr: ChannelAddr,
-    status: watch::Receiver<TxStatus>,
-}
-
-impl<M: RemoteMessage> MpscTx<M> {
-    #[allow(dead_code)] // Not used outside tests.
-    pub fn new(tx: mpsc::UnboundedSender<M>, addr: ChannelAddr) -> (Self, watch::Sender<TxStatus>) {
-        let (sender, receiver) = watch::channel(TxStatus::Active);
-        (
-            Self {
-                tx,
-                addr,
-                status: receiver,
-            },
-            sender,
-        )
-    }
-}
-
-#[async_trait]
-impl<M: RemoteMessage> Tx<M> for MpscTx<M> {
-    fn do_post(&self, message: M, return_channel: Option<oneshot::Sender<SendError<M>>>) {
-        if let Err(mpsc::error::SendError(message)) = self.tx.send(message) {
-            if let Some(return_channel) = return_channel {
-                return_channel
-                    .send(SendError {
-                        error: ChannelError::Closed,
-                        message,
-                        reason: None,
-                    })
-                    .unwrap_or_else(|m| tracing::warn!("failed to deliver SendError: {}", m));
-            }
-        }
-    }
-
-    fn addr(&self) -> ChannelAddr {
-        self.addr.clone()
-    }
-
-    fn status(&self) -> &watch::Receiver<TxStatus> {
-        &self.status
-    }
-}
-
-#[allow(dead_code)] // Not used outside tests.
-struct MpscRx<M: RemoteMessage> {
-    rx: mpsc::UnboundedReceiver<M>,
-    addr: ChannelAddr,
-    // Used to report the status to the Tx side.
-    status_sender: watch::Sender<TxStatus>,
-}
-
-impl<M: RemoteMessage> MpscRx<M> {
-    #[allow(dead_code)] // Not used outside tests.
-    pub fn new(
-        rx: mpsc::UnboundedReceiver<M>,
-        addr: ChannelAddr,
-        status_sender: watch::Sender<TxStatus>,
-    ) -> Self {
-        Self {
-            rx,
-            addr,
-            status_sender,
-        }
-    }
-}
-
-impl<M: RemoteMessage> Drop for MpscRx<M> {
-    fn drop(&mut self) {
-        let _ = self
-            .status_sender
-            .send(TxStatus::Closed("receiver dropped".into()));
-    }
-}
-
-#[async_trait]
-impl<M: RemoteMessage> Rx<M> for MpscRx<M> {
-    async fn recv(&mut self) -> Result<M, ChannelError> {
-        self.rx.recv().await.ok_or(ChannelError::Closed)
-    }
-
-    fn addr(&self) -> ChannelAddr {
-        self.addr.clone()
-    }
-
-    async fn join(self) {}
-}
-
 /// The hostname to use for TLS connections.
 #[derive(
     Clone,
@@ -297,7 +493,7 @@ impl<M: RemoteMessage> Rx<M> for MpscRx<M> {
 pub enum TcpMode {
     /// Use localhost/loopback for the connection.
     Localhost,
-    /// Use host domain name for the connection.
+    /// Use a non-loopback address resolved from the host domain name.
     Hostname,
 }
 
@@ -361,6 +557,20 @@ impl TlsAddr {
     }
 }
 
+impl FromStr for TlsAddr {
+    type Err = anyhow::Error;
+
+    fn from_str(addr: &str) -> Result<Self, Self::Err> {
+        let (hostname, port_str) = addr
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("invalid TLS address: {}", addr))?;
+        let port = port_str
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid TLS address port: {}", port_str))?;
+        Ok(Self::new(hostname, port))
+    }
+}
+
 impl fmt::Display for TlsAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.hostname, self.port)
@@ -388,7 +598,14 @@ pub enum ChannelTransport {
     /// Transport over a TCP connection with configurable TLS support
     Tls,
 
-    /// Local transports uses an in-process registry and mpsc channels.
+    /// Transport over a QUIC connection with configurable TLS support.
+    Quic,
+
+    /// Transport over a QUIC connection with TLS support within Meta.
+    MetaQuic(TlsMode),
+
+    /// Local transports use a process-local registry and private Unix socket
+    /// pairs.
     Local,
 
     /// Transport over unix domain socket.
@@ -401,6 +618,8 @@ impl fmt::Display for ChannelTransport {
             Self::Tcp(mode) => write!(f, "tcp({:?})", mode),
             Self::MetaTls(mode) => write!(f, "metatls({:?})", mode),
             Self::Tls => write!(f, "tls"),
+            Self::Quic => write!(f, "quic"),
+            Self::MetaQuic(mode) => write!(f, "metaquic({:?})", mode),
             Self::Local => write!(f, "local"),
             Self::Unix => write!(f, "unix"),
         }
@@ -422,10 +641,16 @@ impl FromStr for ChannelTransport {
             "local" => Ok(ChannelTransport::Local),
             "unix" => Ok(ChannelTransport::Unix),
             "tls" => Ok(ChannelTransport::Tls),
+            "quic" => Ok(ChannelTransport::Quic),
             s if s.starts_with("metatls(") && s.ends_with(")") => {
                 let inner = &s["metatls(".len()..s.len() - 1];
                 let mode = inner.parse()?;
                 Ok(ChannelTransport::MetaTls(mode))
+            }
+            s if s.starts_with("metaquic(") && s.ends_with(")") => {
+                let inner = &s["metaquic(".len()..s.len() - 1];
+                let mode = inner.parse()?;
+                Ok(ChannelTransport::MetaQuic(mode))
             }
             unknown => Err(anyhow::anyhow!("unknown channel transport: {}", unknown)),
         }
@@ -457,22 +682,50 @@ impl ChannelTransport {
             ChannelTransport::Tcp(_) => true,
             ChannelTransport::MetaTls(_) => true,
             ChannelTransport::Tls => true,
+            ChannelTransport::Quic => true,
+            ChannelTransport::MetaQuic(_) => true,
             ChannelTransport::Local => false,
             ChannelTransport::Unix => false,
         }
     }
 
+    /// Returns true if this transport is served by the `net` module
+    /// (i.e., a kernel-level socket: TCP, Unix, or a TLS variant
+    /// thereof). The only non-net transport is the in-process
+    /// [`Local`](ChannelTransport::Local) channel.
+    pub fn is_net(&self) -> bool {
+        match self {
+            ChannelTransport::Tcp(_) => true,
+            ChannelTransport::MetaTls(_) => true,
+            ChannelTransport::Tls => true,
+            ChannelTransport::Quic => false,
+            ChannelTransport::MetaQuic(_) => false,
+            ChannelTransport::Unix => true,
+            ChannelTransport::Local => false,
+        }
+    }
+
+    /// Returns true if this transport uses TLS encryption.
+    pub fn is_tls(&self) -> bool {
+        matches!(self, ChannelTransport::Tls | ChannelTransport::MetaTls(_))
+    }
+
     /// Returns true if this transport can carry the duplex byte-stream
-    /// protocol (see [`crate::channel::net::duplex`]). In-process
-    /// transports cannot carry a duplex wire protocol and must fall
-    /// back to a simplex channel.
+    /// protocol (see [`crate::channel::net::duplex`]). This is a
+    /// distinct predicate from [`is_net`](Self::is_net): the in-process
+    /// [`Local`](ChannelTransport::Local) transport is not a kernel
+    /// socket (so `is_net` is false) yet is still served over the net
+    /// stack and carries duplex.
     pub fn supports_duplex(&self) -> bool {
         match self {
             ChannelTransport::Tcp(_) => true,
             ChannelTransport::MetaTls(_) => true,
             ChannelTransport::Tls => true,
+            // Quic actually supports duplex byte streams, but they are not yet tested.
+            ChannelTransport::Quic => false,
+            ChannelTransport::MetaQuic(_) => false,
             ChannelTransport::Unix => true,
-            ChannelTransport::Local => false,
+            ChannelTransport::Local => true,
         }
     }
 }
@@ -576,6 +829,7 @@ pub type Port = u16;
 ///
 /// - `tcp:127.0.0.1:1234` - localhost port 1234 over TCP
 /// - `tcp:192.168.0.1:1111` - 192.168.0.1 port 1111 over TCP
+/// - `quic:example.com:1234` - example.com port 1234 over QUIC
 /// - `local:123` - the (in-process) local port 123
 /// - `unix:/some/path` - the Unix socket at `/some/path`
 ///
@@ -616,6 +870,14 @@ pub enum ChannelAddr {
     /// Uses TlsAddr with hostname and port.
     Tls(TlsAddr),
 
+    /// An address to establish QUIC channels with configurable TLS support.
+    /// Uses TlsAddr with hostname and port.
+    Quic(TlsAddr),
+
+    /// An address to establish QUIC channels with TLS support within Meta.
+    /// Uses TlsAddr with hostname and port.
+    MetaQuic(TlsAddr),
+
     /// Local addresses are registered in-process and given an integral
     /// index.
     Local(u64),
@@ -638,6 +900,12 @@ pub enum ChannelAddr {
     /// address, yet the server is bound to a private IP address or simply
     /// INADDR_ANY. Traffic to the public IP address is mapped to the private
     /// IP address through network address translation (NAT).
+    ///
+    /// `Alias` is serve-side syntax. [`serve`] consumes it by binding to
+    /// `bind_to` and advertising `dial_to`; identity-bearing values such as
+    /// proc addresses, actor addresses, host references, and routing keys
+    /// should store only `dial_to`. Dial helpers canonicalize aliases the same
+    /// way.
     Alias {
         /// The address to which the client should dial to.
         dial_to: Box<ChannelAddr>,
@@ -670,37 +938,45 @@ impl From<tokio::net::unix::SocketAddr> for ChannelAddr {
     }
 }
 
-/// Return the first non-link-local address from a list.
+fn is_routable_address(addr: &IpAddr) -> bool {
+    !addr.is_loopback()
+        && match addr {
+            IpAddr::V6(v6) => !v6.is_unicast_link_local(),
+            IpAddr::V4(v4) => !v4.is_link_local(),
+        }
+}
+
+/// Return the first non-loopback, non-link-local address from a list.
 fn find_routable_address(addresses: &[IpAddr]) -> Option<IpAddr> {
     addresses
         .iter()
-        .find(|addr| match addr {
-            IpAddr::V6(v6) => !v6.is_unicast_link_local(),
-            IpAddr::V4(v4) => !v4.is_link_local(),
-        })
+        .find(|addr| is_routable_address(addr))
         .cloned()
 }
 
 impl ChannelAddr {
-    /// The "any" address for the given transport type. This is used to
-    /// servers to "any" address.
+    /// Returns the "any" address for the given transport.
+    ///
+    /// For [`TcpMode::Hostname`], this resolves the host name to a
+    /// non-loopback, non-link-local address with port zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics if host name resolution fails or produces no routable address.
     pub fn any(transport: ChannelTransport) -> Self {
         match transport {
             ChannelTransport::Tcp(mode) => {
                 let ip = match mode {
                     TcpMode::Localhost => IpAddr::V6(Ipv6Addr::LOCALHOST),
                     TcpMode::Hostname => {
-                        hostname::get()
-                            .ok()
-                            .and_then(|hostname| {
-                                // TODO: Avoid using DNS directly once we figure out a good extensibility story here
-                                hostname.to_str().and_then(|hostname_str| {
-                                    dns_lookup::lookup_host(hostname_str)
-                                        .ok()
-                                        .and_then(|addresses| find_routable_address(&addresses))
-                                })
-                            })
-                            .unwrap_or(IpAddr::V6(Ipv6Addr::LOCALHOST))
+                        let hostname = hostname::get().expect("failed to retrieve hostname");
+                        let hostname = hostname.to_str().expect("hostname is not valid UTF-8");
+                        // TODO: Avoid using DNS directly once we figure out a good extensibility story here
+                        let addresses =
+                            dns_lookup::lookup_host(hostname).expect("failed to resolve hostname");
+                        find_routable_address(&addresses).expect(
+                            "hostname resolved to no non-loopback, non-link-local address; configure an explicit transport address",
+                        )
                     }
                 };
                 Self::Tcp(SocketAddr::new(ip, 0))
@@ -717,6 +993,18 @@ impl ChannelAddr {
                 };
                 Self::MetaTls(TlsAddr::new(host_address, 0))
             }
+            ChannelTransport::MetaQuic(mode) => {
+                let host_address = match mode {
+                    TlsMode::Hostname => hostname::get()
+                        .ok()
+                        .and_then(|hostname| hostname.to_str().map(|s| s.to_string()))
+                        .unwrap_or("unknown_host".to_string()),
+                    TlsMode::IpV6 => {
+                        get_host_ipv6_address().expect("failed to retrieve ipv6 address")
+                    }
+                };
+                Self::MetaQuic(TlsAddr::new(host_address, 0))
+            }
             ChannelTransport::Local => Self::Local(0),
             ChannelTransport::Tls => {
                 let host_address = hostname::get()
@@ -724,6 +1012,13 @@ impl ChannelAddr {
                     .and_then(|hostname| hostname.to_str().map(|s| s.to_string()))
                     .unwrap_or("localhost".to_string());
                 Self::Tls(TlsAddr::new(host_address, 0))
+            }
+            ChannelTransport::Quic => {
+                let host_address = hostname::get()
+                    .ok()
+                    .and_then(|hostname| hostname.to_str().map(|s| s.to_string()))
+                    .unwrap_or("localhost".to_string());
+                Self::Quic(TlsAddr::new(host_address, 0))
             }
             // This works because the file will be deleted but we know we have a unique file by this point.
             ChannelTransport::Unix => Self::Unix(net::unix::SocketAddr::from_str("").unwrap()),
@@ -746,6 +1041,12 @@ impl ChannelAddr {
                 Err(_) => ChannelTransport::MetaTls(TlsMode::Hostname),
             },
             Self::Tls(_) => ChannelTransport::Tls,
+            Self::Quic(_) => ChannelTransport::Quic,
+            Self::MetaQuic(addr) => match addr.hostname.parse::<IpAddr>() {
+                Ok(IpAddr::V6(_)) => ChannelTransport::MetaQuic(TlsMode::IpV6),
+                Ok(IpAddr::V4(_)) => ChannelTransport::MetaQuic(TlsMode::Hostname),
+                Err(_) => ChannelTransport::MetaQuic(TlsMode::Hostname),
+            },
             Self::Local(_) => ChannelTransport::Local,
             Self::Unix(_) => ChannelTransport::Unix,
             // bind_to's transport is what is actually used in communication.
@@ -771,6 +1072,8 @@ impl fmt::Display for ChannelAddr {
             Self::Tcp(addr) => write!(f, "tcp:{}", addr),
             Self::MetaTls(addr) => write!(f, "metatls:{}", addr),
             Self::Tls(addr) => write!(f, "tls:{}", addr),
+            Self::Quic(addr) => write!(f, "quic:{}", addr),
+            Self::MetaQuic(addr) => write!(f, "metaquic:{}", addr),
             Self::Local(index) => write!(f, "local:{}", index),
             Self::Unix(addr) => write!(f, "unix:{}", addr),
             Self::Alias { dial_to, bind_to } => {
@@ -795,6 +1098,8 @@ impl FromStr for ChannelAddr {
                 .map_err(anyhow::Error::from),
             Some(("metatls", rest)) => net::meta::parse(rest).map_err(|e| e.into()),
             Some(("tls", rest)) => net::tls::parse(rest).map_err(|e| e.into()),
+            Some(("quic", rest)) => TlsAddr::from_str(rest).map(Self::Quic),
+            Some(("metaquic", rest)) => TlsAddr::from_str(rest).map(Self::MetaQuic),
             Some(("unix", rest)) => Ok(Self::Unix(net::unix::SocketAddr::from_str(rest)?)),
             Some(("alias", _)) => Err(anyhow::anyhow!(
                 "detect possible alias address, but we currently do not support \
@@ -825,14 +1130,33 @@ pub(crate) fn normalize_host(host: &str) -> String {
 }
 
 impl ChannelAddr {
+    /// Return the canonical address that remote peers should dial.
+    ///
+    /// For regular addresses this is the address itself. For aliases, this
+    /// recursively consumes the alias and returns its `dial_to` address. Use
+    /// this before storing an address in identity-bearing state; aliases are
+    /// intended as input to [`serve`].
+    pub fn into_dial_addr(self) -> Self {
+        match self {
+            Self::Alias { dial_to, .. } => (*dial_to).into_dial_addr(),
+            addr => addr,
+        }
+    }
+
     /// Parse ZMQ-style URL format: scheme://address
     /// Supports:
     /// - tcp://hostname:port or tcp://*:port (wildcard binding)
     /// - inproc://endpoint-name (equivalent to local)
     /// - ipc://path (equivalent to unix)
     /// - metatls://hostname:port or metatls://*:port
+    /// - quic://hostname:port or quic://*:port
+    /// - metaquic://hostname:port or metaquic://*:port
     /// - Alias format: dial_to_url@bind_to_url (e.g., tcp://host:port@tcp://host:port)
     ///   Note: Alias format is currently only supported for TCP addresses
+    ///
+    /// Alias format is meant for serving. Callers that will dial or store the
+    /// result as an identity should canonicalize it with
+    /// [`ChannelAddr::into_dial_addr`].
     pub fn from_zmq_url(address: &str) -> Result<Self, anyhow::Error> {
         let (addr, _listener) = Self::from_zmq_url_with_listener(address)?;
         Ok(addr)
@@ -910,7 +1234,7 @@ impl ChannelAddr {
                 Ok((Self::Local(port), None))
             }
             "ipc" => Ok((Self::Unix(net::unix::SocketAddr::from_str(address)?), None)),
-            "metatls" | "tls" => {
+            "metatls" | "tls" | "quic" | "metaquic" => {
                 let (host, port, listener) = Self::parse_host_port_or_fd(address)?;
                 let hostname = if host == "*" {
                     std::net::Ipv6Addr::UNSPECIFIED.to_string()
@@ -919,6 +1243,8 @@ impl ChannelAddr {
                 };
                 let addr = match scheme {
                     "metatls" => Self::MetaTls(TlsAddr::new(hostname, port)),
+                    "metaquic" => Self::MetaQuic(TlsAddr::new(hostname, port)),
+                    "quic" => Self::Quic(TlsAddr::new(hostname, port)),
                     _ => Self::Tls(TlsAddr::new(hostname, port)),
                 };
                 Ok((addr, listener))
@@ -963,6 +1289,8 @@ impl ChannelAddr {
             Self::Tcp(addr) => format!("tcp://{}", addr),
             Self::MetaTls(addr) => format!("metatls://{}:{}", addr.hostname, addr.port),
             Self::Tls(addr) => format!("tls://{}:{}", addr.hostname, addr.port),
+            Self::Quic(addr) => format!("quic://{}:{}", addr.hostname, addr.port),
+            Self::MetaQuic(addr) => format!("metaquic://{}:{}", addr.hostname, addr.port),
             Self::Local(index) => format!("inproc://{}", index),
             Self::Unix(addr) => format!("ipc://{}", addr),
             Self::Alias { dial_to, bind_to } => {
@@ -997,9 +1325,12 @@ impl ChannelAddr {
     }
 }
 
-/// Universal channel transmitter.
+/// Universal channel transmitter. Manages the link state, reconnections,
+/// etc. on top of a [`net::Link`].
 pub struct ChannelTx<M: RemoteMessage> {
-    inner: ChannelTxKind<M>,
+    sender: mpsc::UnboundedSender<(M, CompletionSink<M>, Instant)>,
+    dest: ChannelAddr,
+    status: watch::Receiver<TxStatus>,
 }
 
 impl<M: RemoteMessage> fmt::Debug for ChannelTx<M> {
@@ -1010,39 +1341,45 @@ impl<M: RemoteMessage> fmt::Debug for ChannelTx<M> {
     }
 }
 
-/// Universal channel transmitter.
-enum ChannelTxKind<M: RemoteMessage> {
-    Local(local::LocalTx<M>),
-    Net(net::NetTx<M>),
-}
-
 #[async_trait]
 impl<M: RemoteMessage> Tx<M> for ChannelTx<M> {
-    fn do_post(&self, message: M, return_channel: Option<oneshot::Sender<SendError<M>>>) {
-        match &self.inner {
-            ChannelTxKind::Local(tx) => tx.do_post(message, return_channel),
-            ChannelTxKind::Net(tx) => tx.do_post(message, return_channel),
+    fn do_post(&self, message: M, completion: CompletionSink<M>) {
+        tracing::trace!(
+            name = "post",
+            dest = %self.dest,
+            "sending message"
+        );
+
+        if let Err(mpsc::error::SendError((message, completion, _))) =
+            self.sender.send((message, completion, Instant::now()))
+        {
+            let reason = self
+                .status
+                .borrow()
+                .as_closed()
+                .map(|r| SendErrorReason::Other(r.to_string()));
+            completion.reject(SendError {
+                error: ChannelError::Closed,
+                message,
+                reason,
+            });
         }
     }
 
     fn addr(&self) -> ChannelAddr {
-        match &self.inner {
-            ChannelTxKind::Local(tx) => tx.addr(),
-            ChannelTxKind::Net(tx) => Tx::<M>::addr(tx),
-        }
+        self.dest.clone()
     }
 
     fn status(&self) -> &watch::Receiver<TxStatus> {
-        match &self.inner {
-            ChannelTxKind::Local(tx) => tx.status(),
-            ChannelTxKind::Net(tx) => tx.status(),
-        }
+        &self.status
     }
 }
 
 /// Universal channel receiver.
 pub struct ChannelRx<M: RemoteMessage> {
-    inner: ChannelRxKind<M>,
+    receiver: mpsc::Receiver<M>,
+    dest: ChannelAddr,
+    server: net::ServerHandle,
 }
 
 impl<M: RemoteMessage> fmt::Debug for ChannelRx<M> {
@@ -1053,34 +1390,43 @@ impl<M: RemoteMessage> fmt::Debug for ChannelRx<M> {
     }
 }
 
-/// Universal channel receiver.
-enum ChannelRxKind<M: RemoteMessage> {
-    Local(local::LocalRx<M>),
-    Net(net::NetRx<M>),
+impl<M: RemoteMessage> ChannelRx<M> {
+    /// Stop the channel server, tagging the log with what triggered shutdown.
+    fn stop(&self, trigger: &str) {
+        self.server.stop(&format!(
+            "ChannelRx {trigger}; channel address: {}",
+            self.dest
+        ));
+    }
 }
 
 #[async_trait]
 impl<M: RemoteMessage> Rx<M> for ChannelRx<M> {
-    #[tracing::instrument(level = "debug", skip_all)]
     async fn recv(&mut self) -> Result<M, ChannelError> {
-        match &mut self.inner {
-            ChannelRxKind::Local(rx) => rx.recv().await,
-            ChannelRxKind::Net(rx) => rx.recv().await,
-        }
+        tracing::trace!(
+            name = "recv",
+            dest = %self.dest,
+            "receiving message"
+        );
+        self.receiver.recv().await.ok_or(ChannelError::Closed)
     }
 
     fn addr(&self) -> ChannelAddr {
-        match &self.inner {
-            ChannelRxKind::Local(rx) => rx.addr(),
-            ChannelRxKind::Net(rx) => rx.addr(),
-        }
+        self.dest.clone()
     }
 
-    async fn join(self) {
-        match self.inner {
-            ChannelRxKind::Local(rx) => rx.join().await,
-            ChannelRxKind::Net(rx) => rx.join().await,
-        }
+    /// Gracefully shut down the channel server, waiting for pending
+    /// acks to be flushed before returning.
+    async fn join(mut self) {
+        self.stop("joined");
+        let _ = (&mut self.server).await;
+        // Drop will call stop() again which is harmless (token already cancelled).
+    }
+}
+
+impl<M: RemoteMessage> Drop for ChannelRx<M> {
+    fn drop(&mut self) {
+        self.stop("dropped");
     }
 }
 
@@ -1090,74 +1436,109 @@ impl<M: RemoteMessage> Rx<M> for ChannelRx<M> {
 #[allow(clippy::result_large_err)] // TODO: Consider reducing the size of `ChannelError`.
 #[track_caller]
 pub fn dial<M: RemoteMessage>(addr: ChannelAddr) -> Result<ChannelTx<M>, ChannelError> {
+    let addr = addr.into_dial_addr();
     tracing::debug!(name = "dial", caller = %Location::caller(), %addr, "dialing channel {}", addr);
-    let inner = match addr {
-        ChannelAddr::Local(port) => ChannelTxKind::Local(local::dial(port)?),
-        ChannelAddr::Tcp(_)
-        | ChannelAddr::Unix(_)
-        | ChannelAddr::Tls(_)
-        | ChannelAddr::MetaTls(_) => {
-            ChannelTxKind::Net(net::spawn(net::link(addr, net::SessionId::random(), 0)?))
-        }
-        ChannelAddr::Alias { dial_to, .. } => dial(*dial_to)?.inner,
-    };
-    Ok(ChannelTx { inner })
+    Ok(net::spawn::<M>(net::link(
+        addr,
+        net::SessionId::random(),
+        0,
+        net::ProtocolKind::Simplex,
+    )?))
 }
 
-/// Experimental: dial with out-of-order delivery and N parallel streams.
-///
-/// Opens N TCP connections sharing a single `SessionId` (distinct
-/// `stream_id` in `1..=num_streams` so the server routes them through
-/// the multi-stream receive path). Frames are load-balanced across
-/// streams via a shared MPMC work queue — idle writers pull next.
-/// API may change.
-///
-/// # Semantics (how this differs from [`dial`])
-///
-/// Multi-stream trades several of [`dial`]'s delivery guarantees for
-/// aggregate bandwidth. Use [`dial`] when any of these matter:
-///
-/// - **Ordering.** Messages are delivered to the receiver in *arrival
-///   order across streams*, not send order. Two messages posted back
-///   to back on the sender may reach the receiver out of order when
-///   they're carried on different TCP streams. [`dial`] is strictly
-///   in-order.
-///
-/// - **Retransmission on reconnect.** If a writer's TCP connection
-///   drops after the bytes of a message have been written but before
-///   the peer acks, that message is **not retransmitted** on the new
-///   connection. It may be silently lost. [`dial`] re-sends all
-///   unacked messages on reconnect.
-///
-/// - **Delivery timeouts.** No delivery timeout is enforced. On
-///   sustained peer outage, writers reconnect indefinitely (backoff
-///   capped at 5s); senders block in `send().await` with no bound.
-///   [`dial`] fails unacked sends after
-///   `MESSAGE_DELIVERY_TIMEOUT`.
-///
-/// - **`Tx::send` return semantics.** On session shutdown, messages
-///   still in the unacked buffer have their `return_channel` dropped.
-///   Per the [`Tx::send`] contract, this makes `send().await` return
-///   `Ok(())` for messages that may never have been delivered — i.e.
-///   a "success" return does not actually confirm delivery here.
-///   [`dial`] delivers a structured `SendError` instead.
-///
-/// # Ack semantics
-///
-/// Receivers ack a cumulative watermark: the highest `N` such that
-/// all of `0..=N` have been observed across all streams. Acks may
-/// stall behind a single missing seq on a slow stream.
-pub fn exp_dial_unordered<M: RemoteMessage>(
-    addr: ChannelAddr,
-    num_streams: usize,
-) -> Result<ChannelTx<M>, ChannelError> {
-    assert!(num_streams > 0);
-    let session_id = net::SessionId::random();
-    let links: Vec<net::NetLink> = (1..=num_streams)
-        .map(|i| net::link(addr.clone(), session_id, i as u8))
-        .collect::<Result<_, _>>()?;
-    let inner = ChannelTxKind::Net(net::spawn_unordered(links));
-    Ok(ChannelTx { inner })
+/// Channels that may deliver messages out of send order.
+pub mod unordered {
+    use super::*;
+
+    /// Dial with out-of-order delivery and N parallel streams.
+    ///
+    /// Opens N links sharing a single `SessionId` (distinct
+    /// `stream_id` in `1..=num_streams` so the server routes them
+    /// through the multi-stream receive path). Frames are
+    /// load-balanced across streams via a shared MPMC work queue —
+    /// idle writers pull next.
+    ///
+    /// # Semantics (how this differs from [`super::dial`])
+    ///
+    /// Multi-stream trades several of [`super::dial`]'s delivery
+    /// guarantees for aggregate bandwidth. Use [`super::dial`] when
+    /// any of these matter:
+    ///
+    /// - **Ordering.** Messages are delivered to the receiver in
+    ///   *arrival order across streams*, not send order. Two messages
+    ///   posted back to back on the sender may reach the receiver out
+    ///   of order when they're carried on different streams.
+    ///   [`super::dial`] is strictly in-order.
+    ///
+    /// - **Retransmission on reconnect.** If a writer's connection
+    ///   drops after the bytes of a message have been written but
+    ///   before the peer acks, that message is **not retransmitted**
+    ///   on the new connection. It may be silently lost.
+    ///   [`super::dial`] re-sends all unacked messages on reconnect.
+    ///
+    /// - **Delivery timeouts.** No delivery timeout is enforced. On
+    ///   sustained peer outage, writers reconnect indefinitely
+    ///   (backoff capped at 5s); senders block in `send().await` with
+    ///   no bound. [`super::dial`] fails unacked sends after
+    ///   `MESSAGE_DELIVERY_TIMEOUT`.
+    ///
+    /// - **`Tx::send` return semantics.** On session shutdown,
+    ///   messages still in the unacked buffer have their
+    ///   `return_channel` dropped. Per the [`Tx::send`] contract,
+    ///   this makes `send().await` return `Ok(())` for messages that
+    ///   may never have been delivered — i.e. a "success" return does
+    ///   not actually confirm delivery here. [`super::dial`] delivers
+    ///   a structured `SendError` instead.
+    ///
+    /// # Ack semantics
+    ///
+    /// Receivers ack a cumulative watermark: the highest `N` such
+    /// that all of `0..=N` have been observed across all streams.
+    /// Acks may stall behind a single missing seq on a slow stream.
+    #[track_caller]
+    pub fn dial<M: RemoteMessage>(
+        addr: ChannelAddr,
+        num_streams: usize,
+    ) -> Result<ChannelTx<M>, ChannelError> {
+        assert!(num_streams > 0);
+        let addr = addr.into_dial_addr();
+        let session_id = net::SessionId::random();
+        let links: Vec<net::NetLink> = (1..=num_streams)
+            .map(|i| {
+                net::link(
+                    addr.clone(),
+                    session_id,
+                    i as u8,
+                    net::ProtocolKind::Simplex,
+                )
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(net::spawn_unordered::<M>(links))
+    }
+
+    /// Serve a receiver that accepts unordered senders.
+    ///
+    /// The network server already routes multi-stream sessions by
+    /// `SessionId`, so unordered serving uses the same listener as the
+    /// ordered channel API.
+    #[track_caller]
+    pub fn serve<M: RemoteMessage>(
+        addr: ChannelAddr,
+    ) -> Result<(ChannelAddr, ChannelRx<M>), ChannelError> {
+        super::serve(addr)
+    }
+
+    /// Serve with an optional pre-opened listener.
+    ///
+    /// Pre-opened listeners are only supported for TCP-based transports,
+    /// matching [`super::serve_with_listener`].
+    #[track_caller]
+    pub fn serve_with_listener<M: RemoteMessage>(
+        addr: ChannelAddr,
+        listener: Option<std::net::TcpListener>,
+    ) -> Result<(ChannelAddr, ChannelRx<M>), ChannelError> {
+        super::serve_with_listener(addr, listener)
+    }
 }
 
 /// Serve on the provided channel address. The server is turned down
@@ -1178,20 +1559,252 @@ pub fn serve_with_listener<M: RemoteMessage>(
     listener: Option<std::net::TcpListener>,
 ) -> Result<(ChannelAddr, ChannelRx<M>), ChannelError> {
     let caller = Location::caller();
-    serve_inner(addr, listener).map(|(addr, inner)| {
+    serve_inner(addr, listener).map(|(addr, rx)| {
         tracing::debug!(
             name = "serve",
             %addr,
             %caller,
         );
-        (addr, ChannelRx { inner })
+        (addr, rx)
     })
+}
+
+/// Serve a muxed listener on `addr`. Simplex clients (dialed via
+/// [`channel::dial`](dial)) deliver into the bundled [`ChannelRx<M>`];
+/// duplex clients (dialed via [`channel::duplex::dial`](net::duplex::dial))
+/// populate the bundled [`DuplexServer<In, Out>`]. Only net transports
+/// are supported; the caller picks transports that implement both
+/// protocol styles.
+///
+/// The returned [`MuxServer`] owns both halves and a shared
+/// [`MuxShutdown`]. Dropping or stopping any of these tears down the
+/// listener and the other half together — see [`MuxServer`] for the
+/// full lifecycle contract.
+#[track_caller]
+pub fn serve_mux<M: RemoteMessage, In: RemoteMessage, Out: RemoteMessage>(
+    addr: ChannelAddr,
+    prebound_listener: Option<std::net::TcpListener>,
+) -> Result<MuxServer<M, In, Out>, ChannelError> {
+    if !addr.transport().is_net() {
+        return Err(ChannelError::InvalidAddress(format!(
+            "serve_mux requires a net transport; got {}",
+            addr
+        )));
+    }
+    let parts = net::mux::serve::<M, In, Out>(addr, prebound_listener)?;
+    Ok(MuxServer {
+        addr: parts.addr,
+        simplex: parts.simplex,
+        duplex: parts.duplex,
+        shutdown: MuxShutdown {
+            join_handle: parts.join_handle,
+            cancel: parts.cancel,
+        },
+    })
+}
+
+/// A muxed server bundling a simplex receiver, a duplex accept
+/// server, and the shared shutdown signal that ties them together.
+///
+/// All three components share one underlying listener. Lifecycle:
+///
+/// - Dropping the [`MuxServer`] cancels the shared shutdown and
+///   tears down the listener and any in-flight sessions.
+/// - [`MuxServer::stop`] does the same explicitly.
+/// - [`MuxServer::split`] hands out the address, simplex half,
+///   duplex half, and a [`MuxShutdown`] separately. After splitting,
+///   dropping the simplex half, the duplex half, or the
+///   [`MuxShutdown`] guard cancels the shared shutdown. The address
+///   is a plain value and does not own any resources.
+///
+/// The simplex half is a [`ChannelRx<M>`] you `recv()` on; the duplex
+/// half is a [`DuplexServer<In, Out>`] you `accept()` on. Neither is
+/// `join()`-able — there is no separate per-half task to await.
+pub struct MuxServer<M: RemoteMessage, In: RemoteMessage, Out: RemoteMessage> {
+    addr: ChannelAddr,
+    simplex: ChannelRx<M>,
+    duplex: net::duplex::DuplexServer<In, Out>,
+    shutdown: MuxShutdown,
+}
+
+impl<M: RemoteMessage, In: RemoteMessage, Out: RemoteMessage> MuxServer<M, In, Out> {
+    /// The address the muxed listener is bound to.
+    pub fn addr(&self) -> &ChannelAddr {
+        &self.addr
+    }
+
+    /// Borrow the simplex receiver.
+    pub fn simplex_mut(&mut self) -> &mut ChannelRx<M> {
+        &mut self.simplex
+    }
+
+    /// Borrow the duplex accept server.
+    pub fn duplex_mut(&mut self) -> &mut net::duplex::DuplexServer<In, Out> {
+        &mut self.duplex
+    }
+
+    /// Cancel the shared shutdown and tear down both halves.
+    pub fn stop(&self, reason: &str) {
+        self.shutdown.stop(reason);
+    }
+
+    /// Move the bound address, simplex half, duplex half, and a
+    /// [`MuxShutdown`] guard out of this wrapper. After splitting,
+    /// dropping the simplex half, the duplex half, or the
+    /// [`MuxShutdown`] guard cancels the shared shutdown and tears
+    /// the rest down. The address is a plain value and does not own
+    /// any resources.
+    pub fn split(
+        self,
+    ) -> (
+        ChannelAddr,
+        ChannelRx<M>,
+        net::duplex::DuplexServer<In, Out>,
+        MuxShutdown,
+    ) {
+        (self.addr, self.simplex, self.duplex, self.shutdown)
+    }
+
+    /// Wire up handlers for both halves, spawn a background task that
+    /// owns the orderly shutdown (duplex drain → simplex pump → listener),
+    /// and return a [`MailboxServerHandle`](crate::mailbox::MailboxServerHandle).
+    /// Calling `.stop()` on the handle drives the drain.
+    ///
+    /// `simplex_handler` consumes the simplex receiver and produces
+    /// the simplex pump's `MailboxServerHandle` (typically by calling
+    /// [`MailboxServer::serve`](crate::mailbox::MailboxServer::serve)
+    /// on a forwarder). `duplex_handler` receives the
+    /// [`DuplexServer`](net::duplex::DuplexServer) and a stop signal,
+    /// and returns the future driving the duplex pump.
+    ///
+    /// **Shutdown ordering.** On stop, the coordinator awaits
+    /// `duplex_task` first so the duplex handler can drive its own
+    /// internal drain (e.g., the host's per-connection forwarder
+    /// pumps stop and drop their `AttachSender`s, which lets
+    /// `send_connected` flush queued outbound naturally as
+    /// `SendLoopError::AppClosed`, before the handler's terminal
+    /// `duplex_server.stop` signals listener shutdown and `join`
+    /// waits for it). Stopping the simplex pump and listener happens
+    /// after the duplex drain to avoid cascading cancellation through
+    /// `dispatch_duplex_stream`'s `select!` while the duplex side
+    /// still has queued sends.
+    ///
+    /// Mirrors [`MailboxServer::serve`](crate::mailbox::MailboxServer::serve)'s
+    /// shape: take the work to do, return a `MailboxServerHandle`.
+    pub fn serve<SH, DH, DF>(
+        self,
+        simplex_handler: SH,
+        duplex_handler: DH,
+    ) -> crate::mailbox::MailboxServerHandle
+    where
+        SH: FnOnce(ChannelRx<M>) -> crate::mailbox::MailboxServerHandle,
+        DH: FnOnce(net::duplex::DuplexServer<In, Out>, tokio::sync::watch::Receiver<bool>) -> DF,
+        DF: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (stopped_tx, mut stopped_rx) = tokio::sync::watch::channel(false);
+        let duplex_stop = stopped_rx.clone();
+        let simplex_handle = simplex_handler(self.simplex);
+        let duplex_task = tokio::spawn(duplex_handler(self.duplex, duplex_stop));
+        let shutdown = self.shutdown;
+        let join_handle = tokio::spawn(async move {
+            // Pend forever if `stopped_tx` is silently dropped (caller
+            // discarded the handle without `stop()`). Mirrors the
+            // existing `MailboxServer::serve` behavior of holding the
+            // server open absent an explicit stop signal — otherwise
+            // we'd tear down the mux as soon as the handle drops.
+            let ok = stopped_rx.wait_for(|stopped| *stopped).await.is_ok();
+            if !ok {
+                std::future::pending::<()>().await;
+            }
+            const REASON: &str = "MuxServer shutdown";
+            // 1. Wait for the duplex handler to complete its own drain.
+            //    The handler already saw `duplex_stop` (a clone of our
+            //    `stopped_rx`) at the same instant we did, so it is
+            //    already winding down. Awaiting before any cancel fires
+            //    preserves the natural app-closed path through
+            //    `send_connected` so queued outbound is not abandoned.
+            let _ = duplex_task.await;
+            // 2. The duplex handler's drop fires `cancel_token`, which
+            //    cascades to simplex per-session cancels and closes
+            //    `simplex_rx`; the simplex pump then exits naturally
+            //    via its `rx.recv()` returning `Closed`. We only need
+            //    to await it. Calling `simplex_handle.stop` here would
+            //    race the natural exit and panic on the watch send if
+            //    the pump's receiver has already dropped.
+            let _ = simplex_handle.await;
+            // 3. Backstop: cancel the listener explicitly (idempotent
+            //    if already cancelled), then await the accept-loop's
+            //    full drain.
+            shutdown.stop(REASON);
+            let _ = shutdown.await;
+            Ok::<(), crate::mailbox::MailboxServerError>(())
+        });
+        crate::mailbox::MailboxServerHandle::from_parts(join_handle, stopped_tx)
+    }
+}
+
+/// Awaitable shutdown handle for a [`MuxServer`]. Wraps the muxed
+/// listener's accept-loop [`JoinHandle`](tokio::task::JoinHandle); the
+/// caller signals teardown with [`stop`](Self::stop) and then `.await`s
+/// the handle to confirm the listener task has fully exited. Drop
+/// cancels the shared signal as a backstop, so a forgotten handle does
+/// not leak the listener.
+///
+/// Mirrors the [`MailboxServerHandle`](crate::mailbox::MailboxServerHandle)
+/// shape: signal stop, then await the handle.
+pub struct MuxShutdown {
+    join_handle: tokio::task::JoinHandle<Result<(), net::ServerError>>,
+    cancel: CancellationToken,
+}
+
+impl MuxShutdown {
+    /// Signal the muxed listener to stop accepting new connections and
+    /// tear down. The caller should subsequently `.await` the handle
+    /// to confirm shutdown.
+    pub fn stop(&self, reason: &str) {
+        tracing::info!(
+            name = "MuxServerStatus",
+            status = "Stop::Sent",
+            reason,
+            "muxed frontend stop signalled",
+        );
+        self.cancel.cancel();
+    }
+
+    /// Resolve when the shared shutdown has been cancelled (without
+    /// awaiting the listener task itself). Useful for outer tasks that
+    /// drive per-half pumps and need to wake on teardown.
+    pub async fn cancelled(&self) {
+        self.cancel.cancelled().await;
+    }
+}
+
+impl std::future::Future for MuxShutdown {
+    type Output =
+        <tokio::task::JoinHandle<Result<(), net::ServerError>> as std::future::Future>::Output;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // `JoinHandle` is `Unpin`, so we can re-pin a mutable borrow of
+        // it without unsafe pin projection. `MuxShutdown` is `Unpin` by
+        // virtue of its `Unpin` fields, which lets us reach through the
+        // outer `Pin`.
+        std::pin::Pin::new(&mut self.join_handle).poll(cx)
+    }
+}
+
+impl Drop for MuxShutdown {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 fn serve_inner<M: RemoteMessage>(
     addr: ChannelAddr,
     listener: Option<std::net::TcpListener>,
-) -> Result<(ChannelAddr, ChannelRxKind<M>), ChannelError> {
+) -> Result<(ChannelAddr, ChannelRx<M>), ChannelError> {
     match addr {
         ChannelAddr::Unix(_) => {
             assert!(
@@ -1199,31 +1812,20 @@ fn serve_inner<M: RemoteMessage>(
                 "pre-opened listener not supported for Unix transport"
             );
             let (addr, rx) = net::server::serve::<M>(addr, listener)?;
-            Ok((addr, ChannelRxKind::Net(rx)))
+            Ok((addr, rx))
         }
-        ChannelAddr::Tcp(_) | ChannelAddr::Tls(_) | ChannelAddr::MetaTls(_) => {
+        ChannelAddr::Tcp(_)
+        | ChannelAddr::Local(_)
+        | ChannelAddr::Tls(_)
+        | ChannelAddr::MetaTls(_)
+        | ChannelAddr::Quic(_)
+        | ChannelAddr::MetaQuic(_)
+        // The `Alias` variant binds on its `bind_to` address but advertises
+        // `dial_to`; `listen_with_prebound` resolves this, so it routes through
+        // the same net serve path as the other TCP-based transports.
+        | ChannelAddr::Alias { .. } => {
             let (addr, rx) = net::server::serve::<M>(addr, listener)?;
-            Ok((addr, ChannelRxKind::Net(rx)))
-        }
-        ChannelAddr::Local(0) => {
-            assert!(
-                listener.is_none(),
-                "pre-opened listener not supported for Local transport"
-            );
-            let (port, rx) = local::serve::<M>();
-            Ok((ChannelAddr::Local(port), ChannelRxKind::Local(rx)))
-        }
-        ChannelAddr::Local(a) => Err(ChannelError::InvalidAddress(format!(
-            "invalid local addr: {}",
-            a
-        ))),
-        ChannelAddr::Alias { dial_to, bind_to } => {
-            let (bound_addr, rx) = serve_inner::<M>(*bind_to, listener)?;
-            let alias_addr = ChannelAddr::Alias {
-                dial_to,
-                bind_to: Box::new(bound_addr),
-            };
-            Ok((alias_addr, rx))
+            Ok((addr, rx))
         }
     }
 }
@@ -1231,18 +1833,28 @@ fn serve_inner<M: RemoteMessage>(
 /// Serve on the local address. The server is turned down
 /// when the returned Rx is dropped.
 pub fn serve_local<M: RemoteMessage>() -> (ChannelAddr, ChannelRx<M>) {
-    let (port, rx) = local::serve::<M>();
-    (
-        ChannelAddr::Local(port),
-        ChannelRx {
-            inner: ChannelRxKind::Local(rx),
-        },
-    )
+    serve::<M>(ChannelAddr::Local(0)).expect("fresh local stream port must bind")
+}
+
+/// Reserve a local channel address that can be served later.
+///
+/// Local channels are backed by a process-local port registry, so reserving a
+/// concrete address is a synchronous allocation that does not bind an OS
+/// listener. Gateways use this to have a stable advertised local location
+/// immediately, including when the process-wide gateway is initialized from a
+/// [`std::sync::OnceLock`]. Serving is a separate step that binds the reserved
+/// port to a receiver.
+///
+/// Network transports do not have an equivalent reservation API here: their
+/// concrete addresses come from binding sockets and starting the corresponding
+/// channel server.
+pub fn reserve_local_addr() -> ChannelAddr {
+    ChannelAddr::Local(local::reserve())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::assert_matches::assert_matches;
+    use std::assert_matches;
     use std::collections::HashSet;
     use std::net::IpAddr;
     use std::net::Ipv4Addr;
@@ -1271,6 +1883,14 @@ mod tests {
                     IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                     8080,
                 )),
+            ),
+            (
+                "quic<DELIM>example.com:443",
+                ChannelAddr::Quic(TlsAddr::new("example.com", 443)),
+            ),
+            (
+                "metaquic<DELIM>example.com:443",
+                ChannelAddr::MetaQuic(TlsAddr::new("example.com", 443)),
             ),
             #[cfg(target_os = "linux")]
             ("local<DELIM>123", ChannelAddr::Local(123)),
@@ -1350,6 +1970,30 @@ mod tests {
             ChannelAddr::MetaTls(TlsAddr::new("192.168.1.1", 443))
         );
 
+        // Test quic with hostname
+        assert_eq!(
+            ChannelAddr::from_zmq_url("quic://example.com:443").unwrap(),
+            ChannelAddr::Quic(TlsAddr::new("example.com", 443))
+        );
+
+        // Test quic wildcard binding
+        assert_eq!(
+            ChannelAddr::from_zmq_url("quic://*:8443").unwrap(),
+            ChannelAddr::Quic(TlsAddr::new("::", 8443))
+        );
+
+        // Test metaquic with hostname
+        assert_eq!(
+            ChannelAddr::from_zmq_url("metaquic://example.com:443").unwrap(),
+            ChannelAddr::MetaQuic(TlsAddr::new("example.com", 443))
+        );
+
+        // Test metaquic wildcard binding
+        assert_eq!(
+            ChannelAddr::from_zmq_url("metaquic://*:8443").unwrap(),
+            ChannelAddr::MetaQuic(TlsAddr::new("::", 8443))
+        );
+
         // Test metatls with wildcard (should use IPv6 unspecified address)
         assert_eq!(
             ChannelAddr::from_zmq_url("metatls://*:8443").unwrap(),
@@ -1410,6 +2054,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_reserved_local_addr_can_be_served() {
+        let addr = reserve_local_addr();
+        assert!(dial::<u64>(addr.clone()).is_err());
+
+        let (bound_addr, mut rx) = serve::<u64>(addr.clone()).unwrap();
+        assert_eq!(bound_addr, addr);
+
+        let tx = dial::<u64>(addr.clone()).unwrap();
+        tx.post(123);
+        assert_eq!(rx.recv().await.unwrap(), 123);
+        rx.join().await;
+
+        let (rebound_addr, _rx) = serve::<u64>(addr.clone()).unwrap();
+        assert_eq!(rebound_addr, addr);
+    }
+
     #[test]
     fn test_normalize_host() {
         // Plain IPv4 passes through
@@ -1431,6 +2092,34 @@ mod tests {
         // addresses. This demonstrates that the bracket stripping in
         // normalize_host is necessary.
         assert!("[::1]".parse::<IpAddr>().is_err());
+    }
+
+    #[test]
+    fn test_find_routable_address_skips_loopback() {
+        let addresses = [
+            "127.0.1.1".parse::<IpAddr>().unwrap(),
+            "169.254.1.1".parse::<IpAddr>().unwrap(),
+            "::1".parse::<IpAddr>().unwrap(),
+            "fe80::1".parse::<IpAddr>().unwrap(),
+            "192.0.2.10".parse::<IpAddr>().unwrap(),
+        ];
+
+        assert_eq!(
+            find_routable_address(&addresses),
+            Some("192.0.2.10".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_find_routable_address_rejects_unroutable_addresses() {
+        let addresses = [
+            "127.0.1.1".parse::<IpAddr>().unwrap(),
+            "169.254.1.1".parse::<IpAddr>().unwrap(),
+            "::1".parse::<IpAddr>().unwrap(),
+            "fe80::1".parse::<IpAddr>().unwrap(),
+        ];
+
+        assert_eq!(find_routable_address(&addresses), None);
     }
 
     #[test]
@@ -1533,17 +2222,15 @@ mod tests {
             let start = tokio::time::Instant::now();
 
             let result = loop {
-                let (return_tx, return_rx) = oneshot::channel();
-                tx.try_post(123, return_tx);
-                let result = return_rx.await;
+                let result = tx.try_post(123).await;
 
-                if result.is_ok() || start.elapsed() > Duration::from_secs(10) {
+                if result.is_err() || start.elapsed() > Duration::from_secs(10) {
                     break result;
                 }
             };
             assert_matches!(
                 result,
-                Ok(SendError {
+                Err(SendError {
                     error: ChannelError::Closed,
                     message: 123,
                     reason: None
@@ -1616,6 +2303,42 @@ mod tests {
             tx.post(123);
             assert_eq!(rx.recv().await.unwrap(), 123);
         }
+    }
+
+    #[tokio::test]
+    // TODO: OSS: called `Result::unwrap()` on an `Err` value: Server(Listen(Tcp([::1]:0), Os { code: 99, kind: AddrNotAvailable, message: "Cannot assign requested address" }))
+    #[cfg_attr(not(fbcode_build), ignore)]
+    async fn test_serve_alias_advertises_dial_to() {
+        // Reserve an ephemeral port, then release it so the alias can bind to
+        // it via `bind_to`.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // `dial_to` advertises a reachable loopback address; `bind_to` listens
+        // on the wildcard interface (the case that matters where the dial
+        // address cannot be bound directly, e.g. behind NAT).
+        let alias =
+            ChannelAddr::from_zmq_url(&format!("tcp://127.0.0.1:{port}@tcp://0.0.0.0:{port}"))
+                .unwrap();
+        assert_matches!(alias, ChannelAddr::Alias { .. });
+
+        let (listen_addr, mut rx) = crate::channel::serve::<i32>(alias).unwrap();
+
+        // Serving an alias consumes it: the advertised address is the plain
+        // `dial_to`. Remote peers independently construct this same `Tcp`
+        // address from the dial string, so the proc namespace derived from it
+        // must match. If serving left the address an `Alias`, that match would
+        // fail and messages would not route to the server.
+        assert_eq!(
+            listen_addr,
+            ChannelAddr::Tcp(format!("127.0.0.1:{port}").parse().unwrap()),
+            "serving an alias must advertise dial_to, not the alias itself"
+        );
+
+        let tx = crate::channel::dial(listen_addr).unwrap();
+        tx.post(123);
+        assert_eq!(rx.recv().await.unwrap(), 123);
     }
 
     #[tokio::test]

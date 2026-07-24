@@ -22,15 +22,14 @@ use chrono::Local;
 use hostname;
 use hyperactor::Actor;
 use hyperactor::ActorRef;
-use hyperactor::Bind;
 use hyperactor::Context;
+use hyperactor::Endpoint as _;
 use hyperactor::HandleClient;
 use hyperactor::Handler;
 use hyperactor::Instance;
 use hyperactor::OncePortRef;
 use hyperactor::ProcAddr;
 use hyperactor::RefClient;
-use hyperactor::Unbind;
 use hyperactor::channel;
 use hyperactor::channel::ChannelAddr;
 use hyperactor::channel::ChannelRx;
@@ -313,6 +312,10 @@ pub enum LogMessage {
     Handler,
     HandleClient,
     RefClient
+)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "actor message enum with Handler/HandleClient/RefClient derives; boxing fields ripples into client/handler call sites and may require derive-macro changes — separate diff"
 )]
 pub enum LogClientMessage {
     SetAggregate {
@@ -965,9 +968,7 @@ impl StreamFwder {
     Named,
     Handler,
     HandleClient,
-    RefClient,
-    Bind,
-    Unbind
+    RefClient
 )]
 pub enum LogForwardMessage {
     /// Receive the log from the parent process and forward it to the client.
@@ -981,7 +982,7 @@ pub enum LogForwardMessage {
 }
 
 /// A log forwarder that receives the log from its parent process and forward it back to the client
-#[hyperactor::export(LogForwardMessage { cast = true })]
+#[hyperactor::export(LogForwardMessage)]
 #[hyperactor::spawnable]
 pub struct LogForwardActor {
     rx: ChannelRx<LogMessage>,
@@ -995,7 +996,7 @@ pub struct LogForwardActor {
 impl Actor for LogForwardActor {
     async fn init(&mut self, this: &Instance<Self>) -> Result<(), anyhow::Error> {
         this.set_system();
-        this.self_message_with_delay(LogForwardMessage::Forward {}, Duration::from_secs(0))?;
+        this.post_after(this, LogForwardMessage::Forward {}, Duration::from_secs(0));
 
         // Make sure we start the flush loop periodically so the log channel will not deadlock.
         self.flush_tx
@@ -1108,7 +1109,7 @@ impl LogForwardMessageHandler for LogForwardActor {
         }
 
         // This is not ideal as we are using raw tx/rx.
-        ctx.self_message_with_delay(LogForwardMessage::Forward {}, Duration::from_secs(0))?;
+        ctx.post_after(ctx, LogForwardMessage::Forward {}, Duration::from_secs(0));
 
         Ok(())
     }
@@ -1297,20 +1298,14 @@ impl LogMessageHandler for LogClientActor {
                     match self.next_flush_deadline {
                         None => {
                             self.next_flush_deadline = Some(new_deadline);
-                            cx.self_message_with_delay(
-                                LogMessage::Flush { sync_version: None },
-                                delay,
-                            )?;
+                            cx.post_after(cx, LogMessage::Flush { sync_version: None }, delay);
                         }
                         Some(deadline) => {
                             // Some early log lines have alrady triggered the flush.
                             if new_deadline < deadline {
                                 // This can happen if the user has adjusted the aggregation window.
                                 self.next_flush_deadline = Some(new_deadline);
-                                cx.self_message_with_delay(
-                                    LogMessage::Flush { sync_version: None },
-                                    delay,
-                                )?;
+                                cx.post_after(cx, LogMessage::Flush { sync_version: None }, delay);
                             }
                         }
                     }
@@ -1356,7 +1351,7 @@ impl LogMessageHandler for LogClientActor {
                     self.flush_internal();
                     let reply = self.current_flush_port.take().unwrap();
                     self.current_flush_port = None;
-                    reply.send(cx, ()).map_err(anyhow::Error::from)?;
+                    reply.post(cx, ());
                 }
             }
         }
@@ -1403,9 +1398,7 @@ impl LogClientMessageHandler for LogClientActor {
         );
         self.current_flush_port = Some(reply.clone());
         self.current_unflushed_procs = expected_procs_flushed;
-        version
-            .send(cx, self.current_flush_version)
-            .map_err(anyhow::Error::from)?;
+        version.post(cx, self.current_flush_version);
         Ok(())
     }
 }
@@ -1596,7 +1589,7 @@ mod tests {
         proc.clone().serve(client_rx);
         let proc_ref: ProcAddr = test_proc_id("client_0");
         router.bind(proc_ref, proc_addr.clone());
-        let (client, _handle) = proc.instance("client").unwrap();
+        let client = proc.client("client");
 
         // Spin up both the forwarder and the client
         let log_channel = ChannelAddr::any(ChannelTransport::Unix);
@@ -1605,15 +1598,11 @@ mod tests {
             std::env::set_var(BOOTSTRAP_LOG_CHANNEL, log_channel.to_string());
         }
         let log_client_actor = LogClientActor::new((), Flattrs::default()).await.unwrap();
-        let log_client: ActorRef<LogClientActor> =
-            proc.spawn("log_client", log_client_actor).unwrap().bind();
+        let log_client: ActorRef<LogClientActor> = proc.spawn(log_client_actor).bind();
         let log_forwarder_actor = LogForwardActor::new(log_client.clone(), Flattrs::default())
             .await
             .unwrap();
-        let log_forwarder: ActorRef<LogForwardActor> = proc
-            .spawn("log_forwarder", log_forwarder_actor)
-            .unwrap()
-            .bind();
+        let log_forwarder: ActorRef<LogForwardActor> = proc.spawn(log_forwarder_actor).bind();
 
         // Write some logs that will not be streamed
         let tx: ChannelTx<LogMessage> = channel::dial(log_channel).unwrap();
@@ -1988,7 +1977,7 @@ mod tests {
 
         // Test that result is always between 0.0 and 1.0
         let distance = normalized_edit_distance("completely", "different");
-        assert!(distance >= 0.0 && distance <= 1.0);
+        assert!((0.0..=1.0).contains(&distance));
     }
 
     #[tokio::test]

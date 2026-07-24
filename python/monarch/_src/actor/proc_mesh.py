@@ -41,7 +41,6 @@ from monarch._rust_bindings.monarch_hyperactor.proc_mesh import ProcMesh as HyPr
 from monarch._rust_bindings.monarch_hyperactor.pytokio import PythonTask, Shared
 from monarch._rust_bindings.monarch_hyperactor.shape import Region, Shape, Slice
 from monarch._rust_bindings.monarch_hyperactor.supervision import MeshFailure
-from monarch._rust_bindings.monarch_hyperactor.telemetry import forward_to_tracing
 from monarch._src.actor.actor_mesh import (
     _Actor,
     _create_endpoint_message,
@@ -63,6 +62,7 @@ from monarch._src.actor.endpoint import endpoint
 from monarch._src.actor.future import Future
 from monarch._src.actor.logging import LoggingManager
 from monarch._src.actor.shape import MeshTrait
+from monarch._src.actor.telemetry import log_with_tracing
 from monarch.tools.config.environment import CondaEnvironment
 from monarch.tools.config.workspace import Workspace
 from monarch.tools.utils import conda as conda_utils
@@ -101,38 +101,6 @@ _COMMON_CUDA_ENV_VARS: Tuple[str, ...] = (
 
 T = TypeVar("T")
 TActor = TypeVar("TActor", bound=Actor)
-
-
-def log_with_tracing(
-    level: int,
-    msg: object,
-    *args: object,
-    stack_info: bool = False,
-    stacklevel: int = 1,
-    extra: Dict[str, object] | None = None,
-    logger: logging.Logger | None = None,
-) -> None:
-    logger = logger or logging.getLogger(__name__)
-
-    fn, lno, func, sinfo = logger.findCaller(
-        stack_info=stack_info,
-        stacklevel=stacklevel + 1,
-    )
-
-    record = logger.makeRecord(
-        logger.name,
-        level,
-        fn,
-        lno,
-        msg,
-        args,
-        None,
-        func,
-        extra=extra,
-        sinfo=sinfo,
-    )
-    logger.handle(record)
-    forward_to_tracing(record)
 
 
 def _cuda_env_snapshot() -> Dict[str, Optional[str]]:
@@ -308,7 +276,6 @@ class SetupActor(Actor):
                     await user_setup()
                 else:
                     with fake_sync_state():
-                        # pyre-ignore[29]: user_setup is callable here
                         user_setup()
 
 
@@ -420,6 +387,7 @@ class ProcMesh(MeshTrait):
         return self._region.slice()
 
     @property
+    # pyrefly: ignore [bad-override]
     def _labels(self) -> List[str]:
         return self._region.labels
 
@@ -577,6 +545,7 @@ class ProcMesh(MeshTrait):
         )
 
         init_message = _create_endpoint_message(
+            # pyrefly: ignore [bad-argument-type]
             MethodSpecifier.Init(),
             inspect.signature(Class.__init__),
             (
@@ -647,9 +616,11 @@ class ProcMesh(MeshTrait):
         return self._device_mesh.activate()
 
     def rank_tensor(self, dim: str | Sequence[str]) -> "Tensor":
+        # pyrefly: ignore [missing-attribute]
         return self._maybe_device_mesh.rank(dim)
 
     def rank_tensors(self) -> Dict[str, "Tensor"]:
+        # pyrefly: ignore [missing-attribute]
         return self._maybe_device_mesh.ranks
 
     async def logging_option(
@@ -663,9 +634,9 @@ class ProcMesh(MeshTrait):
 
         Args:
             stream_to_client (bool): If True, logs from the remote processes will be streamed to the client.
-            Defaults to True.
+            Defaults to False.
             aggregate_window_sec (Optional[int]): If not None, logs from the remote processes will be aggregated
-            and sent to the client every aggregate_window_sec seconds. Defaults to 3 seconds, meaning no aggregation.
+            and sent to the client every aggregate_window_sec seconds. Defaults to None, meaning no aggregation.
             Error will be thrown if aggregate_window_sec is set and stream_to_client is False.
             level (int): The logging level of the logger. Defaults to logging.INFO.
 
@@ -745,7 +716,25 @@ class ProcMesh(MeshTrait):
             root_region,
         )
 
+    # pyrefly: ignore [invalid-annotation]
     def __reduce_ex__(self, protocol: ...) -> Tuple[Any, Tuple[Any, ...]]:
+        # A pending proc mesh has no ProcMeshRef yet. When mesh-reference
+        # collection is active, reserve an out-of-band slot (filled sender-side
+        # once the mesh resolves) and reconstruct from the popped mesh;
+        # otherwise fall through to the ordinary reduce.
+        if self._proc_mesh.poll() is None:
+            from monarch._rust_bindings.monarch_hyperactor.pickle import (
+                reserve_mesh_reference,
+            )
+            from monarch._src.actor.pickle import _MeshSlot
+
+            if reserve_mesh_reference(self._proc_mesh):
+                return ProcMesh._from_initialized_hy_proc_mesh, (
+                    _MeshSlot(),
+                    self._host_mesh,
+                    self._region,
+                    self._root_region,
+                )
         return ProcMesh, (
             self._proc_mesh,
             self._host_mesh,
@@ -863,7 +852,9 @@ class ProcMesh(MeshTrait):
                 # Check if we've already defined a workspace for this local path.
                 existing = workspaces.get(local)
                 if existing is not None:
+                    # pyrefly: ignore [missing-attribute]
                     assert existing.method == CodeSyncMethod.Rsync()
+                    # pyrefly: ignore [missing-attribute]
                     remote = existing.remote
                 else:
                     # Otherwise, add the workspace to the list.
@@ -881,10 +872,12 @@ class ProcMesh(MeshTrait):
                     )
 
                 logging.info(
+                    # pyrefly: ignore [missing-attribute]
                     f"Syncing editable install of {name} from {local} (to {remote.location})"
                 )
 
                 # Make sure we fixup path prefixes to the editable install.
+                # pyrefly: ignore [missing-attribute]
                 conda_prefix_replacements[local] = remote.location
 
             workspaces[conda_prefix] = WorkspaceConfig(
@@ -896,6 +889,7 @@ class ProcMesh(MeshTrait):
                     ),
                     shape=WorkspaceShape.shared("gpus"),
                 ),
+                # pyrefly: ignore [bad-argument-type]
                 method=CodeSyncMethod.CondaSync(conda_prefix_replacements),
             )
 
@@ -918,7 +912,6 @@ class _ControllerController(Actor):
         # Internal mesh name mapped back to the key from _controllers.
         self._mesh_name_to_name: Dict[str, str] = {}
 
-    # pyre-ignore
     @endpoint
     def get_or_spawn(
         self,

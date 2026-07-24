@@ -8,14 +8,15 @@ edition = "2024"
 license = "BSD-3-Clause"
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.103"
 async-trait = "0.1.86"
 derive_more = { version = "1.0.0", features = ["full"] }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 hyperactor = { version = "0.0.0", path = "../hyperactor" }
 hyperactor_config = { version = "0.0.0", path = "../hyperactor_config" }
 hyperactor_mesh = { version = "0.0.0", path = "../hyperactor_mesh" }
-itertools = "0.14.0"
+itertools = "0.15.0"
+monarch_gil = { version = "0.0.0", path = "../monarch_gil" }
 monarch_hyperactor = { version = "0.0.0", path = "../monarch_hyperactor" }
 monarch_messages = { version = "0.0.0", path = "../monarch_messages", default-features = false }
 monarch_types = { version = "0.0.0", path = "../monarch_types" }
@@ -24,7 +25,7 @@ parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 pyo3 = { version = "0.26", features = ["anyhow", "multiple-pymethods", "py-clone"] }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 sorted-vec = "0.8.10"
-tokio = { version = "1.52.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
 torch-sys-ascend = { version = "0.0.0", path = "../torch-sys-ascend", optional = true }
 torch-sys-cuda = { version = "0.0.0", path = "../torch-sys-cuda", optional = true, default-features = false }
 torch-sys2 = { version = "0.0.0", path = "../torch-sys2" }
@@ -34,7 +35,7 @@ typeuri = { version = "0.0.0", path = "../typeuri" }
 wirevalue = { version = "0.0.0", path = "../wirevalue" }
 
 [dev-dependencies]
-rand = "0.10.1"
+rand = "0.10.2"
 timed_test = { version = "0.0.0", path = "../timed_test" }
 
 [build-dependencies]
@@ -42,11 +43,9 @@ build_utils = { path = "../build_utils" }
 
 [features]
 default = []
-cuda = ["dep:torch-sys-cuda", "monarch_messages/cuda", "torch-sys-cuda/cuda"]
-# Legacy alias retained while ascend_engine downstream features still
-# reference the pre-rename name "monarch_tensor_worker/cuda_backend".
-cuda_backend = ["cuda"]
+cuda_backend = ["dep:torch-sys-cuda", "monarch_messages/cuda"]
+cuda = ["cuda_backend", "torch-sys-cuda/cuda"]
 ascend_backend = ["dep:torch-sys-ascend", "monarch_messages/ascend_backend"]
 
-[lints]
-rust = { unexpected_cfgs = { check-cfg = ["cfg(fbcode_build)"], level = "warn" } }
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fbcode_build)"]}

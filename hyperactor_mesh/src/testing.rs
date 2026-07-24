@@ -31,16 +31,22 @@ use hyperactor::actor::ActorErrorKind;
 use hyperactor::actor::ActorStatus;
 use hyperactor::actor::Signal;
 use hyperactor::channel::ChannelTransport;
-use hyperactor::mailbox::PortReceiver;
-use hyperactor::proc::WorkCell;
+use hyperactor::proc::ActorWorkReceiver;
 use hyperactor::supervision::ActorSupervisionEvent;
+#[cfg(fbcode_build)]
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+#[cfg(fbcode_build)]
 use crate::Bootstrap;
+#[cfg(fbcode_build)]
 use crate::HostMeshRef;
+#[cfg(fbcode_build)]
+use crate::bootstrap::HostBootstrapReady;
+#[cfg(fbcode_build)]
 use crate::host_mesh::HostMesh;
+#[cfg(fbcode_build)]
 use crate::host_mesh::HostMeshShutdownGuard;
 use crate::supervision::MeshFailure;
 
@@ -181,9 +187,9 @@ fn process_name(pid: u32) -> Option<String> {
 
 #[derive(Debug)]
 pub struct TestRootClient {
-    signal_rx: PortReceiver<Signal>,
-    supervision_rx: PortReceiver<ActorSupervisionEvent>,
-    work_rx: mpsc::UnboundedReceiver<WorkCell<Self>>,
+    signal_rx: mpsc::UnboundedReceiver<Signal>,
+    supervision_rx: mpsc::UnboundedReceiver<ActorSupervisionEvent>,
+    work_rx: ActorWorkReceiver<Self>,
 }
 
 impl Actor for TestRootClient {}
@@ -206,22 +212,22 @@ impl TestRootClient {
                     work = self.work_rx.recv() => {
                         let work = work.expect("inconsistent work queue state");
                         if let Err(err) = work.handle(&mut self, instance).await {
-                            for supervision_event in self.supervision_rx.drain() {
+                            while let Ok(supervision_event) = self.supervision_rx.try_recv() {
                                 if let Err(err) = instance.handle_supervision_event(&mut self, supervision_event).await {
                                     break 'messages err;
                                 }
                             }
                             let kind = ActorErrorKind::processing(err);
                             break ActorError {
-                                actor_id: Box::new(instance.self_id().clone()),
+                                actor_id: Box::new(instance.self_addr().clone()),
                                 kind: Box::new(kind),
                             };
                         }
                     }
-                    _ = self.signal_rx.recv() => {
+                    Some(_) = self.signal_rx.recv() => {
                         // TODO: do we need any signal handling for the root client?
                     }
-                    Ok(supervision_event) = self.supervision_rx.recv() => {
+                    Some(supervision_event) = self.supervision_rx.recv() => {
                         if let Err(err) = instance.handle_supervision_event(&mut self, supervision_event).await {
                             break err;
                         }
@@ -233,7 +239,7 @@ impl TestRootClient {
                 _ => {
                     let status = ActorStatus::generic_failure(err.kind.to_string());
                     ActorSupervisionEvent::new(
-                        instance.self_id().clone(),
+                        instance.self_addr().clone(),
                         Some("testclient".into()),
                         status,
                         None,
@@ -303,10 +309,13 @@ pub async fn host_mesh(n: usize) -> HostMeshShutdownGuard {
         host_addrs.push(ChannelTransport::Unix.any());
     }
 
+    let mut ready = Vec::with_capacity(n);
     for host in host_addrs.iter() {
+        let callback = HostBootstrapReady::new(host.clone()).unwrap();
         let mut cmd = Command::new(program.clone());
         let boot = Bootstrap::Host {
             addr: host.clone(),
+            callback_addr: callback.callback_addr(),
             command: None, // use current binary
             config: None,
             exit_on_shutdown: false,
@@ -320,9 +329,15 @@ pub async fn host_mesh(n: usize) -> HostMeshShutdownGuard {
             cmd.pre_exec(crate::bootstrap::install_pdeathsig_kill);
         }
         cmd.spawn().unwrap();
+        ready.push(callback);
+    }
+    for callback in ready {
+        callback.wait().await.unwrap();
     }
 
-    let host_mesh =
-        HostMeshRef::from_hosts(HostMeshId::unique(Label::new("test").unwrap()), host_addrs);
+    let host_mesh = HostMeshRef::from_hosts(
+        HostMeshId::instance(Label::new("test").unwrap()),
+        host_addrs,
+    );
     HostMesh::take(host_mesh).shutdown_guard()
 }

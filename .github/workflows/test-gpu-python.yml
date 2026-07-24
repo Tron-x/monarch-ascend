@@ -54,14 +54,6 @@ jobs:
         # Install the built wheel from artifact
         install_wheel_from_artifact
 
-        # tests the type_assert statements in test_python_actor are correct
-        # pyre currently does not check these assertions
-        pyright python/tests/test_python_actors.py
-
-        # Run GPU Python tests split into 10 groups sequentially
-        # Each group runs separately with process cleanup in between
-        pip install pytest-split
-
         # run_test_groups disables errexit internally and leaks `set +e`,
         # so capture its exit code before `stage_test_artifacts` runs;
         # otherwise stage_test_artifacts's exit 0 masks a test failure.

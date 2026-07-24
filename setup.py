@@ -221,13 +221,28 @@ if not gpu_platform and build_tensor_engine and cuda_home and rocm_home:
         "Both CUDA and ROCm detected. Set MONARCH_GPU_PLATFORM=cuda, =rocm, or =none."
     )
 
-build_cuda = build_tensor_engine and (
-    gpu_platform == "cuda" or (not gpu_platform and cuda_home)
-)
-build_rocm = build_tensor_engine and (
-    gpu_platform == "rocm" or (not gpu_platform and rocm_home)
-)
+# Two independent axes drive the cargo features below:
+#   * torch present?            -> build_tensor_engine ("tensor_engine")
+#   * CUDA/ROCm toolchain?      -> has_cuda / has_rocm
+# MONARCH_GPU_PLATFORM forces the platform ("cuda"/"rocm"/"none"); empty means
+# auto-detect. Invalid / forced-but-missing / both-installed cases already
+# errored out above, so here we just read the result.
+auto_detect = gpu_platform == ""
+has_cuda = gpu_platform == "cuda" or (auto_detect and cuda_home is not None)
+has_rocm = gpu_platform == "rocm" or (auto_detect and rocm_home is not None)
+
+# GPU tensor-engine build needs torch AND a toolchain -> "tensor_engine_gpu"
+# feature (which itself folds in "rdma", see monarch_extension/Cargo.toml).
+build_cuda = build_tensor_engine and has_cuda
+build_rocm = build_tensor_engine and has_rocm
 build_gpu = build_cuda or build_rocm
+
+# rdma needs only the toolchain, not torch, so it can ship in the no-torch
+# (USE_TENSOR_ENGINE=0) build too.
+# TODO: this coupling makes no sense and should be removed in a follow-up —
+# rdma (ibverbs) is a network transport with nothing to do with GPU compute;
+# it can't build today only because rdmaxcel-sys compiles device code.
+build_rdma = has_cuda or has_rocm
 
 print("=" * 80)
 if build_ascend:
@@ -245,11 +260,15 @@ elif build_tensor_engine:
         elif build_rocm:
             print(f"  - ROCm: {rocm_home}")
     else:
-        print("✓ Building WITH tensor_engine (CPU-only, no GPU/NCCL/RDMA)")
+        print("✓ Building WITH tensor_engine (CPU-only, no GPU/NCCL)")
         print(f"  - PyTorch: {torch_config['lib_path']}")
     print(f"  - C++11 ABI: {'enabled' if torch_config['cxx11_abi'] else 'disabled'}")
 else:
-    print("Building WITHOUT tensor_engine (actors only, no torch)")
+    print("Building WITHOUT tensor_engine (no torch)")
+if build_rdma:
+    print("  - RDMA: included")
+else:
+    print("  - RDMA: not included (no CUDA/ROCm toolchain found; see TODO in setup.py)")
 print("=" * 80)
 
 # Set PYO3_PYTHON for Rust binaries
@@ -258,6 +277,8 @@ if "PYO3_PYTHON" not in os.environ:
 
 # Set Rust and C++ flags
 rustflags = ["-Zthreads=16", "--cfg=tracing_unstable"]
+if os.environ.get("CI") == "true":
+    rustflags.append("--cfg=hyperactor_verify_auto_traits")
 if os.environ.get("ENABLE_MESSAGE_LOGGING"):
     rustflags.append("--cfg=enable_hyperactor_message_logging")
 
@@ -397,7 +418,7 @@ def create_cpp_extension(
     return Extension(
         name,
         sources,
-        extra_compile_args=["-std=c++17", "-g", "-O3"],
+        extra_compile_args=["-std=c++20", "-g", "-O3"],
         extra_link_args=extra_link_args,
         define_macros=define_macros or [],
         libraries=libraries,
@@ -452,16 +473,23 @@ elif build_ascend and torch_config:
 
 # Rust extensions
 rust_extensions = []
+# Pass --locked as a *manifest* arg, not a build arg: setuptools-rust forwards
+# `args` only to `cargo build`, but also runs `cargo metadata` to locate the
+# built artifact, and an unlocked `cargo metadata` silently rewrites Cargo.lock.
+# `cargo_manifest_args` reaches every cargo invocation (metadata and build).
+locked_cargo_args = ["--locked"]
 
 # Main Python extension
 rust_features = ["extension-module", "distributed_sql_telemetry"]
+if build_rdma:
+    rust_features.append("rdma")
 if build_tensor_engine:
     rust_features.append("tensor_engine")
 elif build_ascend:
     rust_features.append("ascend_engine")
 
 if build_gpu:
-    rust_features.append("tensor_engine_gpu")
+    rust_features.append("tensor_engine_gpu")  # folds in "rdma" too
 
 has_engine = build_tensor_engine or build_ascend
 rust_extensions.append(
@@ -472,6 +500,7 @@ rust_extensions.append(
         debug=False,
         features=rust_features,
         args=["--no-default-features"],
+        cargo_manifest_args=locked_cargo_args,
         rustc_flags=rust_link_flags,
     )
 )
@@ -483,6 +512,7 @@ rust_extensions.append(
         {"hyperactor_mesh_admin_tui": "monarch-tui"},
         path="hyperactor_mesh_admin_tui/Cargo.toml",
         debug=False,
+        cargo_manifest_args=locked_cargo_args,
     )
 )
 
@@ -532,7 +562,7 @@ class BuildFrontend(Command):
 
         print("Building dashboard frontend...")
         try:
-            subprocess.check_call([npm_cmd, "install"], cwd=frontend_dir)
+            subprocess.check_call([npm_cmd, "ci"], cwd=frontend_dir)
             os.makedirs(os.path.join(build_dir, "static", "css"), exist_ok=True)
             subprocess.check_call([npm_cmd, "run", "build"], cwd=frontend_dir)
             # esbuild puts CSS next to JS; move it to static/css/
@@ -555,7 +585,7 @@ class BuildFrontend(Command):
                 "or use pre-built assets."
             )
         except subprocess.CalledProcessError as e:
-            print("Frontend build failed with error:", e)
+            raise RuntimeError("frontend build failed") from e
 
 
 # Clean command
@@ -601,7 +631,7 @@ class BuildPyWithFrontend(build_py):
 
 # Actual Setup
 package_name = os.environ.get("MONARCH_PACKAGE_NAME", "torchmonarch")
-package_version = os.environ.get("MONARCH_VERSION", "0.5.0.dev0")
+package_version = os.environ.get("MONARCH_VERSION", "0.7.0.dev0")
 
 setup(
     name=package_name,

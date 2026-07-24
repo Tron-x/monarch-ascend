@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use hyperactor as reference;
 use hyperactor::Actor;
 use hyperactor::Context;
+use hyperactor::Endpoint as _;
 use hyperactor::Handler;
 use hyperactor::RemoteSpawn;
 use hyperactor_config::Flattrs;
@@ -22,6 +23,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use typeuri::Named;
 
+use crate::runtime::GilSite;
 use crate::runtime::monarch_with_gil_blocking;
 
 /// Message to trigger module reloading
@@ -59,7 +61,7 @@ impl AutoReloadActor {
     pub(crate) async fn new() -> Result<Self, anyhow::Error> {
         Ok(Self {
             state: tokio::task::spawn_blocking(move || {
-                monarch_with_gil_blocking(|py| {
+                monarch_with_gil_blocking(GilSite::CodeSync, |py| {
                     Self::create_state(py).map_err(SerializablePyErr::from_fn(py))
                 })
             })
@@ -103,7 +105,7 @@ impl Handler<AutoReloadMessage> for AutoReloadActor {
         let res = async {
             let py_reloader: Arc<_> = self.state.as_ref().map_err(Clone::clone)?.0.clone();
             tokio::task::spawn_blocking(move || {
-                monarch_with_gil_blocking(|py| {
+                monarch_with_gil_blocking(GilSite::CodeSync, |py| {
                     Self::reload(py, py_reloader.as_ref()).map_err(SerializablePyErr::from_fn(py))
                 })
             })
@@ -111,7 +113,7 @@ impl Handler<AutoReloadMessage> for AutoReloadActor {
             anyhow::Ok(())
         }
         .await;
-        result.send(cx, res.map_err(|e| format!("{:#?}", e)))?;
+        result.post(cx, res.map_err(|e| format!("{:#?}", e)));
         Ok(())
     }
 }

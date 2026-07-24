@@ -343,17 +343,17 @@ mod tests {
     use super::*;
 
     fn mock_actor_ref(name: &str) -> NodeRef {
-        let proc_id = hyperactor::ProcAddr::from_resource_name(
+        let proc_id = hyperactor_mesh::mesh_id::ResourceId::proc_addr_from_name(
             "unix:@test"
                 .parse::<hyperactor::channel::ChannelAddr>()
                 .unwrap(),
             "world",
         );
-        NodeRef::Actor(proc_id.actor_id(name))
+        NodeRef::Actor(proc_id.actor_addr(name))
     }
 
     fn mock_proc_ref(name: &str) -> NodeRef {
-        let proc_id = hyperactor::ProcAddr::from_resource_name(
+        let proc_id = hyperactor_mesh::mesh_id::ResourceId::proc_addr_from_name(
             "unix:@test"
                 .parse::<hyperactor::channel::ChannelAddr>()
                 .unwrap(),
@@ -369,13 +369,17 @@ mod tests {
             properties: NodeProperties::Actor {
                 actor_status: "Running".to_string(),
                 actor_type: "test".to_string(),
+                instance_id: String::new(),
                 messages_processed: 0,
                 created_at: Some(SystemTime::UNIX_EPOCH),
                 last_message_handler: None,
                 total_processing_time_us: 0,
+                queue_depth: 0,
                 flight_recorder: None,
                 is_system: false,
+                inbound_ordering: None,
                 failure_info: None,
+                execution: None,
             },
             children: vec![],
             parent: None,
@@ -602,13 +606,17 @@ mod tests {
             properties: NodeProperties::Actor {
                 actor_status: "stopped:done".to_string(),
                 actor_type: "test".to_string(),
+                instance_id: String::new(),
                 messages_processed: 5,
                 created_at: Some(SystemTime::UNIX_EPOCH),
                 last_message_handler: None,
                 total_processing_time_us: 0,
+                queue_depth: 0,
                 flight_recorder: None,
                 is_system: false,
+                inbound_ordering: None,
                 failure_info: None,
+                execution: None,
             },
             children: vec![],
             parent: None,
@@ -634,13 +642,17 @@ mod tests {
             properties: NodeProperties::Actor {
                 actor_status: "idle".to_string(),
                 actor_type: "hyperactor_mesh::proc_agent::ProcAgent".to_string(),
+                instance_id: String::new(),
                 messages_processed: 10,
                 created_at: Some(SystemTime::UNIX_EPOCH),
                 last_message_handler: None,
                 total_processing_time_us: 0,
+                queue_depth: 0,
                 flight_recorder: None,
                 is_system: true,
+                inbound_ordering: None,
                 failure_info: None,
+                execution: None,
             },
             children: vec![],
             parent: None,
@@ -686,25 +698,28 @@ mod tests {
     fn from_payload_sets_failed_for_actor_with_failure_info() {
         let r = mock_actor_ref("actor1");
         let worker_id = {
-            hyperactor::ProcAddr::from_resource_name(
+            hyperactor_mesh::mesh_id::ResourceId::proc_addr_from_name(
                 "unix:@test"
                     .parse::<hyperactor::channel::ChannelAddr>()
                     .unwrap(),
                 "world",
             )
-            .actor_id("worker")
+            .actor_addr("worker")
         };
         let payload = NodePayload {
             identity: r.clone(),
             properties: NodeProperties::Actor {
                 actor_status: "failed:panic".to_string(),
                 actor_type: "test".to_string(),
+                instance_id: String::new(),
                 messages_processed: 0,
                 created_at: Some(SystemTime::UNIX_EPOCH),
                 last_message_handler: None,
                 total_processing_time_us: 0,
+                queue_depth: 0,
                 flight_recorder: None,
                 is_system: false,
+                inbound_ordering: None,
                 failure_info: Some(FailureInfo {
                     error_message: "GPU memory corruption".to_string(),
                     root_cause_actor: worker_id,
@@ -712,6 +727,7 @@ mod tests {
                     occurred_at: SystemTime::UNIX_EPOCH,
                     is_propagated: false,
                 }),
+                execution: None,
             },
             children: vec![],
             parent: None,
@@ -738,13 +754,17 @@ mod tests {
             properties: NodeProperties::Actor {
                 actor_status: "stopped:done".to_string(),
                 actor_type: "test".to_string(),
+                instance_id: String::new(),
                 messages_processed: 0,
                 created_at: Some(SystemTime::UNIX_EPOCH),
                 last_message_handler: None,
                 total_processing_time_us: 0,
+                queue_depth: 0,
                 flight_recorder: None,
                 is_system: false,
+                inbound_ordering: None,
                 failure_info: None,
+                execution: None,
             },
             children: vec![],
             parent: None,
@@ -775,13 +795,17 @@ mod tests {
             properties: NodeProperties::Actor {
                 actor_status: "failed:panic".to_string(),
                 actor_type: "test".to_string(),
+                instance_id: String::new(),
                 messages_processed: 0,
                 created_at: Some(SystemTime::UNIX_EPOCH),
                 last_message_handler: None,
                 total_processing_time_us: 0,
+                queue_depth: 0,
                 flight_recorder: None,
                 is_system: false,
+                inbound_ordering: None,
                 failure_info: None,
+                execution: None,
             },
             children: vec![],
             parent: None,

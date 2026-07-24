@@ -17,6 +17,14 @@
 //! production than the in-process variant. The `mesh_admin.rs`
 //! white-box tests use `pub(crate)` shortcuts not available here.
 
+use std::io::Read;
+use std::io::Write;
+use std::net::TcpListener;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -36,9 +44,10 @@ use hyperactor_mesh::introspect::NodeRef;
 use hyperactor_mesh::mesh_admin::ResolveReferenceMessageClient;
 use monarch_distributed_telemetry::database_scanner::TableStore;
 use monarch_introspection_snapshot::capture::capture_snapshot;
-use monarch_introspection_snapshot::integration::register_snapshot_schemas;
 use monarch_introspection_snapshot::integration::start_periodic_snapshots;
+use monarch_introspection_snapshot::push::SNAPSHOT_TABLE_NAMES;
 use monarch_introspection_snapshot::push::push_snapshot;
+use monarch_introspection_snapshot::service::HttpPublisher;
 use ndslice::extent;
 use ndslice::view::Ranked;
 
@@ -126,6 +135,69 @@ fn is_null(batch: &RecordBatch, col: &str, row: usize) -> bool {
         .is_null(row)
 }
 
+fn http_request_complete(buf: &[u8]) -> bool {
+    let Some(header_end) = buf.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let headers = String::from_utf8_lossy(&buf[..header_end]);
+    let content_len = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    buf.len() >= header_end + 4 + content_len
+}
+
+fn spawn_snapshot_http_counter() -> (String, Arc<AtomicUsize>, Arc<AtomicBool>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_count = request_count.clone();
+    let thread_stop = stop.clone();
+    let handle = std::thread::spawn(move || {
+        while !thread_stop.load(Ordering::Acquire) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("snapshot HTTP test server failed: {error}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if http_request_complete(&request) {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            thread_count.fetch_add(1, Ordering::AcqRel);
+        }
+    });
+    (format!("http://{}", addr), request_count, stop, handle)
+}
+
 // -- The integration test --
 
 #[tokio::test]
@@ -137,7 +209,7 @@ async fn test_snapshot_sql_queries() -> Result<()> {
 
     // Step 2: Spawn two worker procs, each with one test actor.
     let proc_mesh = host_mesh
-        .spawn(&instance, "worker", extent!(replica = 2), None)
+        .spawn(&instance, "worker", extent!(replica = 2), None, None)
         .await?;
     let actor_mesh = proc_mesh
         .spawn::<SnapshotTestActor, _>(&instance, "test_actor", &())
@@ -148,10 +220,10 @@ async fn test_snapshot_sql_queries() -> Result<()> {
 
     // Capture deterministic fixture-owned IDs via typed refs.
     let proc_0_ref = proc_mesh.get(0).expect("proc at rank 0");
-    let proc_0_id = NodeRef::Proc(proc_0_ref.proc_id().clone()).to_string();
+    let proc_0_id = NodeRef::Proc(proc_0_ref.proc_addr().clone()).to_string();
 
     let actor_0_ref = actor_mesh.get(0).expect("actor at rank 0");
-    let actor_0_id = NodeRef::Actor(actor_0_ref.actor_id().clone()).to_string();
+    let actor_0_id = NodeRef::Actor(actor_0_ref.actor_addr().clone()).to_string();
 
     // Step 4: Build the resolver closure.
     let resolve = |node_ref: &NodeRef| {
@@ -172,11 +244,11 @@ async fn test_snapshot_sql_queries() -> Result<()> {
     let ctx = SessionContext::new();
     register_all(&table_store, &ctx).await?;
 
-    // PS-1: all nine tables registered.
+    // PS-1: all thirteen tables registered.
     assert_eq!(
         table_store.table_names()?.len(),
-        9,
-        "PS-1: all nine tables should be registered"
+        13,
+        "PS-1: all thirteen tables should be registered"
     );
 
     // PS-5: exactly one snapshot row.
@@ -355,6 +427,78 @@ async fn test_snapshot_sql_queries() -> Result<()> {
     assert_eq!(col_str(&d, "node_kind", 3), "root");
     assert_eq!(col_i64(&d, "depth", 3), 3);
 
+    // Query E: IO-7 (live actors carry an `actor_inbound_orderings`
+    // row), IO-4 (snapshot_complete iff skipped == 0), and IO-5
+    // (known_session_count == returned + skipped). Joins
+    // `actor_inbound_orderings` to `ordering_sessions` via the shared
+    // `(snapshot_id, node_id)` key and groups to count returned
+    // sessions, so we can cross-validate the rollup against the
+    // per-session detail in one go.
+    let e = query_batch(
+        &ctx,
+        r#"
+        SELECT io.node_id,
+               io.enabled,
+               io.snapshot_complete,
+               io.skipped_session_count,
+               io.known_session_count,
+               COUNT(s.session_id) AS returned_sessions
+        FROM actor_inbound_orderings io
+        LEFT JOIN ordering_sessions s
+          ON s.snapshot_id = io.snapshot_id
+         AND s.node_id = io.node_id
+        WHERE io.snapshot_id = 'test_snap'
+        GROUP BY io.node_id, io.enabled, io.snapshot_complete,
+                 io.skipped_session_count, io.known_session_count
+    "#,
+    )
+    .await?;
+    assert!(
+        e.num_rows() >= 1,
+        "Query E (IO-7): at least one live actor must surface in actor_inbound_orderings",
+    );
+    for row in 0..e.num_rows() {
+        let snapshot_complete = col_bool(&e, "snapshot_complete", row);
+        let skipped = col_i64(&e, "skipped_session_count", row);
+        let known = col_i64(&e, "known_session_count", row);
+        let returned = col_i64(&e, "returned_sessions", row);
+        assert_eq!(
+            snapshot_complete,
+            skipped == 0,
+            "IO-4: snapshot_complete must equal (skipped_session_count == 0) for {}",
+            col_str(&e, "node_id", row),
+        );
+        assert_eq!(
+            known,
+            returned + skipped,
+            "IO-5: known_session_count must equal returned + skipped for {}",
+            col_str(&e, "node_id", row),
+        );
+    }
+
+    // Query F: every `actor_inbound_orderings` row must FK to a live
+    // `actor_nodes` row in the same snapshot. The presence of a NULL
+    // `actor_type` in this LEFT JOIN indicates an orphan rollup row.
+    let f = query_batch(
+        &ctx,
+        r#"
+        SELECT io.node_id, a.actor_type
+        FROM actor_inbound_orderings io
+        LEFT JOIN actor_nodes a
+          ON a.snapshot_id = io.snapshot_id
+         AND a.node_id = io.node_id
+        WHERE io.snapshot_id = 'test_snap'
+    "#,
+    )
+    .await?;
+    for row in 0..f.num_rows() {
+        assert!(
+            !is_null(&f, "actor_type", row),
+            "Query F: actor_inbound_orderings row for {} has no matching actor_nodes row",
+            col_str(&f, "node_id", row),
+        );
+    }
+
     // Cleanup: shutdown the mesh.
     let mut host_mesh = host_mesh;
     host_mesh.shutdown(&instance).await?;
@@ -370,9 +514,13 @@ async fn test_pt1_rejects_zero_interval() -> Result<()> {
     let instance = cx.actor_instance;
     let host_mesh = HostMesh::local().await?;
     let admin_ref = spawn_admin([&host_mesh], &instance, Some("[::]:0".parse()?), None).await?;
-    let table_store = TableStore::new_empty();
 
-    let err = start_periodic_snapshots(&instance, table_store, admin_ref.clone(), Duration::ZERO);
+    let err = start_periodic_snapshots(
+        &instance,
+        HttpPublisher::new("http://127.0.0.1:1"),
+        admin_ref.clone(),
+        Duration::ZERO,
+    );
     assert!(err.is_err(), "PT-1: zero interval must be rejected");
     assert!(
         err.unwrap_err().to_string().contains("non-zero"),
@@ -392,13 +540,12 @@ async fn test_pt3_immediate_first_capture() -> Result<()> {
     let host_mesh = HostMesh::local().await?;
     let admin_ref = spawn_admin([&host_mesh], &instance, Some("[::]:0".parse()?), None).await?;
 
-    let table_store = TableStore::new_empty();
-    register_snapshot_schemas(&table_store).await?;
+    let (base_url, request_count, stop_server, server) = spawn_snapshot_http_counter();
 
     // Use a long interval so only the initial immediate capture fires.
     start_periodic_snapshots(
         &instance,
-        table_store.clone(),
+        HttpPublisher::new(base_url),
         admin_ref.clone(),
         Duration::from_secs(600),
     )?;
@@ -406,24 +553,23 @@ async fn test_pt3_immediate_first_capture() -> Result<()> {
     // Give the immediate capture time to complete.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let ctx = SessionContext::new();
-    register_all(&table_store, &ctx).await?;
-    let batch = query_batch(&ctx, "SELECT COUNT(*) AS cnt FROM snapshots").await?;
-    let count = col_i64(&batch, "cnt", 0);
+    let count = request_count.load(Ordering::Acquire);
     assert!(
-        count >= 1,
-        "PT-3: at least one capture should fire immediately, got {}",
+        count >= SNAPSHOT_TABLE_NAMES.len(),
+        "PT-3: at least one capture should fire immediately, got {} HTTP requests",
         count,
     );
 
     // Stop the actor and clean up.
-    let actor_id = instance.proc().proc_id().actor_ref("snapshot_capture");
+    let actor_id = instance.proc().proc_addr().actor_addr("snapshot_capture");
     instance
         .proc()
-        .stop_actor(&actor_id, "PT-3 test cleanup".to_string());
+        .stop_actor(actor_id.id(), "PT-3 test cleanup".to_string());
 
     let mut host_mesh = host_mesh;
     host_mesh.shutdown(&instance).await?;
+    stop_server.store(true, Ordering::Release);
+    server.join().unwrap();
     Ok(())
 }
 
@@ -437,13 +583,12 @@ async fn test_pt5_drain_halts_future_captures() -> Result<()> {
     let host_mesh = HostMesh::local().await?;
     let admin_ref = spawn_admin([&host_mesh], &instance, Some("[::]:0".parse()?), None).await?;
 
-    let table_store = TableStore::new_empty();
-    register_snapshot_schemas(&table_store).await?;
+    let (base_url, request_count, stop_server, server) = spawn_snapshot_http_counter();
 
     // Start periodic capture with a short interval.
     start_periodic_snapshots(
         &instance,
-        table_store.clone(),
+        HttpPublisher::new(base_url),
         admin_ref.clone(),
         Duration::from_millis(200),
     )?;
@@ -452,24 +597,19 @@ async fn test_pt5_drain_halts_future_captures() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Verify captures actually ran before stopping.
-    let count_before_stop = {
-        let ctx = SessionContext::new();
-        register_all(&table_store, &ctx).await?;
-        let batch = query_batch(&ctx, "SELECT COUNT(*) AS cnt FROM snapshots").await?;
-        col_i64(&batch, "cnt", 0)
-    };
+    let count_before_stop = request_count.load(Ordering::Acquire);
     assert!(
-        count_before_stop > 0,
-        "PT-5: expected positive snapshot count before stop, got {}",
+        count_before_stop >= SNAPSHOT_TABLE_NAMES.len(),
+        "PT-5: expected positive snapshot HTTP request count before stop, got {}",
         count_before_stop,
     );
 
     // Stop the snapshot actor directly. In production, job teardown
     // stops the proc which stops all actors on it.
-    let actor_id = instance.proc().proc_id().actor_ref("snapshot_capture");
+    let actor_id = instance.proc().proc_addr().actor_addr("snapshot_capture");
     let status_rx = instance
         .proc()
-        .stop_actor(&actor_id, "PT-5 test shutdown".to_string());
+        .stop_actor(actor_id.id(), "PT-5 test shutdown".to_string());
     if let Some(mut rx) = status_rx {
         // Wait for the actor to reach a terminal state.
         while !rx.borrow().is_terminal() {
@@ -480,30 +620,22 @@ async fn test_pt5_drain_halts_future_captures() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Record snapshot count after actor stop.
-    let count_at_shutdown = {
-        let ctx = SessionContext::new();
-        register_all(&table_store, &ctx).await?;
-        let batch = query_batch(&ctx, "SELECT COUNT(*) AS cnt FROM snapshots").await?;
-        col_i64(&batch, "cnt", 0)
-    };
+    let count_at_shutdown = request_count.load(Ordering::Acquire);
 
     // Wait to verify no further captures fire.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let count_after_wait = {
-        let ctx = SessionContext::new();
-        register_all(&table_store, &ctx).await?;
-        let batch = query_batch(&ctx, "SELECT COUNT(*) AS cnt FROM snapshots").await?;
-        col_i64(&batch, "cnt", 0)
-    };
+    let count_after_wait = request_count.load(Ordering::Acquire);
 
     // PT-5: snapshot count must not keep increasing after shutdown.
     assert_eq!(
         count_at_shutdown, count_after_wait,
-        "PT-5: snapshot count should stabilize after shutdown \
+        "PT-5: snapshot HTTP request count should stabilize after shutdown \
          (got {} at shutdown, {} after 2s wait)",
         count_at_shutdown, count_after_wait,
     );
 
+    stop_server.store(true, Ordering::Release);
+    server.join().unwrap();
     Ok(())
 }

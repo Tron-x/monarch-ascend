@@ -8,7 +8,7 @@
 
 //! Durable snapshot bundle export and import.
 //!
-//! A snapshot bundle is a directory containing 9 Arrow IPC files (one
+//! A snapshot bundle is a directory containing 13 Arrow IPC files (one
 //! per table) and a JSON manifest. It represents exactly one snapshot
 //! and is the persistence mechanism for historical TUI debugging.
 //!
@@ -120,6 +120,10 @@ fn counts_from_batches(batches: &[NamedBatch]) -> NodeCounts {
         proc_nodes: row_count("proc_nodes"),
         actor_nodes: row_count("actor_nodes"),
         actor_failures: row_count("actor_failures"),
+        actor_inbound_orderings: row_count("actor_inbound_orderings"),
+        ordering_sessions: row_count("ordering_sessions"),
+        actor_executions: row_count("actor_executions"),
+        active_handlers: row_count("active_handlers"),
         resolution_errors: row_count("resolution_errors"),
     }
 }
@@ -142,6 +146,10 @@ fn counts_from_loaded(loaded: &[(&str, usize)]) -> NodeCounts {
         proc_nodes: row_count("proc_nodes"),
         actor_nodes: row_count("actor_nodes"),
         actor_failures: row_count("actor_failures"),
+        actor_inbound_orderings: row_count("actor_inbound_orderings"),
+        ordering_sessions: row_count("ordering_sessions"),
+        actor_executions: row_count("actor_executions"),
+        active_handlers: row_count("active_handlers"),
         resolution_errors: row_count("resolution_errors"),
     }
 }
@@ -331,11 +339,11 @@ mod tests {
     const ACTOR_TYPE: &str = "test_actor";
 
     fn test_proc_id() -> ProcAddr {
-        ProcAddr::from_resource_name(ChannelAddr::Local(0), PROC_NAME)
+        hyperactor_mesh::mesh_id::ResourceId::proc_addr_from_name(ChannelAddr::Local(0), PROC_NAME)
     }
 
     fn test_host_ref() -> NodeRef {
-        NodeRef::Host(test_proc_id().actor_id(HOST_MESH_AGENT_ACTOR_NAME))
+        NodeRef::Host(test_proc_id().actor_addr(HOST_MESH_AGENT_ACTOR_NAME))
     }
 
     fn test_proc_ref() -> NodeRef {
@@ -343,7 +351,7 @@ mod tests {
     }
 
     fn test_actor_ref() -> NodeRef {
-        NodeRef::Actor(test_proc_id().actor_id(ACTOR_TYPE))
+        NodeRef::Actor(test_proc_id().actor_addr(ACTOR_TYPE))
     }
 
     fn minimal_snapshot(id: &str) -> SnapshotData {
@@ -359,6 +367,10 @@ mod tests {
             proc_nodes: vec![],
             actor_nodes: vec![],
             actor_failures: vec![],
+            actor_inbound_orderings: vec![],
+            ordering_sessions: vec![],
+            actor_executions: vec![],
+            active_handlers: vec![],
             resolution_errors: vec![],
         }
     }
@@ -452,13 +464,19 @@ mod tests {
                 node_id: actor_id,
                 actor_status: "running".to_owned(),
                 actor_type: ACTOR_TYPE.to_owned(),
+                instance_id: String::new(),
                 messages_processed: 42,
                 created_at: Some(900_000),
                 last_message_handler: Some("handle_msg".to_owned()),
                 total_processing_time_us: 5000,
+                queue_depth: 0,
                 is_system: false,
             }],
             actor_failures: vec![],
+            actor_inbound_orderings: vec![],
+            ordering_sessions: vec![],
+            actor_executions: vec![],
+            active_handlers: vec![],
             resolution_errors: vec![],
         }
     }

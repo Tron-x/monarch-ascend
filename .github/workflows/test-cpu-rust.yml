@@ -2,34 +2,33 @@ name: Test CPU Rust
 
 on:
   workflow_call:
-    inputs:
-      python-version:
-        description: 'Python version to test with'
-        type: string
-        default: '3.10'
-      runner:
-        description: 'Linux runner to use for the test'
-        type: string
-        default: 'linux.4xlarge'
-      docker-image:
-        description: 'Docker image to use (default lets test-infra auto-select)'
-        type: string
-        default: 'pytorch/almalinux-builder'
 
 concurrency:
-  group: test-cpu-rust-${{ inputs.runner }}-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
+  group: test-cpu-rust-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   test-cpu-rust:
-    name: Test CPU Rust
+    name: Test CPU Rust (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64
+            runner: linux.4xlarge
+            docker-image: pytorch/almalinux-builder
+            cargo-jobs: 16
+          - name: arm64
+            runner: linux.arm64.m8g.4xlarge
+            docker-image: pytorch/manylinuxaarch64-builder:cuda13.2
+            cargo-jobs: 8
     uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
     with:
       timeout: 120
-      runner: ${{ inputs.runner }}
-      docker-image: ${{ inputs.docker-image }}
+      runner: ${{ matrix.runner }}
+      docker-image: ${{ matrix.docker-image }}
       submodules: recursive
-      upload-artifact: test-results-cpu-rust-${{ github.sha }}
+      upload-artifact: test-results-cpu-rust-${{ matrix.name }}-${{ github.sha }}
       script: |
         # Source common setup functions
         source scripts/common-setup.sh
@@ -48,16 +47,26 @@ jobs:
         install_system_dependencies
 
         # Install PyTorch (needed for ABI compatibility, no GPU required)
-        pip install --pre torch --extra-index-url https://download.pytorch.org/whl/nightly/cu128
+        pip install --pre torch --extra-index-url https://download.pytorch.org/whl/nightly/cu132
 
         # Run CPU-safe Rust tests (no GPU hardware available)
+        echo "=== Runner spec ==="
+        lscpu | grep -E '^(Architecture|Model name|CPU\(s\)):' || true
+        free -h || true
+        echo "=== end runner spec ==="
         echo "Running CPU Rust tests..."
+        # The CI profile is configured in .config/nextest.toml
+        # It includes individual test timeouts and a timeout for the entire test run.
         # Capture the test exit code so stage_test_artifacts still runs on
         # failure (otherwise set -e would exit before any artifacts are
         # uploaded). Exclude crates that require GPU hardware, CUDA libraries,
         # or torch C++ headers (libtorch) not available on CPU-only runners.
         rc=0
-        timeout 12m cargo nextest run --workspace --profile ci \
+        # CI disables the Send/Sync shortcut impls so rustc verifies the
+        # underlying auto-trait bounds structurally.
+        CARGO_BUILD_JOBS=${{ matrix.cargo-jobs }} \
+          RUSTFLAGS="${RUSTFLAGS:-} --cfg hyperactor_verify_auto_traits" \
+          cargo nextest run --locked --workspace --profile ci \
           -E "$(cat .config/nextest-filter.txt)" \
           --exclude monarch_messages \
           --exclude monarch_tensor_worker \

@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#![feature(assert_matches)]
+#![deny(clippy::disallowed_methods)]
 
 // torch-sys-cuda is a link-only dependency on Linux to consolidate NCCL
 // linking for downstream consumers; reference it so the Rust crate does

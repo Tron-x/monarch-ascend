@@ -25,6 +25,7 @@ except ImportError:
 
 from monarch.actor import Actor, endpoint, this_host
 from monarch.rdma import RDMABuffer
+from monarch._src.actor.host_mesh import default_bootstrap_cmd
 
 
 def npu_device(dev_id: int):
@@ -35,7 +36,25 @@ def npu_device(dev_id: int):
         import torch
         import torch_npu  # noqa: F401
         torch.npu.set_device(0)
+        print(
+            f"[bootstrap] visible={os.environ.get('ASCEND_RT_VISIBLE_DEVICES')} "
+            f"hixl_dev={os.environ.get('MONARCH_NPU_DEVICE')} "
+            f"hccl_ports={os.environ.get('HCCL_NPU_SOCKET_PORT_RANGE')}",
+            flush=True,
+        )
     return _bootstrap
+
+
+def npu_bootstrap_command(dev_id: int):
+    # Device visibility must be set before the worker imports torch_npu.
+    return default_bootstrap_cmd().with_env(
+        {
+            "ASCEND_RT_VISIBLE_DEVICES": str(dev_id),
+            "HCCL_NPU_SOCKET_PORT_RANGE": f"{61000 + dev_id * 100}-{61049 + dev_id * 100}",
+            "MONARCH_HIXL_USE_LOCAL_COMM_RES": "1",
+            "MONARCH_NPU_DEVICE": "0",
+        }
+    )
 
 
 class Producer(Actor):
@@ -81,8 +100,16 @@ async def main():
     print("=" * 60)
 
     host = this_host()
-    producer_mesh = host.spawn_procs(per_host={"npus": 1}, bootstrap=npu_device(0))
-    consumer_mesh = host.spawn_procs(per_host={"npus": 1}, bootstrap=npu_device(1))
+    producer_mesh = host.spawn_procs(
+        per_host={"npus": 1},
+        bootstrap=npu_device(0),
+        bootstrap_command=npu_bootstrap_command(0),
+    )
+    consumer_mesh = host.spawn_procs(
+        per_host={"npus": 1},
+        bootstrap=npu_device(1),
+        bootstrap_command=npu_bootstrap_command(1),
+    )
 
     producer = producer_mesh.spawn("producer", Producer)
     consumer = consumer_mesh.spawn("consumer", Consumer)
@@ -112,4 +139,9 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        from monarch._src.actor.actor_mesh import shutdown_context
+
+        shutdown_context().get(timeout=75.0)

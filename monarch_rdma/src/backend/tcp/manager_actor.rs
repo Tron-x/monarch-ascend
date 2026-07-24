@@ -23,10 +23,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use bytes::BytesMut;
 use dashmap::DashMap;
-use hyperactor as reference;
 use hyperactor::Actor;
 use hyperactor::ActorHandle;
+use hyperactor::ActorRef;
 use hyperactor::Context;
+use hyperactor::Endpoint as _;
 use hyperactor::HandleClient;
 use hyperactor::Handler;
 use hyperactor::Instance;
@@ -51,11 +52,12 @@ use tokio_util::sync::CancellationToken;
 use typeuri::Named;
 
 use super::TcpOp;
-use crate::RdmaLocalMemory;
 use crate::RdmaOp;
 use crate::RdmaOpType;
 use crate::RdmaTransportLevel;
 use crate::backend::RdmaBackend;
+use crate::backend::RdmaConfig;
+use crate::local_memory::KeepaliveLocalMemory;
 use crate::rdma_manager_actor::GetTcpActorRefClient;
 use crate::rdma_manager_actor::RdmaManagerActor;
 use crate::rdma_manager_actor::RdmaManagerMessageClient;
@@ -86,7 +88,7 @@ wirevalue::register_type!(TcpDataChunk);
 #[derive(Debug)]
 struct TransferState {
     /// Buffer backing this transfer, provided at construction.
-    local_memory: Arc<dyn RdmaLocalMemory>,
+    local_memory: KeepaliveLocalMemory,
 
     /// Number of chunks received so far.
     chunks_received: usize,
@@ -102,7 +104,7 @@ struct TransferState {
 impl TransferState {
     fn new(
         total_chunks: usize,
-        local_memory: Arc<dyn RdmaLocalMemory>,
+        local_memory: KeepaliveLocalMemory,
         done: OncePortRef<Result<(), String>>,
     ) -> Self {
         Self {
@@ -142,7 +144,7 @@ struct TransferError {
 /// a remote TcpManagerActor.
 #[derive(Debug)]
 struct RegisterTransferLocal {
-    local_memory: Arc<dyn RdmaLocalMemory>,
+    local_memory: KeepaliveLocalMemory,
     total_chunks: usize,
     done: OncePortRef<Result<(), String>>,
     // The transfer ID
@@ -154,7 +156,7 @@ struct RegisterTransferLocal {
 #[derive(Debug)]
 struct ExecuteTransferLocal {
     transfer_id: usize,
-    local_memory: Arc<dyn RdmaLocalMemory>,
+    local_memory: KeepaliveLocalMemory,
     chunk_size: usize,
     dest_addr: ChannelAddr,
 }
@@ -247,7 +249,7 @@ impl TcpManagerActor {
 
     fn register_transfer(
         &mut self,
-        local_memory: Arc<dyn RdmaLocalMemory>,
+        local_memory: KeepaliveLocalMemory,
         total_chunks: usize,
         done: OncePortRef<Result<(), String>>,
     ) -> usize {
@@ -264,7 +266,7 @@ impl TcpManagerActor {
         &mut self,
         cx: &Context<Self>,
         transfer_id: usize,
-        local_memory: Arc<dyn RdmaLocalMemory>,
+        local_memory: KeepaliveLocalMemory,
         chunk_size: usize,
         dest_addr: ChannelAddr,
     ) -> Result<()> {
@@ -303,9 +305,7 @@ impl TcpManagerActor {
                     "tcp_chunk_sender_{}",
                     hyperactor_mesh::shortuuid::ShortUuid::generate()
                 );
-                let (instance, _handle) = proc
-                    .instance(&sender_name)
-                    .expect("failed to create sender instance");
+                let instance = proc.client(&sender_name);
 
                 loop {
                     if cancel.is_cancelled() {
@@ -320,15 +320,15 @@ impl TcpManagerActor {
                     let offset = idx * chunk_size;
                     let len = std::cmp::min(chunk_size, size - offset);
                     let mut buf = BytesMut::zeroed(len);
-                    if let Err(e) = mem.read_at(offset, &mut buf) {
-                        error_port
-                            .send(
-                                &instance,
-                                TransferError {
-                                    message: format!("read_at failed at offset {offset}: {e}"),
-                                },
-                            )
-                            .unwrap();
+                    // SAFETY: the caller is responsible for ensuring that no other
+                    // component writes the target byte range concurrently.
+                    if let Err(e) = unsafe { mem.read_at(offset, &mut buf) } {
+                        error_port.post(
+                            &instance,
+                            TransferError {
+                                message: format!("read_at failed at offset {offset}: {e}"),
+                            },
+                        );
                         return;
                     }
 
@@ -339,16 +339,12 @@ impl TcpManagerActor {
                     };
 
                     if let Err(e) = conn.send(chunk).await {
-                        error_port
-                            .send(
-                                &instance,
-                                TransferError {
-                                    message: format!(
-                                        "failed to send chunk at offset {offset}: {e}"
-                                    ),
-                                },
-                            )
-                            .unwrap();
+                        error_port.post(
+                            &instance,
+                            TransferError {
+                                message: format!("failed to send chunk at offset {offset}: {e}"),
+                            },
+                        );
                         return;
                     }
                 }
@@ -364,8 +360,7 @@ impl TcpManagerActor {
         client: &(impl context::Actor + Send + Sync),
     ) -> Result<ActorHandle<Self>, anyhow::Error> {
         let rdma_handle = RdmaManagerActor::local_handle(client);
-        let tcp_ref: reference::ActorRef<TcpManagerActor> =
-            rdma_handle.get_tcp_actor_ref(client).await?;
+        let tcp_ref = rdma_handle.get_tcp_actor_ref(client).await?;
         tcp_ref
             .downcast_handle(client)
             .ok_or_else(|| anyhow::anyhow!("TcpManagerActor is not in the local process"))
@@ -406,9 +401,7 @@ impl Actor for TcpManagerActor {
             self.receiver_done = Some(done_rx);
 
             tokio::spawn(async move {
-                let (instance, _handle) = proc
-                    .instance(&receiver_name.to_string())
-                    .expect("failed to create receiver instance");
+                let instance = proc.client(&receiver_name.to_string());
 
                 loop {
                     let chunk = tokio::select! {
@@ -417,15 +410,14 @@ impl Actor for TcpManagerActor {
                             Ok(chunk) => chunk,
                             Err(e) => {
                                 error_port
-                                    .send(
+                                    .post(
                                         &instance,
                                         TransferError {
                                             message: format!(
                                                 "parallel channel receive error: {e}"
                                             ),
                                         },
-                                    )
-                                    .unwrap();
+                                    );
                                 break;
                             }
                         },
@@ -443,9 +435,11 @@ impl Actor for TcpManagerActor {
                     };
 
                     let mut write_offset = chunk.offset;
-                    let fragments = chunk.data.into_inner();
+                    let fragments = chunk.data.into_fragments();
                     let write_err = fragments.iter().find_map(|fragment| {
-                        let result = entry.local_memory.write_at(write_offset, fragment);
+                        // SAFETY: the caller is responsible for ensuring that no other
+                        // component reads or writes the target byte range concurrently.
+                        let result = unsafe { entry.local_memory.write_at(write_offset, fragment) };
                         write_offset += fragment.len();
                         result.err()
                     });
@@ -453,15 +447,13 @@ impl Actor for TcpManagerActor {
                         let transfer_id = chunk.transfer_id;
                         drop(entry);
                         let (_, state) = transfers.remove(&transfer_id).unwrap();
-                        result_port
-                            .send(
-                                &instance,
-                                SendTransferResult {
-                                    done: state.done,
-                                    result: Err(e.to_string()),
-                                },
-                            )
-                            .unwrap();
+                        result_port.post(
+                            &instance,
+                            SendTransferResult {
+                                done: state.done,
+                                result: Err(e.to_string()),
+                            },
+                        );
                         continue;
                     }
 
@@ -470,15 +462,13 @@ impl Actor for TcpManagerActor {
                         let transfer_id = chunk.transfer_id;
                         drop(entry);
                         let (_, state) = transfers.remove(&transfer_id).unwrap();
-                        result_port
-                            .send(
-                                &instance,
-                                SendTransferResult {
-                                    done: state.done,
-                                    result: Ok(()),
-                                },
-                            )
-                            .unwrap();
+                        result_port.post(
+                            &instance,
+                            SendTransferResult {
+                                done: state.done,
+                                result: Ok(()),
+                            },
+                        );
                     }
                 }
                 rx.join().await;
@@ -520,7 +510,11 @@ impl TcpManagerMessageHandler for TcpManagerActor {
         };
 
         let bytes = data.into_bytes();
-        if let Err(e) = mem.write_at(offset, &bytes) {
+        // SAFETY: the remote peer that issued this `WriteChunk` had to
+        // register the buffer locally first; its caller is responsible
+        // for ensuring no other component reads or writes the target byte
+        // range concurrently.
+        if let Err(e) = unsafe { mem.write_at(offset, &bytes) } {
             return Ok(Err(e.to_string()));
         }
 
@@ -542,7 +536,11 @@ impl TcpManagerMessageHandler for TcpManagerActor {
         };
 
         let mut buf = BytesMut::zeroed(size);
-        if let Err(e) = mem.read_at(offset, &mut buf) {
+        // SAFETY: the remote peer that issued this `ReadChunk` had to
+        // register the buffer locally first; its caller is responsible
+        // for ensuring no other component writes the target byte range
+        // concurrently.
+        if let Err(e) = unsafe { mem.read_at(offset, &mut buf) } {
             return Ok(Err(e.to_string()));
         }
         Ok(Ok(TcpChunk(Part::from(buf.freeze()))))
@@ -600,7 +598,7 @@ impl Handler<RegisterTransferLocal> for TcpManagerActor {
     ) -> Result<(), anyhow::Error> {
         let transfer_id =
             self.register_transfer(message.local_memory, message.total_chunks, message.done);
-        message.reply.send(cx, transfer_id)?;
+        message.reply.post(cx, transfer_id);
         Ok(())
     }
 }
@@ -629,7 +627,8 @@ impl Handler<SendTransferResult> for TcpManagerActor {
         cx: &Context<Self>,
         message: SendTransferResult,
     ) -> Result<(), anyhow::Error> {
-        Ok(message.done.send(cx, message.result)?)
+        message.done.post(cx, message.result);
+        Ok(())
     }
 }
 
@@ -672,6 +671,15 @@ impl TcpBackend {
         chunk_size: usize,
         deadline: Instant,
     ) -> Result<()> {
+        // A write transfers the whole local buffer into the remote prefix; the
+        // remote buffer may be larger, so its tail is left untouched.
+        if op.local_memory.size() > op.remote_size {
+            anyhow::bail!(
+                "remote buffer size ({}) is smaller than local buffer size ({})",
+                op.remote_size,
+                op.local_memory.size(),
+            );
+        }
         let size = op.local_memory.size();
         let total_chunks = size.div_ceil(chunk_size);
 
@@ -700,7 +708,7 @@ impl TcpBackend {
         .map_err(|_| anyhow::anyhow!("get_channel_address timed out"))??
         .ok_or_else(|| anyhow::anyhow!("remote does not have parallel channels enabled"))?;
 
-        self.0.send(
+        self.0.post(
             cx,
             ExecuteTransferLocal {
                 transfer_id,
@@ -708,7 +716,7 @@ impl TcpBackend {
                 chunk_size,
                 dest_addr,
             },
-        )?;
+        );
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         let result = tokio_timeout(remaining, done_rx.recv())
@@ -727,7 +735,16 @@ impl TcpBackend {
         chunk_size: usize,
         deadline: Instant,
     ) -> Result<()> {
-        let size = op.local_memory.size();
+        // A read transfers the whole remote buffer into the local prefix; the
+        // local buffer may be larger, so its tail is left untouched.
+        if op.remote_size > op.local_memory.size() {
+            anyhow::bail!(
+                "remote buffer size ({}) is larger than local buffer size ({})",
+                op.remote_size,
+                op.local_memory.size(),
+            );
+        }
+        let size = op.remote_size;
         let total_chunks = size.div_ceil(chunk_size);
 
         let (done_handle, done_rx) = hyperactor::mailbox::open_once_port::<Result<(), String>>(cx);
@@ -735,7 +752,7 @@ impl TcpBackend {
 
         let (id_handle, id_rx) = hyperactor::mailbox::open_once_port::<usize>(cx);
 
-        self.0.send(
+        self.0.post(
             cx,
             RegisterTransferLocal {
                 local_memory: op.local_memory.clone(),
@@ -743,7 +760,7 @@ impl TcpBackend {
                 done: done_ref,
                 reply: id_handle,
             },
-        )?;
+        );
 
         let transfer_id = id_rx
             .recv()
@@ -788,6 +805,15 @@ impl TcpBackend {
         chunk_size: usize,
         deadline: Instant,
     ) -> Result<()> {
+        // A write transfers the whole local buffer into the remote prefix; the
+        // remote buffer may be larger, so its tail is left untouched.
+        if op.local_memory.size() > op.remote_size {
+            anyhow::bail!(
+                "remote buffer size ({}) is smaller than local buffer size ({})",
+                op.remote_size,
+                op.local_memory.size(),
+            );
+        }
         let size = op.local_memory.size();
         let mut offset = 0;
 
@@ -800,7 +826,10 @@ impl TcpBackend {
             let len = std::cmp::min(chunk_size, size - offset);
 
             let mut buf = vec![0u8; len];
-            op.local_memory.read_at(offset, &mut buf)?;
+            // SAFETY: `op.local_memory` is the caller's buffer; that
+            // caller is responsible for excluding external writers
+            // while the `write_from_local` operation is in flight.
+            unsafe { op.local_memory.read_at(offset, &mut buf) }?;
             let data = Part::from(Bytes::from(buf));
 
             tokio_timeout(
@@ -827,7 +856,16 @@ impl TcpBackend {
         chunk_size: usize,
         deadline: Instant,
     ) -> Result<()> {
-        let size = op.local_memory.size();
+        // A read transfers the whole remote buffer into the local prefix; the
+        // local buffer may be larger, so its tail is left untouched.
+        if op.remote_size > op.local_memory.size() {
+            anyhow::bail!(
+                "remote buffer size ({}) is larger than local buffer size ({})",
+                op.remote_size,
+                op.local_memory.size(),
+            );
+        }
+        let size = op.remote_size;
         let mut offset = 0;
 
         while offset < size {
@@ -854,7 +892,11 @@ impl TcpBackend {
                 data.len()
             );
 
-            op.local_memory.write_at(offset, &data)?;
+            // SAFETY: `op.local_memory` is the caller's buffer; that
+            // caller is responsible for excluding external readers
+            // and writers while the `read_into_local` operation is in
+            // flight.
+            unsafe { op.local_memory.write_at(offset, &data) }?;
 
             offset += len;
         }
@@ -865,15 +907,50 @@ impl TcpBackend {
 
 #[async_trait]
 impl RdmaBackend for TcpBackend {
+    type RemoteBackendContext = ActorRef<TcpManagerActor>;
     type TransportInfo = ();
+
+    /// TCP is available when fallback is enabled.
+    fn available() -> bool {
+        hyperactor_config::global::get(crate::config::RDMA_ALLOW_TCP_FALLBACK)
+    }
+
+    fn transport_level(&self) -> RdmaTransportLevel {
+        RdmaTransportLevel::Tcp
+    }
+
+    fn transport_info(&self) -> Option<Self::TransportInfo> {
+        None
+    }
+
+    async fn spawn(cx: &(impl context::Actor + Send + Sync), _config: &RdmaConfig) -> Result<Self> {
+        Ok(TcpBackend(cx.spawn(TcpManagerActor::new())))
+    }
+
+    /// TCP needs no per-buffer registration.
+    async fn register_remote_buffer(
+        &self,
+        _cx: &(impl context::Actor + Send + Sync),
+        _remote_buf_id: usize,
+        _local: KeepaliveLocalMemory,
+    ) -> Result<ActorRef<TcpManagerActor>> {
+        Ok(self.0.bind())
+    }
+
+    async fn release_buffer(
+        &self,
+        _cx: &(impl context::Actor + Send + Sync),
+        _remote_buf_id: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// Submit a batch of RDMA operations over TCP.
     ///
-    /// Each operation's remote buffer is resolved to its TCP backend
-    /// context, then executed directly — sending chunked write/read
-    /// messages to the remote [`TcpManagerActor`].
+    /// Each op is executed directly — sending chunked write/read messages
+    /// to the remote [`TcpManagerActor`].
     async fn submit(
-        &mut self,
+        &self,
         cx: &(impl context::Actor + Send + Sync),
         ops: Vec<RdmaOp>,
         timeout: Duration,
@@ -890,12 +967,16 @@ impl RdmaBackend for TcpBackend {
                 anyhow::bail!("tcp submit timed out");
             }
 
-            let (remote_tcp_mgr, remote_buf_id) = op.remote.resolve_tcp()?;
+            let remote_tcp_manager = op
+                .remote
+                .resolve_tcp()
+                .expect("op routed to incompatible backend");
             let tcp_op = TcpOp {
-                op_type: op.op_type.clone(),
+                op_type: op.op_type,
+                remote_buf_id: op.remote.id,
+                remote_size: op.remote.size,
                 local_memory: op.local,
-                remote_tcp_manager: remote_tcp_mgr,
-                remote_buf_id,
+                remote_tcp_manager,
             };
 
             if parallelism > 1 {
@@ -924,14 +1005,6 @@ impl RdmaBackend for TcpBackend {
 
         Ok(())
     }
-
-    fn transport_level(&self) -> RdmaTransportLevel {
-        RdmaTransportLevel::Tcp
-    }
-
-    fn transport_info(&self) -> Option<Self::TransportInfo> {
-        None
-    }
 }
 
 #[cfg(test)]
@@ -953,23 +1026,19 @@ mod tests {
     use crate::RdmaOp;
     use crate::RdmaOpType;
     use crate::backend::RdmaBackend;
-    use crate::local_memory::Keepalive;
     use crate::local_memory::KeepaliveLocalMemory;
-    use crate::local_memory::RdmaLocalMemory;
     use crate::rdma_manager_actor::GetTcpActorRefClient;
     use crate::rdma_manager_actor::RdmaManagerActor;
-
-    impl Keepalive for Box<[u8]> {}
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     struct TcpTestProcEnv {
         proc: Proc,
         rdma_handle: ActorHandle<RdmaManagerActor>,
-        instance: hyperactor::Instance<()>,
+        instance: hyperactor::Client,
         tcp_backend: TcpBackend,
         rdma_remote_buf: crate::RdmaRemoteBuffer,
-        local_memory: Arc<dyn RdmaLocalMemory>,
+        local_memory: KeepaliveLocalMemory,
     }
 
     impl Drop for TcpTestProcEnv {
@@ -997,10 +1066,10 @@ mod tests {
                 ChannelAddr::any(hyperactor::channel::ChannelTransport::Unix),
                 format!("tcp_test_{id}"),
             )?;
-            let (instance, _) = proc.instance("client")?;
+            let instance = proc.client("client");
 
             let rdma_actor = RdmaManagerActor::new(None, Flattrs::default()).await?;
-            let rdma_handle = proc.spawn("rdma_manager", rdma_actor)?;
+            let rdma_handle = proc.spawn(rdma_actor);
 
             let tcp_ref = rdma_handle.get_tcp_actor_ref(&instance).await?;
             let tcp_backend = TcpBackend(
@@ -1030,7 +1099,7 @@ mod tests {
             buffer_size: usize,
         ) -> anyhow::Result<Self> {
             let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let (instance, _) = proc.instance(&format!("client_{id}"))?;
+            let instance = proc.client(&format!("client_{id}"));
 
             let (local_memory, rdma_remote_buf) =
                 Self::alloc_cpu_buffer(&instance, rdma_handle, buffer_size).await?;
@@ -1046,17 +1115,12 @@ mod tests {
         }
 
         async fn alloc_cpu_buffer(
-            instance: &hyperactor::Instance<()>,
+            instance: &hyperactor::Client,
             rdma_handle: &ActorHandle<RdmaManagerActor>,
             buffer_size: usize,
-        ) -> anyhow::Result<(Arc<dyn RdmaLocalMemory>, crate::RdmaRemoteBuffer)> {
+        ) -> anyhow::Result<(KeepaliveLocalMemory, crate::RdmaRemoteBuffer)> {
             let cpu_buf = vec![0u8; buffer_size].into_boxed_slice();
-            let ptr = cpu_buf.as_ptr() as usize;
-            let local_memory: Arc<dyn RdmaLocalMemory> = Arc::new(KeepaliveLocalMemory::new(
-                ptr,
-                buffer_size,
-                Arc::new(cpu_buf),
-            ));
+            let local_memory = KeepaliveLocalMemory::new(Arc::new(cpu_buf));
             let rdma_remote_buf = rdma_handle
                 .request_buffer(instance, local_memory.clone())
                 .await?;
@@ -1101,6 +1165,24 @@ mod tests {
 
     // --- Shared test helpers ---
 
+    /// Test-only wrapper around [`KeepaliveLocalMemory::write_at`].
+    ///
+    /// Every [`TcpTestProcEnv`] owns a distinct CPU buffer that no
+    /// other thread accesses outside of explicit, serialized test
+    /// operations, so the safety obligation of `write_at` is trivially
+    /// satisfied across the whole module.
+    fn test_write(mem: &KeepaliveLocalMemory, offset: usize, src: &[u8]) -> anyhow::Result<()> {
+        // SAFETY: see the function-level comment.
+        unsafe { mem.write_at(offset, src) }
+    }
+
+    /// Test-only wrapper around [`KeepaliveLocalMemory::read_at`]. See
+    /// [`test_write`] for the safety rationale.
+    fn test_read(mem: &KeepaliveLocalMemory, offset: usize, dst: &mut [u8]) -> anyhow::Result<()> {
+        // SAFETY: see the function-level comment.
+        unsafe { mem.read_at(offset, dst) }
+    }
+
     /// Fill envs[0], write to envs[1], verify.
     async fn do_write_test(
         envs: &mut [TcpTestProcEnv],
@@ -1111,7 +1193,7 @@ mod tests {
         for (i, byte) in src.iter_mut().enumerate() {
             *byte = (i % 256) as u8;
         }
-        envs[0].local_memory.write_at(0, &src)?;
+        test_write(&envs[0].local_memory, 0, &src)?;
 
         let remote = envs[1].rdma_remote_buf.clone();
         let env = &mut envs[0];
@@ -1128,7 +1210,7 @@ mod tests {
             .await?;
 
         let mut dst = vec![0u8; buf_size];
-        envs[1].local_memory.read_at(0, &mut dst)?;
+        test_read(&envs[1].local_memory, 0, &mut dst)?;
         for (i, byte) in dst.iter().enumerate() {
             assert_eq!(*byte, (i % 256) as u8, "mismatch at offset {i} after write");
         }
@@ -1145,7 +1227,7 @@ mod tests {
         for (i, byte) in src.iter_mut().enumerate() {
             *byte = ((i * 7 + 3) % 256) as u8;
         }
-        envs[1].local_memory.write_at(0, &src)?;
+        test_write(&envs[1].local_memory, 0, &src)?;
 
         let remote = envs[1].rdma_remote_buf.clone();
         let env = &mut envs[0];
@@ -1162,7 +1244,7 @@ mod tests {
             .await?;
 
         let mut dst = vec![0u8; buf_size];
-        envs[0].local_memory.read_at(0, &mut dst)?;
+        test_read(&envs[0].local_memory, 0, &mut dst)?;
         for (i, byte) in dst.iter().enumerate() {
             assert_eq!(
                 *byte,
@@ -1183,7 +1265,7 @@ mod tests {
         for (i, byte) in src.iter_mut().enumerate() {
             *byte = ((i * 13 + 5) % 256) as u8;
         }
-        envs[0].local_memory.write_at(0, &src)?;
+        test_write(&envs[0].local_memory, 0, &src)?;
 
         let remote = envs[1].rdma_remote_buf.clone();
         let env = &mut envs[0];
@@ -1199,7 +1281,7 @@ mod tests {
             )
             .await?;
 
-        envs[0].local_memory.write_at(0, &vec![0u8; buf_size])?;
+        test_write(&envs[0].local_memory, 0, &vec![0u8; buf_size])?;
 
         let env = &mut envs[0];
         env.tcp_backend
@@ -1215,7 +1297,7 @@ mod tests {
             .await?;
 
         let mut dst = vec![0u8; buf_size];
-        envs[0].local_memory.read_at(0, &mut dst)?;
+        test_read(&envs[0].local_memory, 0, &mut dst)?;
         for (i, byte) in dst.iter().enumerate() {
             assert_eq!(
                 *byte,
@@ -1272,7 +1354,7 @@ mod tests {
         for (i, byte) in src.iter_mut().enumerate() {
             *byte = (i % 251) as u8;
         }
-        envs[0].local_memory.write_at(0, &src)?;
+        test_write(&envs[0].local_memory, 0, &src)?;
 
         let remote = envs[1].rdma_remote_buf.clone();
         let env = &mut envs[0];
@@ -1289,7 +1371,7 @@ mod tests {
             .await?;
 
         let mut dst = vec![0u8; buf_size];
-        envs[1].local_memory.read_at(0, &mut dst)?;
+        test_read(&envs[1].local_memory, 0, &mut dst)?;
         for (i, byte) in dst.iter().enumerate() {
             assert_eq!(*byte, (i % 251) as u8, "mismatch at offset {i}");
         }
@@ -1311,7 +1393,7 @@ mod tests {
         for (i, byte) in src.iter_mut().enumerate() {
             *byte = ((i * 3 + 17) % 256) as u8;
         }
-        envs[1].local_memory.write_at(0, &src)?;
+        test_write(&envs[1].local_memory, 0, &src)?;
 
         let remote = envs[1].rdma_remote_buf.clone();
         let env = &mut envs[0];
@@ -1328,7 +1410,7 @@ mod tests {
             .await?;
 
         let mut dst = vec![0u8; buf_size];
-        envs[0].local_memory.read_at(0, &mut dst)?;
+        test_read(&envs[0].local_memory, 0, &mut dst)?;
         for (i, byte) in dst.iter().enumerate() {
             assert_eq!(*byte, ((i * 3 + 17) % 256) as u8, "mismatch at offset {i}");
         }
@@ -1350,7 +1432,7 @@ mod tests {
         for (i, byte) in src.iter_mut().enumerate() {
             *byte = ((i * 41 + 7) % 256) as u8;
         }
-        envs[0].local_memory.write_at(0, &src)?;
+        test_write(&envs[0].local_memory, 0, &src)?;
 
         let remote = envs[1].rdma_remote_buf.clone();
         let env = &mut envs[0];
@@ -1366,7 +1448,7 @@ mod tests {
             )
             .await?;
 
-        envs[0].local_memory.write_at(0, &vec![0u8; buf_size])?;
+        test_write(&envs[0].local_memory, 0, &vec![0u8; buf_size])?;
 
         let env = &mut envs[0];
         env.tcp_backend
@@ -1382,7 +1464,7 @@ mod tests {
             .await?;
 
         let mut dst = vec![0u8; buf_size];
-        envs[0].local_memory.read_at(0, &mut dst)?;
+        test_read(&envs[0].local_memory, 0, &mut dst)?;
         for (i, byte) in dst.iter().enumerate() {
             assert_eq!(
                 *byte,
@@ -1403,10 +1485,12 @@ mod tests {
         let envs = setup_tcp_env(64).await?;
 
         for (i, env) in envs.iter().enumerate() {
-            let (tcp_ref, id) = env.rdma_remote_buf.resolve_tcp()?;
-            assert_eq!(id, env.rdma_remote_buf.id, "buf id mismatch for env {i}");
+            let tcp_ref = env
+                .rdma_remote_buf
+                .resolve_tcp()
+                .unwrap_or_else(|| panic!("tcp backend not found for env {i}"));
             let expected: hyperactor::ActorRef<TcpManagerActor> = env.tcp_backend.bind();
-            assert_eq!(tcp_ref.actor_id(), expected.actor_id());
+            assert_eq!(tcp_ref.actor_addr(), expected.actor_addr());
         }
 
         Ok(())
@@ -1425,7 +1509,7 @@ mod tests {
         for (i, byte) in src.iter_mut().enumerate() {
             *byte = (i % 256) as u8;
         }
-        envs[0].local_memory.write_at(0, &src)?;
+        test_write(&envs[0].local_memory, 0, &src)?;
 
         // Normal write should succeed.
         let remote = envs[1].rdma_remote_buf.clone();
@@ -1539,23 +1623,6 @@ mod tests {
         do_round_trip_test(&mut envs, 4096, Duration::from_secs(10)).await
     }
 
-    /// When TCP fallback is disabled and ibverbs is unavailable,
-    /// RdmaManagerActor::new returns an error.
-    #[timed_test::async_timed_test(timeout_secs = 30)]
-    async fn test_tcp_fallback_disabled_fails() -> anyhow::Result<()> {
-        let config = hyperactor_config::global::lock();
-        let _guard = config.override_key(crate::config::RDMA_ALLOW_TCP_FALLBACK, false);
-
-        let result = RdmaManagerActor::new(None, Flattrs::default()).await;
-        if crate::ibverbs_supported() {
-            assert!(result.is_ok());
-        } else {
-            assert!(result.is_err());
-        }
-
-        Ok(())
-    }
-
     // --- Multi-GPU TCP fallback tests ---
 
     use crate::backend::cuda_test_utils::CudaAllocator;
@@ -1569,10 +1636,10 @@ mod tests {
                 ChannelAddr::any(hyperactor::channel::ChannelTransport::Unix),
                 format!("tcp_gpu_test_{id}"),
             )?;
-            let (instance, _) = proc.instance("client")?;
+            let instance = proc.client("client");
 
             let rdma_actor = RdmaManagerActor::new(None, Flattrs::default()).await?;
-            let rdma_handle = proc.spawn("rdma_manager", rdma_actor)?;
+            let rdma_handle = proc.spawn(rdma_actor);
 
             let tcp_ref = rdma_handle.get_tcp_actor_ref(&instance).await?;
             let tcp_backend = TcpBackend(
@@ -1581,12 +1648,8 @@ mod tests {
                     .ok_or_else(|| anyhow::anyhow!("tcp actor not local"))?,
             );
 
-            let alloc = CudaAllocator::get().allocate(device, buffer_size);
-            let local_memory: Arc<dyn RdmaLocalMemory> = Arc::new(KeepaliveLocalMemory::new(
-                alloc.ptr(),
-                buffer_size,
-                Arc::new(alloc),
-            ));
+            let alloc = CudaAllocator::get().allocate(device, buffer_size, buffer_size);
+            let local_memory = KeepaliveLocalMemory::new(Arc::new(alloc));
             let rdma_remote_buf = rdma_handle
                 .request_buffer(&instance, local_memory.clone())
                 .await?;
@@ -1676,7 +1739,7 @@ mod tests {
         for (i, byte) in src.iter_mut().enumerate() {
             *byte = (i % 256) as u8;
         }
-        envs[0].local_memory.write_at(0, &src)?;
+        test_write(&envs[0].local_memory, 0, &src)?;
         let remote = envs[1].rdma_remote_buf.clone();
         let env = &mut envs[0];
         env.tcp_backend
@@ -1787,18 +1850,18 @@ mod tests {
         for (i, byte) in src0.iter_mut().enumerate() {
             *byte = (i % 256) as u8;
         }
-        envs[0].local_memory.write_at(0, &src0)?;
+        test_write(&envs[0].local_memory, 0, &src0)?;
         let mut src2 = vec![0u8; buf_size];
         for (i, byte) in src2.iter_mut().enumerate() {
             *byte = ((i * 3 + 7) % 256) as u8;
         }
-        envs[2].local_memory.write_at(0, &src2)?;
+        test_write(&envs[2].local_memory, 0, &src2)?;
 
         // Pair 1: envs[0] -> envs[1], Pair 2: envs[2] -> envs[3].
         let remote_1 = envs[1].rdma_remote_buf.clone();
         let remote_3 = envs[3].rdma_remote_buf.clone();
-        let mut h0 = envs[0].tcp_backend.clone();
-        let mut h2 = envs[2].tcp_backend.clone();
+        let h0 = envs[0].tcp_backend.clone();
+        let h2 = envs[2].tcp_backend.clone();
         let inst_0 = &envs[0].instance;
         let inst_2 = &envs[2].instance;
         let mem_0 = envs[0].local_memory.clone();
@@ -1827,12 +1890,12 @@ mod tests {
         r2?;
 
         let mut dst1 = vec![0u8; buf_size];
-        envs[1].local_memory.read_at(0, &mut dst1)?;
+        test_read(&envs[1].local_memory, 0, &mut dst1)?;
         for (i, byte) in dst1.iter().enumerate() {
             assert_eq!(*byte, (i % 256) as u8, "pair 1 mismatch at offset {i}");
         }
         let mut dst3 = vec![0u8; buf_size];
-        envs[3].local_memory.read_at(0, &mut dst3)?;
+        test_read(&envs[3].local_memory, 0, &mut dst3)?;
         for (i, byte) in dst3.iter().enumerate() {
             assert_eq!(
                 *byte,
@@ -1860,18 +1923,18 @@ mod tests {
         for (i, byte) in src1.iter_mut().enumerate() {
             *byte = ((i * 11 + 3) % 256) as u8;
         }
-        envs[1].local_memory.write_at(0, &src1)?;
+        test_write(&envs[1].local_memory, 0, &src1)?;
         let mut src3 = vec![0u8; buf_size];
         for (i, byte) in src3.iter_mut().enumerate() {
             *byte = ((i * 5 + 13) % 256) as u8;
         }
-        envs[3].local_memory.write_at(0, &src3)?;
+        test_write(&envs[3].local_memory, 0, &src3)?;
 
         // Pair 1: envs[0] <- envs[1], Pair 2: envs[2] <- envs[3].
         let remote_1 = envs[1].rdma_remote_buf.clone();
         let remote_3 = envs[3].rdma_remote_buf.clone();
-        let mut h0 = envs[0].tcp_backend.clone();
-        let mut h2 = envs[2].tcp_backend.clone();
+        let h0 = envs[0].tcp_backend.clone();
+        let h2 = envs[2].tcp_backend.clone();
         let inst_0 = &envs[0].instance;
         let inst_2 = &envs[2].instance;
         let mem_0 = envs[0].local_memory.clone();
@@ -1900,7 +1963,7 @@ mod tests {
         r2?;
 
         let mut dst0 = vec![0u8; buf_size];
-        envs[0].local_memory.read_at(0, &mut dst0)?;
+        test_read(&envs[0].local_memory, 0, &mut dst0)?;
         for (i, byte) in dst0.iter().enumerate() {
             assert_eq!(
                 *byte,
@@ -1909,7 +1972,7 @@ mod tests {
             );
         }
         let mut dst2 = vec![0u8; buf_size];
-        envs[2].local_memory.read_at(0, &mut dst2)?;
+        test_read(&envs[2].local_memory, 0, &mut dst2)?;
         for (i, byte) in dst2.iter().enumerate() {
             assert_eq!(
                 *byte,
@@ -1937,18 +2000,18 @@ mod tests {
         for (i, byte) in src0.iter_mut().enumerate() {
             *byte = (i % 256) as u8;
         }
-        envs[0].local_memory.write_at(0, &src0)?;
+        test_write(&envs[0].local_memory, 0, &src0)?;
         let mut src3 = vec![0u8; buf_size];
         for (i, byte) in src3.iter_mut().enumerate() {
             *byte = ((i * 7 + 13) % 256) as u8;
         }
-        envs[3].local_memory.write_at(0, &src3)?;
+        test_write(&envs[3].local_memory, 0, &src3)?;
 
         // Write envs[0] -> envs[1], read envs[2] <- envs[3] concurrently.
         let remote_1 = envs[1].rdma_remote_buf.clone();
         let remote_3 = envs[3].rdma_remote_buf.clone();
-        let mut h0 = envs[0].tcp_backend.clone();
-        let mut h2 = envs[2].tcp_backend.clone();
+        let h0 = envs[0].tcp_backend.clone();
+        let h2 = envs[2].tcp_backend.clone();
         let inst_0 = &envs[0].instance;
         let inst_2 = &envs[2].instance;
         let mem_0 = envs[0].local_memory.clone();
@@ -1977,12 +2040,12 @@ mod tests {
         read_result?;
 
         let mut dst1 = vec![0u8; buf_size];
-        envs[1].local_memory.read_at(0, &mut dst1)?;
+        test_read(&envs[1].local_memory, 0, &mut dst1)?;
         for (i, byte) in dst1.iter().enumerate() {
             assert_eq!(*byte, (i % 256) as u8, "write mismatch at offset {i}");
         }
         let mut dst2 = vec![0u8; buf_size];
-        envs[2].local_memory.read_at(0, &mut dst2)?;
+        test_read(&envs[2].local_memory, 0, &mut dst2)?;
         for (i, byte) in dst2.iter().enumerate() {
             assert_eq!(
                 *byte,

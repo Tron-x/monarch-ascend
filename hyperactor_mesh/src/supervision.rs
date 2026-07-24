@@ -23,9 +23,30 @@
 //! Python-spawned actor ends up with a mesh base-name string to
 //! supply — lives in `monarch_hyperactor/src/actor.rs`
 //! (`PythonActorParams.mesh_base_name`).
+//!
+//! ## Mesh failure controller-attribution invariants (MFCA-*)
+//!
+//! `MeshFailure.reporting_controller` names the mesh controller that
+//! observed and reported the failure, distinct from `event.actor_id`
+//! (the actor the event concerns).
+//!
+//! - **MFCA-1 (complete controller reports):** every `MeshFailure` a
+//!   controller constructs stamps `reporting_controller =
+//!   Some(controller_id)`; `send_state_change` is the sole controller-to-owner
+//!   failure post and stamps before posting.
+//! - **MFCA-2 (same identity):** the stamped id is
+//!   `cx.instance().self_addr().id()`, which equals the id a consumer reads
+//!   from the mesh's controller ref (`ActorMesh::controller`, or the proc-mesh
+//!   controller).
+//! - **MFCA-3 (subject/source separation):** `event.actor_id` (the event
+//!   subject/root cause) and `reporting_controller` (the reporter) are separate
+//!   roles; their values may coincide on a controller-originated event, but
+//!   neither is overloaded to mean the other.
+//! - **MFCA-4 (non-controller absence):** `None` is reserved for construction
+//!   paths with no reporting mesh controller; such a failure carries no
+//!   controller attribution.
 
-use hyperactor::Bind;
-use hyperactor::Unbind;
+use hyperactor::ActorId;
 use hyperactor::actor::ActorErrorKind;
 use hyperactor::actor::ActorStatus;
 use hyperactor::context;
@@ -36,7 +57,7 @@ use typeuri::Named;
 
 /// Message about a supervision failure on a mesh of actors instead of a single
 /// actor.
-#[derive(Clone, Debug, Serialize, Deserialize, Named, PartialEq, Bind, Unbind)]
+#[derive(Clone, Debug, Serialize, Deserialize, Named, PartialEq)]
 pub struct MeshFailure {
     /// Mesh name carried by the `MeshFailure` construction site,
     /// when locally available. On the direct actor-handled path
@@ -49,6 +70,12 @@ pub struct MeshFailure {
     /// The set of crashed ranks in the mesh. Empty means the event
     /// applies to the whole mesh (e.g. mesh stop, controller timeout).
     pub crashed_ranks: Vec<usize>,
+    /// Identity of the mesh controller that reported this failure, when
+    /// one did (MFCA-3, MFCA-4). A separate role from `event.actor_id`
+    /// (the event subject); the two may hold the same `ActorId` on a
+    /// controller-originated event. `None` on construction paths with no
+    /// reporting controller, which carry no controller attribution.
+    pub reporting_controller: Option<ActorId>,
 }
 wirevalue::register_type!(MeshFailure);
 
@@ -63,9 +90,14 @@ impl MeshFailure {
     /// it to the next owner.
     pub fn default_handler(&self, cx: &impl context::Actor) -> Result<(), anyhow::Error> {
         // If an actor spawned by this one fails, we can't handle it. We fail
-        // ourselves with a chained error and bubble up to the next owner.
+        // ourselves with a chained error and bubble up to the next owner. This
+        // converts the mesh failure into a supervision event, keeping only
+        // `event`; the mesh-level fields (`actor_mesh_name`, `crashed_ranks`,
+        // `reporting_controller`) are dropped and the next controller
+        // re-attributes (MFCA-1). Only a direct clone/re-post of a `MeshFailure`
+        // preserves `reporting_controller`; this conversion is not one.
         let err = ActorErrorKind::UnhandledSupervisionEvent(Box::new(ActorSupervisionEvent::new(
-            cx.instance().self_id().clone(),
+            cx.instance().self_addr().clone(),
             None,
             ActorStatus::Failed(ActorErrorKind::UnhandledSupervisionEvent(Box::new(
                 self.event.clone(),
@@ -125,11 +157,12 @@ mod tests {
     use hyperactor::channel::ChannelAddr;
 
     use super::*;
+    use crate::mesh_id::ResourceId;
 
     fn test_event(name: &str, display_name: Option<String>) -> ActorSupervisionEvent {
-        let proc_id = hyperactor::ProcAddr::from_resource_name(ChannelAddr::Local(0), "test_proc");
+        let proc_id = ResourceId::proc_addr_from_name(ChannelAddr::Local(0), "test_proc");
         ActorSupervisionEvent::new(
-            proc_id.actor_id(name),
+            proc_id.actor_addr(name),
             display_name,
             ActorStatus::Failed(ActorErrorKind::Generic("boom".to_string())),
             None,
@@ -145,6 +178,7 @@ mod tests {
             actor_mesh_name: Some("training".to_string()),
             event: test_event("actor_a", None),
             crashed_ranks: vec![],
+            reporting_controller: None,
         };
         let rendered = format!("{}", failure);
         assert!(
@@ -162,6 +196,7 @@ mod tests {
             actor_mesh_name: None,
             event: test_event("actor_a", None),
             crashed_ranks: vec![],
+            reporting_controller: None,
         };
         let rendered = format!("{}", failure);
         assert!(
@@ -183,6 +218,7 @@ mod tests {
                 Some("instance0.<my_module.Philosopher training>".to_string()),
             ),
             crashed_ranks: vec![],
+            reporting_controller: None,
         };
         let rendered = format!("{}", failure);
         assert!(
@@ -200,10 +236,9 @@ mod tests {
     // (`hyperactor_mesh/src/global_context.rs:278`): display_name =
     // None, actor_status = generic_failure("message not delivered: ...").
     fn undeliverable_synthesized_event() -> ActorSupervisionEvent {
-        let proc_id =
-            hyperactor::ProcAddr::from_resource_name(ChannelAddr::Local(0), "worker_proc");
+        let proc_id = ResourceId::proc_addr_from_name(ChannelAddr::Local(0), "worker_proc");
         ActorSupervisionEvent::new(
-            proc_id.actor_id("dead_actor"),
+            proc_id.actor_addr("dead_actor"),
             None, // synthesized site has no PythonActor context; display_name stays None
             ActorStatus::generic_failure(
                 "message not delivered: undeliverable message error: ... \
@@ -232,11 +267,13 @@ mod tests {
             actor_mesh_name: None,
             event: undeliverable_synthesized_event(),
             crashed_ranks: vec![],
+            reporting_controller: None,
         };
         let with_mesh_name = MeshFailure {
             actor_mesh_name: Some("training".to_string()),
             event: undeliverable_synthesized_event(),
             crashed_ranks: vec![],
+            reporting_controller: None,
         };
         let expected_without = "failure with event: Supervision event: \
                                 actor worker_proc@inproc://0,dead_actor failed:\n  \
@@ -276,10 +313,9 @@ mod tests {
     #[test]
     fn proof_direct_actor_handled_panic() {
         let panicked_event = {
-            let proc_id =
-                hyperactor::ProcAddr::from_resource_name(ChannelAddr::Local(0), "worker_proc");
+            let proc_id = ResourceId::proc_addr_from_name(ChannelAddr::Local(0), "worker_proc");
             ActorSupervisionEvent::new(
-                proc_id.actor_id("philosopher_1"),
+                proc_id.actor_addr("philosopher_1"),
                 // `Proc::stop_actor` populates this via
                 // `actor.display_name()` on a PythonActor — which
                 // returns the Python-class-bearing `str(PyInstance)`.
@@ -294,11 +330,13 @@ mod tests {
             actor_mesh_name: None,
             event: panicked_event.clone(),
             crashed_ranks: vec![],
+            reporting_controller: None,
         };
         let with_mesh_name = MeshFailure {
             actor_mesh_name: Some("training".to_string()),
             event: panicked_event,
             crashed_ranks: vec![],
+            reporting_controller: None,
         };
         let expected_without = "failure with event: Supervision event: actor \
                                 instance0.<monarch_examples.dining.Philosopher \
@@ -325,10 +363,9 @@ mod tests {
     #[test]
     fn proof_controller_unreachable() {
         let controller_timeout_event = {
-            let proc_id =
-                hyperactor::ProcAddr::from_resource_name(ChannelAddr::Local(0), "controller_proc");
+            let proc_id = ResourceId::proc_addr_from_name(ChannelAddr::Local(0), "controller_proc");
             ActorSupervisionEvent::new(
-                proc_id.actor_id("training_controller"),
+                proc_id.actor_addr("training_controller"),
                 None,
                 ActorStatus::generic_failure(
                     "timed out reaching controller ... Assuming controller's proc is dead"
@@ -341,6 +378,7 @@ mod tests {
             actor_mesh_name: Some("training".to_string()),
             event: controller_timeout_event,
             crashed_ranks: vec![],
+            reporting_controller: None,
         };
         let expected = "failure on mesh \"training\" with event: \
                         Supervision event: actor \
@@ -349,5 +387,56 @@ mod tests {
                         timed out reaching controller ... Assuming \
                         controller's proc is dead";
         assert_eq!(format!("{}", failure), expected);
+    }
+
+    // Distinct actor id for use as a controller identity or an event subject.
+    fn mk_actor_id(proc: &str, name: &str) -> ActorId {
+        ResourceId::proc_addr_from_name(ChannelAddr::Local(0), proc)
+            .actor_addr(name)
+            .id()
+            .clone()
+    }
+
+    // MFCA-4 + wire format: `reporting_controller` round-trips through bincode
+    // for both `Some` and `None`.
+    #[test]
+    fn reporting_controller_serde_round_trips() {
+        for reporting_controller in [Some(mk_actor_id("ctrl_proc", "controller")), None] {
+            let failure = MeshFailure {
+                actor_mesh_name: Some("training".to_string()),
+                event: test_event("actor_a", None),
+                crashed_ranks: vec![0],
+                reporting_controller: reporting_controller.clone(),
+            };
+            let bytes = bincode::serde::encode_to_vec(&failure, bincode::config::legacy()).unwrap();
+            let (decoded, _): (MeshFailure, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).unwrap();
+            assert_eq!(decoded, failure);
+            assert_eq!(decoded.reporting_controller, reporting_controller);
+        }
+    }
+
+    // MFCA-3: the reporter and the event subject are separate roles carried
+    // independently. Here they hold different ids (a ProcAgent subject, a
+    // distinct controller reporter); on a controller-originated event they may
+    // instead hold the same id.
+    #[test]
+    fn reporting_controller_and_event_subject_are_independent() {
+        let controller = mk_actor_id("ctrl_proc", "controller");
+        let subject = ResourceId::proc_addr_from_name(ChannelAddr::Local(0), "agent_proc")
+            .actor_addr("proc_agent");
+        let failure = MeshFailure {
+            actor_mesh_name: Some("training".to_string()),
+            event: ActorSupervisionEvent::new(
+                subject.clone(),
+                None,
+                ActorStatus::Failed(ActorErrorKind::Generic("boom".to_string())),
+                None,
+            ),
+            crashed_ranks: Vec::new(),
+            reporting_controller: Some(controller.clone()),
+        };
+        assert_eq!(failure.reporting_controller, Some(controller));
+        assert_eq!(failure.event.actor_id, subject);
     }
 }

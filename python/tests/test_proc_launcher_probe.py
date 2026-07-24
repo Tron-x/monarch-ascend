@@ -113,7 +113,7 @@ async def test_port_receives_result() -> None:
     # be (args_tuple, kwargs_dict) format
     args = ("test_tag",)
     kwargs = {}
-    pickling_state = pickle((args, kwargs), allow_pending_pickles=False)
+    pickling_state = pickle((args, kwargs))
 
     # Call the Rust probe and await the result
     report = await probe_exit_port_via_mesh(
@@ -172,7 +172,7 @@ async def test_port_receives_exception() -> None:
     # be (args_tuple, kwargs_dict) format
     args = ("test_tag",)
     kwargs = {}
-    pickling_state = pickle((args, kwargs), allow_pending_pickles=False)
+    pickling_state = pickle((args, kwargs))
 
     # Call the Rust probe and await the result
     report = await probe_exit_port_via_mesh(

@@ -7,6 +7,7 @@
  */
 
 #![allow(unsafe_op_in_unsafe_fn)]
+#![deny(clippy::disallowed_methods)]
 
 #[cfg(any(feature = "tensor_engine", feature = "ascend_engine"))]
 mod client;
@@ -23,7 +24,6 @@ mod tensor_worker;
 mod blocking;
 #[cfg(target_os = "linux")]
 mod chunked_fuse;
-mod fast_pack;
 mod panic;
 #[cfg(target_os = "linux")]
 mod readonly_fuse;
@@ -77,8 +77,7 @@ pub fn mod_init(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
 
     monarch_hyperactor::runtime::initialize(module.py())?;
-    let runtime = monarch_hyperactor::runtime::get_tokio_runtime();
-    ::hyperactor::initialize(runtime.handle().clone());
+    ::hyperactor::initialize(monarch_hyperactor::runtime::get_tokio_runtime());
     monarch_hyperactor::buffers::register_python_bindings(&get_or_add_new_module(
         module,
         "monarch_hyperactor.buffers",
@@ -131,7 +130,14 @@ pub fn mod_init(module: &Bound<'_, PyModule>) -> PyResult<()> {
             "monarch_extension.mesh_controller",
         )?)?;
     }
-    #[cfg(any(feature = "tensor_engine_gpu", feature = "ascend_engine"))]
+    // rdma registers under the OSS slim wheel's `rdma` feature or, for internal
+    // (buck) builds, transitively via `tensor_engine_gpu`. Ascend provides its
+    // independent HiXL-backed implementation under `ascend_engine`.
+    #[cfg(any(
+        feature = "rdma",
+        feature = "tensor_engine_gpu",
+        feature = "ascend_engine"
+    ))]
     {
         monarch_rdma_extension::register_python_bindings(&get_or_add_new_module(module, "rdma")?)?;
     }
@@ -233,11 +239,6 @@ pub fn mod_init(module: &Bound<'_, PyModule>) -> PyResult<()> {
     crate::blocking::register_python_bindings(&get_or_add_new_module(
         module,
         "monarch_extension.blocking",
-    )?)?;
-
-    crate::fast_pack::register_python_bindings(&get_or_add_new_module(
-        module,
-        "monarch_extension.fast_pack",
     )?)?;
 
     #[cfg(target_os = "linux")]

@@ -35,6 +35,9 @@ import sys
 # HCCS requires 2MB-aligned device memory — use alloc_aligned_tensor().
 # Set MONARCH_HIXL_TRANSPORT=roce to force RoCE if HCCS is unavailable.
 os.environ["PYTHONPATH"] = os.pathsep.join(sys.path)
+# Exercise the deployed CANN 9.1 AICPU kernel and avoid legacy HCCL port
+# contention between the two local worker processes.
+os.environ.setdefault("MONARCH_HIXL_USE_LOCAL_COMM_RES", "1")
 
 _hixl_lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build")
 if os.path.isdir(_hixl_lib_dir):
@@ -57,6 +60,7 @@ except ImportError:
     sys.exit(1)
 
 from monarch.actor import Actor, endpoint, this_host
+from monarch._src.actor.host_mesh import default_bootstrap_cmd
 from monarch._src.rdma.xdma import XDMABuffer as RDMABuffer
 from monarch._src.rdma.xdma import alloc_aligned_tensor
 
@@ -75,6 +79,16 @@ def npu_device(dev_id: int):
         import torch_npu  # noqa: F401
         torch.npu.set_device(0)
     return _bootstrap
+
+
+def npu_bootstrap_command(dev_id: int):
+    return default_bootstrap_cmd().with_env(
+        {
+            "ASCEND_RT_VISIBLE_DEVICES": str(dev_id),
+            "MONARCH_HIXL_USE_LOCAL_COMM_RES": "1",
+            "MONARCH_NPU_DEVICE": "0",
+        }
+    )
 
 
 @dataclass
@@ -106,6 +120,13 @@ class TrajectoryQueue(Actor):
     @endpoint
     async def get(self) -> TrajectorySlice:
         return await self.queue.get()
+
+    @endpoint
+    async def get_timeout(self, timeout: float) -> Optional[TrajectorySlice]:
+        try:
+            return await asyncio.wait_for(self.queue.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
 
 
 class ReplayBuffer(Actor):
@@ -146,8 +167,6 @@ class Scorer(Actor):
             nn.Tanh(),
             nn.Linear(8, 1),
         ).to(DEVICE)
-        self.running = False
-
     async def _score_slice(self, slice: TrajectorySlice) -> None:
         s = slice.state.to(DEVICE).unsqueeze(0).repeat(G, 1)
         a = slice.actions.to(DEVICE).float().unsqueeze(-1)
@@ -163,28 +182,9 @@ class Scorer(Actor):
         await self.replay_buffer.put.call(scored)
 
     @endpoint
-    async def run(self) -> None:
-        if self.running:
-            return
-        self.running = True
-        try:
-            while self.running:
-                try:
-                    slice_ = await asyncio.wait_for(
-                        self.trajectory_queue.get.call_one(),
-                        timeout=10.0,
-                    )
-                    await self._score_slice(slice_)
-                except asyncio.TimeoutError:
-                    continue
-        except Exception as e:
-            print(f"Scorer event loop error: {e}")
-        finally:
-            self.running = False
-
-    @endpoint
-    async def stop_scoring(self) -> None:
-        self.running = False
+    async def score_one(self) -> None:
+        slice_ = await self.trajectory_queue.get.call_one()
+        await self._score_slice(slice_)
 
 
 WEIGHT_BUF_SIZE = 2 * 1024 * 1024  # 2MB — HCCS requires 2MB-aligned buffers
@@ -298,11 +298,13 @@ class Learner(Actor):
         return loss.detach()
 
     @endpoint
-    async def step(self) -> torch.Tensor:
+    async def update_generators(self) -> None:
         if self.generators:
             self.refresh_weights()
             await self.generators.update.call(self.policy_version)
 
+    @endpoint
+    async def step(self) -> torch.Tensor:
         slices = await self.replay_buffer.sample_from.call_one(self.batch_size)
         raw_states = torch.stack([s.state for s in slices])
         actions = torch.cat([s.actions for s in slices])
@@ -405,43 +407,64 @@ async def main():
     # Two meshes, each on a different physical NPU.
     # npu_device(N) sets ASCEND_RT_VISIBLE_DEVICES=N so each process
     # only sees one NPU card as logical device 0.
-    learner_mesh = this_host().spawn_procs(per_host={"npus": 1}, bootstrap=npu_device(0))
-    gen_mesh = this_host().spawn_procs(per_host={"npus": 1}, bootstrap=npu_device(1))
+    learner_mesh = this_host().spawn_procs(
+        per_host={"npus": 1},
+        bootstrap=npu_device(0),
+        bootstrap_command=npu_bootstrap_command(0),
+    )
+    gen_mesh = this_host().spawn_procs(
+        per_host={"npus": 1},
+        bootstrap=npu_device(1),
+        bootstrap_command=npu_bootstrap_command(1),
+    )
 
-    print("[1/6] Spawning actors on learner_mesh (NPU 0)...")
+    print("[1/6] Spawning actors on learner_mesh (NPU 0)...", flush=True)
     traj_q = learner_mesh.spawn("traj", TrajectoryQueue)
     replay_buf = learner_mesh.spawn("rb", ReplayBuffer)
     learner = learner_mesh.spawn("learner", Learner, replay_buf)
     scorer = learner_mesh.spawn("scorer", Scorer, traj_q, replay_buf)
 
-    print("[2/6] Getting weight handles and spawning generators (NPU 1)...")
-    flat_buf, weight_meta = await learner.weights_handle.call_one()
+    print("[2/6] Getting weight handles and spawning generators (NPU 1)...", flush=True)
+    flat_buf, weight_meta = await asyncio.wait_for(
+        learner.weights_handle.call_one(),
+        timeout=60.0,
+    )
+    print("      weight handle received", flush=True)
     generators = gen_mesh.spawn("generator", Generator, flat_buf, weight_meta, traj_q)
-    await learner.init_generators.call(generators)
+    await asyncio.wait_for(learner.init_generators.call(generators), timeout=60.0)
+    print("      generator reference installed", flush=True)
 
-    print("[3/6] Initial generation...")
-    await generators.generate.call(torch.randn(STATE_DIM))
+    print("[3/6] Initial generation...", flush=True)
+    await asyncio.wait_for(
+        generators.generate.call(torch.randn(STATE_DIM)),
+        timeout=60.0,
+    )
 
-    print("[4/6] Starting scorer event loop...")
-    scorer_run_future = scorer.run.call_one()
+    print("[4/6] Scoring initial trajectory...", flush=True)
+    await asyncio.wait_for(scorer.score_one.call_one(), timeout=60.0)
 
-    print("[5/6] Training loop (5 steps)...")
+    print("[5/6] Training loop (5 steps)...", flush=True)
     for step in range(5):
         state = torch.randn(STATE_DIM)
-        _, loss = await asyncio.gather(
-            generators.generate.call(state),
+        await asyncio.wait_for(learner.update_generators.call_one(), timeout=60.0)
+        await asyncio.wait_for(generators.generate.call(state), timeout=60.0)
+        await asyncio.wait_for(scorer.score_one.call_one(), timeout=60.0)
+        loss = await asyncio.wait_for(
             learner.step.call_one(),
+            timeout=60.0,
         )
-        print(f"  [Step {step:02d}] loss={loss:.4f}")
+        print(f"  [Step {step:02d}] loss={loss:.4f}", flush=True)
 
-    print("[6/6] Stopping scorer...")
-    await scorer.stop_scoring.call_one()
-    await scorer_run_future
+    print("[6/6] All trajectories scored.", flush=True)
 
-    print("GRPO training complete!")
+    print("GRPO training complete!", flush=True)
 
 
 if __name__ == "__main__":
-    from monarch._src.actor.actor_mesh import context
+    from monarch._src.actor.actor_mesh import context, shutdown_context
+
     context()
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        shutdown_context().get(timeout=75.0)

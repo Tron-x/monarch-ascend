@@ -28,11 +28,14 @@
 //! controller<2MuAHeDjLCEd>@tcp://[::1]:2345
 //! controller<2MuAHeDjLCEd>.local@inproc://0
 //! <2MuAHeDjLCEd>.<NRjEZGYjYibf>:42@tcp://[::1]:2345
+//! <2MuAHeDjLCEd>.<NRjEZGYjYibf>:handler<NRjEZGYjYibf>@tcp://[::1]:2345
+//! <2MuAHeDjLCEd>.<NRjEZGYjYibf>!introspect@tcp://[::1]:2345
 //! ```
 
 use std::fmt;
 use std::str::FromStr;
 
+use enum_as_inner::EnumAsInner;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -45,32 +48,99 @@ use crate::id::Label;
 use crate::id::PortId;
 use crate::id::ProcId;
 use crate::id::Uid;
+use crate::introspect::IntrospectMessage;
 use crate::parse;
-use crate::parse::addr::ActorAddrParts;
-use crate::parse::addr::PortAddrParts;
-use crate::parse::addr::ProcAddrParts;
+use crate::port::ControlPort;
 use crate::port::Port;
+use crate::proc::StatusMessage;
+use crate::ref_::PortRef;
 
-/// A network location, wrapping a [`ChannelAddr`].
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct Location(ChannelAddr);
+/// A network location.
+///
+/// Two variants: a terminal [`ChannelAddr`], or a "via" hop carrying
+/// the [`Uid`] of a gateway through which the inner location is
+/// reachable. The via form is a source route — a message addressed to
+/// `Via(uid, inner)` is forwarded by the gateway holding that `uid` and
+/// then routed by the inner location.
+///
+/// Display syntax:
+///
+/// ```text
+/// location := via* zmq-url
+/// via      := uid "."
+/// uid      := label | "<" base58 ">" | label "<" base58 ">"
+/// ```
+///
+/// The parser sniffs the ZMQ URL scheme (`<scheme>://`) to split the
+/// via list from the URL — so any uid form accepted by [`Uid`]
+/// (singleton label, unlabeled instance, or labeled instance) is
+/// admitted in via position.
+///
+/// Examples:
+///
+/// * `<2MuAHeDjLCEd>.tcp://[::1]:2345` — one unlabeled instance via.
+/// * `host<7PDmJtQJB5S>.tcp://[::1]:2345` — labeled instance via.
+/// * `client.host<7PDmJtQJB5S>.tcp://[::1]:2345` — a singleton via
+///   stacked on a labeled instance via.
+#[derive(
+    Clone,
+    EnumAsInner,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize
+)]
+pub enum Location {
+    /// A terminal channel address. Routed directly.
+    Addr(ChannelAddr),
+    /// A via hop: messages for this location are forwarded by the
+    /// gateway holding `Uid`, which peels this prefix off the
+    /// destination before routing the inner location.
+    Via(Uid, Box<Location>),
+}
 
 impl Location {
-    /// Returns the underlying channel address.
+    /// Returns the innermost channel address, peeling all via hops.
     pub fn addr(&self) -> &ChannelAddr {
-        &self.0
+        match self {
+            Location::Addr(addr) => addr,
+            Location::Via(_, inner) => inner.addr(),
+        }
+    }
+
+    /// Wrap this location in a via hop carrying `uid`. Vias act like a
+    /// stack: the outermost (most recently added) hop is the first the
+    /// receiving gateway peels off.
+    pub fn with_via(self, uid: Uid) -> Self {
+        Location::Via(uid, Box::new(self))
+    }
+
+    /// Pop the outermost via hop. Returns `Ok((uid, inner))` when this
+    /// is a `Via`, or `Err(self)` when it is a terminal `Addr`, so the
+    /// caller can recover the unchanged location.
+    pub fn pop_via(self) -> Result<(Uid, Location), Location> {
+        match self {
+            Location::Via(uid, inner) => Ok((uid, *inner)),
+            addr @ Location::Addr(_) => Err(addr),
+        }
     }
 }
 
 impl From<ChannelAddr> for Location {
     fn from(addr: ChannelAddr) -> Self {
-        Self(addr)
+        Location::Addr(addr)
     }
 }
 
 impl fmt::Display for Location {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0.to_zmq_url())
+        match self {
+            Location::Addr(addr) => f.write_str(&addr.to_zmq_url()),
+            Location::Via(uid, inner) => write!(f, "{uid}.{inner}"),
+        }
     }
 }
 
@@ -84,7 +154,7 @@ impl FromStr for Location {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        ChannelAddr::from_zmq_url(s).map(Self)
+        parse::addr::parse_location_str(s).map_err(|err| anyhow::anyhow!("{err}"))
     }
 }
 
@@ -138,114 +208,43 @@ impl ProcAddr {
     /// The proc's label: the explicit metadata label for instances,
     /// or the singleton name for singletons.
     pub fn label(&self) -> Option<&Label> {
-        self.id.label().or_else(|| match self.id.uid() {
-            Uid::Singleton(label) => Some(label),
-            _ => None,
-        })
+        self.id.label()
     }
 
-    /// Create a ProcAddr with a unique (random) uid and the given label.
-    pub fn unique(addr: ChannelAddr, base_name: impl AsRef<str>) -> Self {
+    /// Create a ProcAddr with an anonymous instance proc id.
+    pub fn anonymous(addr: ChannelAddr) -> Self {
+        Self::new(id::ProcId::anonymous(), Location::from(addr))
+    }
+
+    /// Create a ProcAddr with an instance proc id and the given display label.
+    pub fn instance(addr: ChannelAddr, base_name: impl AsRef<str>) -> Self {
         let label = Label::strip(base_name.as_ref());
         Self::new(id::ProcId::instance(label), Location::from(addr))
     }
 
-    /// Create a ProcAddr by parsing a name string in ResourceId format.
-    ///
-    /// Recognizes: `label` (singleton), `label<uid58>` (labeled instance),
-    /// `<uid58>` (unlabeled instance). Falls back to singleton from stripped name.
-    pub fn from_resource_name(addr: ChannelAddr, name: impl AsRef<str>) -> Self {
-        let (uid, label) = parse_resource_name(name.as_ref());
-        Self::new(id::ProcId::new(uid, label), Location::from(addr))
+    /// Create a ProcAddr with a singleton proc id identified by the given name.
+    pub fn singleton(addr: ChannelAddr, name: impl AsRef<str>) -> Self {
+        Self::new(
+            id::ProcId::singleton(Label::strip(name.as_ref())),
+            Location::from(addr),
+        )
     }
 
-    /// Create an ActorAddr with the provided name within this proc.
-    pub fn actor_ref(&self, name: impl AsRef<str>) -> ActorAddr {
-        ActorAddr::new_from_name(self.clone(), name)
+    /// Create an ActorAddr singleton with the provided name within this proc.
+    pub fn actor_addr(&self, name: impl AsRef<str>) -> ActorAddr {
+        let uid = Uid::singleton(Label::strip(name.as_ref()));
+        self.actor_addr_uid(uid)
     }
 
-    /// Compatibility alias for callers still using `actor_id` naming.
-    pub fn actor_id(&self, name: impl AsRef<str>) -> ActorAddr {
-        self.actor_ref(name)
+    /// Create an ActorAddr with the provided uid within this proc.
+    pub fn actor_addr_uid(&self, uid: Uid) -> ActorAddr {
+        ActorAddr::new_from_uid(self.clone(), uid)
     }
 
     /// A human-readable name for logging.
     pub fn log_name(&self) -> &str {
         self.label().map(|l| l.as_str()).unwrap_or("?")
     }
-
-    /// The ResourceId text form: `label` (singleton), `label-uid58`
-    /// (labeled instance), or `<uid58>` (unlabeled instance).
-    pub fn resource_name(&self) -> String {
-        fn uid_no_brackets(uid: &Uid) -> String {
-            uid.to_string()
-                .trim_start_matches('<')
-                .trim_end_matches('>')
-                .to_string()
-        }
-
-        match (self.id.uid(), self.id.label()) {
-            (Uid::Singleton(label), _) => label.to_string(),
-            (uid @ Uid::Instance(_), Some(label)) => format!("{label}-{}", uid_no_brackets(uid)),
-            (uid @ Uid::Instance(_), None) => uid.to_string(),
-        }
-    }
-}
-
-/// Parse a name in ResourceId format into a (Uid, Option<Label>) pair.
-///
-/// Formats: `label` (singleton), `label<uid58>` (labeled instance),
-/// `<uid58>` (unlabeled instance). Falls back to singleton from stripped name.
-pub(crate) fn parse_resource_name(s: &str) -> (Uid, Option<Label>) {
-    fn parse_wrapped_instance_uid(s: &str) -> Option<u64> {
-        let wrapped = format!("<{s}>");
-        match Uid::from_str(&wrapped) {
-            Ok(Uid::Instance(uid)) => Some(uid),
-            _ => None,
-        }
-    }
-
-    if let Some(inner) = s
-        .strip_prefix('<')
-        .and_then(|inner| inner.strip_suffix('>'))
-    {
-        if let Ok(uid) = Uid::from_str(&format!("<{inner}>")) {
-            return (uid, None);
-        }
-    }
-
-    if let Some((label_part, uid_part)) = s.rsplit_once('-')
-        && uid_part.len() >= 8
-    {
-        if let (Ok(label), Ok(uid)) = (
-            Label::new(label_part),
-            Uid::from_str(&format!("<{uid_part}>")),
-        ) {
-            return (uid, Some(label));
-        }
-        if let (Ok(label), Some(uid)) =
-            (Label::new(label_part), parse_wrapped_instance_uid(uid_part))
-        {
-            return (Uid::Instance(uid), Some(label));
-        }
-    }
-
-    if let Some(open) = s.find('<') {
-        if s.ends_with('>') {
-            let label_part = &s[..open];
-            let uid_part = &s[open..];
-            if let (Ok(uid), Ok(label)) = (Uid::from_str(uid_part), Label::new(label_part)) {
-                return (uid, Some(label));
-            }
-        }
-    }
-
-    if let Ok(label) = Label::new(s) {
-        return (Uid::Singleton(label.clone()), Some(label));
-    }
-
-    let label = Label::strip(s);
-    (Uid::Singleton(label.clone()), Some(label))
 }
 
 impl PartialEq for ProcAddr {
@@ -296,8 +295,7 @@ impl FromStr for ProcAddr {
     type Err = AddrParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts = parse::addr::parse_proc_addr(s).map_err(|_| legacy_parse_proc_ref(s))?;
-        Self::try_from((s, parts))
+        parse::addr::parse_proc_addr(s).map_err(|_| legacy_parse_proc_ref(s))
     }
 }
 
@@ -316,16 +314,20 @@ impl ActorAddr {
         Self { id, location }
     }
 
-    /// Create an ActorAddr from a ProcAddr and name string (parsed in ResourceId format).
-    pub fn new_from_name(proc_ref: ProcAddr, name: impl AsRef<str>) -> Self {
-        let (uid, label) = parse_resource_name(name.as_ref());
-        let actor_id = id::ActorId::new(uid, proc_ref.id.clone(), label);
+    /// Create an ActorAddr from a ProcAddr and actor uid.
+    pub fn new_from_uid(proc_ref: ProcAddr, uid: Uid) -> Self {
+        let actor_id = id::ActorId::new(uid, proc_ref.id.clone(), None);
         Self::new(actor_id, proc_ref.location)
     }
 
     /// Returns the actor id.
     pub fn id(&self) -> &ActorId {
         &self.id
+    }
+
+    /// Returns the proc id that owns this actor id.
+    pub fn proc_id(&self) -> &ProcId {
+        self.id.proc_id()
     }
 
     /// Returns the location.
@@ -346,28 +348,30 @@ impl ActorAddr {
     /// The actor's label: explicit metadata label for instances,
     /// or singleton name for singletons.
     pub fn label(&self) -> Option<&Label> {
-        self.id.label().or_else(|| match self.id.uid() {
-            Uid::Singleton(label) => Some(label),
-            _ => None,
-        })
+        self.id.label()
     }
 
     /// Reconstruct the parent ProcAddr (with location preserved).
-    pub fn proc_ref(&self) -> ProcAddr {
+    pub fn proc_addr(&self) -> ProcAddr {
         ProcAddr::new(self.id.proc_id().clone(), self.location.clone())
     }
 
-    /// Compatibility alias for callers still using `proc_id` naming.
-    pub fn proc_id(&self) -> ProcAddr {
-        self.proc_ref()
-    }
-
     /// Create a PortAddr for a port on this actor.
-    pub fn port_ref(&self, port: Port) -> PortAddr {
+    pub fn port_addr(&self, port: Port) -> PortAddr {
         PortAddr::new(
             id::PortId::new(self.id.clone(), port),
             self.location.clone(),
         )
+    }
+
+    /// The actor's introspection control port.
+    pub fn introspect_port(&self) -> PortRef<IntrospectMessage> {
+        PortRef::attest(self.port_addr(Port::control(ControlPort::Introspect)))
+    }
+
+    /// The actor's lifecycle status control port.
+    pub fn status_port(&self) -> PortRef<StatusMessage> {
+        PortRef::attest(self.port_addr(Port::control(ControlPort::Status)))
     }
 
     /// Create an ActorAddr for a root actor on a proc.
@@ -378,14 +382,14 @@ impl ActorAddr {
     }
 
     /// Create an ActorAddr for a child actor with a random uid.
-    pub fn unique_child(&self) -> Self {
-        let child_id = id::ActorId::instance(self.id.proc_id().clone());
+    pub fn anonymous_child(&self) -> Self {
+        let child_id = id::ActorId::anonymous(self.id.proc_id().clone());
         Self::new(child_id, self.location.clone())
     }
 
     /// Whether this is a root actor (singleton uid).
     pub fn is_root(&self) -> bool {
-        matches!(self.id.uid(), Uid::Singleton(_))
+        self.id.uid().is_singleton()
     }
 
     /// A human-readable name for logging.
@@ -456,8 +460,7 @@ impl FromStr for ActorAddr {
     type Err = AddrParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts = parse::addr::parse_actor_addr(s).map_err(|_| legacy_parse_actor_ref(s))?;
-        Self::try_from((s, parts))
+        parse::addr::parse_actor_addr(s).map_err(|_| legacy_parse_actor_ref(s))
     }
 }
 
@@ -489,9 +492,24 @@ impl PortAddr {
         self.id.actor_id()
     }
 
-    /// Whether this is a handler (actor-level) port.
-    pub(crate) fn is_actor_port(&self) -> bool {
+    /// Returns the proc id that owns this port id.
+    pub fn proc_id(&self) -> &ProcId {
+        self.id.actor_id().proc_id()
+    }
+
+    /// Whether this is a handler port.
+    pub(crate) fn is_handler_port(&self) -> bool {
         self.id.port().is_handler()
+    }
+
+    /// Whether this is the provided control port.
+    pub(crate) fn is_control_port_kind(&self, port: ControlPort) -> bool {
+        self.id.port() == Port::control(port)
+    }
+
+    /// The port.
+    pub fn port(&self) -> Port {
+        self.id.port()
     }
 
     /// The port index.
@@ -499,9 +517,19 @@ impl PortAddr {
         self.id.port().as_u64()
     }
 
+    /// The ephemeral port index.
+    pub fn ephemeral_index(&self) -> Option<u64> {
+        self.id.port().ephemeral_index()
+    }
+
+    /// Reconstruct the parent ActorAddr (with location preserved).
+    pub fn actor_addr(&self) -> ActorAddr {
+        ActorAddr::new(self.id.actor_id().clone(), self.location.clone())
+    }
+
     /// Reconstruct the parent ActorAddr (with location preserved).
     pub fn actor_ref(&self) -> ActorAddr {
-        ActorAddr::new(self.id.actor_id().clone(), self.location.clone())
+        self.actor_addr()
     }
 
     /// Send a serialized message to this port, provided a sending capability.
@@ -616,8 +644,7 @@ impl FromStr for PortAddr {
     type Err = AddrParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts = parse::addr::parse_port_addr(s).map_err(|_| legacy_parse_port_ref(s))?;
-        Self::try_from((s, parts))
+        parse::addr::parse_port_addr(s).map_err(|_| legacy_parse_port_ref(s))
     }
 }
 
@@ -626,8 +653,8 @@ impl FromStr for PortAddr {
 /// Used for prefix-based routing in [`MailboxRouter`] and
 /// [`DialMailboxRouter`]. Ordering is lexicographic by
 /// (proc, actor uid, port).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Address {
+#[derive(Debug, Clone, EnumAsInner, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Addr {
     /// A process reference.
     Proc(ProcAddr),
     /// An actor reference.
@@ -636,16 +663,16 @@ pub enum Address {
     Port(PortAddr),
 }
 
-impl Address {
+impl Addr {
     /// Whether `self` is a prefix of `other`.
     ///
     /// - Proc is a prefix of any Actor or Port on the same proc.
     /// - Actor is a prefix of any Port on the same actor.
     pub fn is_prefix_of(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Proc(p), Self::Actor(a)) => *p == a.proc_ref(),
-            (Self::Proc(p), Self::Port(pt)) => *p == pt.actor_ref().proc_ref(),
-            (Self::Actor(a), Self::Port(pt)) => *a == pt.actor_ref(),
+            (Self::Proc(p), Self::Actor(a)) => *p == a.proc_addr(),
+            (Self::Proc(p), Self::Port(pt)) => *p == pt.actor_addr().proc_addr(),
+            (Self::Actor(a), Self::Port(pt)) => *a == pt.actor_addr(),
             (Self::Proc(p1), Self::Proc(p2)) => p1 == p2,
             (Self::Actor(a1), Self::Actor(a2)) => a1 == a2,
             (Self::Port(p1), Self::Port(p2)) => p1 == p2,
@@ -653,26 +680,26 @@ impl Address {
         }
     }
 
-    /// The proc ref of this reference.
-    pub fn proc_ref(&self) -> ProcAddr {
+    /// The proc addr of this reference.
+    pub fn proc_addr(&self) -> ProcAddr {
         match self {
             Self::Proc(p) => p.clone(),
-            Self::Actor(a) => a.proc_ref(),
-            Self::Port(p) => p.actor_ref().proc_ref(),
+            Self::Actor(a) => a.proc_addr(),
+            Self::Port(p) => p.actor_addr().proc_addr(),
         }
     }
 }
 
-impl PartialOrd for Address {
+impl PartialOrd for Addr {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for Address {
+impl Ord for Addr {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Order by: proc, then actor uid (None < Some), then port (None < Some).
-        let proc_ord = self.proc_ref().cmp(&other.proc_ref());
+        let proc_ord = self.proc_addr().cmp(&other.proc_addr());
         if proc_ord != std::cmp::Ordering::Equal {
             return proc_ord;
         }
@@ -702,7 +729,7 @@ impl Ord for Address {
     }
 }
 
-impl fmt::Display for Address {
+impl fmt::Display for Addr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Proc(p) => fmt::Display::fmt(p, f),
@@ -712,61 +739,11 @@ impl fmt::Display for Address {
     }
 }
 
-impl FromStr for Address {
+impl FromStr for Addr {
     type Err = AddrParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match parse::addr::parse_address(s).map_err(|_| legacy_parse_reference(s))? {
-            parse::addr::AddressParts::Proc(_) => Ok(Self::Proc(s.parse()?)),
-            parse::addr::AddressParts::Actor(_) => Ok(Self::Actor(s.parse()?)),
-            parse::addr::AddressParts::Port(_) => Ok(Self::Port(s.parse()?)),
-        }
-    }
-}
-
-fn id_text_from_ref_input<'a>(input: &'a str, location: &str) -> &'a str {
-    &input[..input.len() - location.len() - 1]
-}
-
-impl<'a> TryFrom<(&'a str, ProcAddrParts<'a>)> for ProcAddr {
-    type Error = AddrParseError;
-
-    fn try_from((input, parts): (&'a str, ProcAddrParts<'a>)) -> Result<Self, Self::Error> {
-        let id_text = id_text_from_ref_input(input, parts.location);
-        let id: ProcId = id_text.parse()?;
-        let location: Location = parts
-            .location
-            .parse()
-            .map_err(AddrParseError::InvalidLocation)?;
-        Ok(Self { id, location })
-    }
-}
-
-impl<'a> TryFrom<(&'a str, ActorAddrParts<'a>)> for ActorAddr {
-    type Error = AddrParseError;
-
-    fn try_from((input, parts): (&'a str, ActorAddrParts<'a>)) -> Result<Self, Self::Error> {
-        let id_text = id_text_from_ref_input(input, parts.location);
-        let id: ActorId = id_text.parse()?;
-        let location: Location = parts
-            .location
-            .parse()
-            .map_err(AddrParseError::InvalidLocation)?;
-        Ok(Self { id, location })
-    }
-}
-
-impl<'a> TryFrom<(&'a str, PortAddrParts<'a>)> for PortAddr {
-    type Error = AddrParseError;
-
-    fn try_from((input, parts): (&'a str, PortAddrParts<'a>)) -> Result<Self, Self::Error> {
-        let id_text = id_text_from_ref_input(input, parts.location);
-        let id: PortId = id_text.parse()?;
-        let location: Location = parts
-            .location
-            .parse()
-            .map_err(AddrParseError::InvalidLocation)?;
-        Ok(Self { id, location })
+        parse::addr::parse_addr(s).map_err(|_| legacy_parse_reference(s))
     }
 }
 
@@ -862,19 +839,19 @@ fn legacy_parse_reference(s: &str) -> AddrParseError {
     AddrParseError::InvalidId(proc_result.unwrap_err())
 }
 
-impl From<ProcAddr> for Address {
+impl From<ProcAddr> for Addr {
     fn from(p: ProcAddr) -> Self {
         Self::Proc(p)
     }
 }
 
-impl From<ActorAddr> for Address {
+impl From<ActorAddr> for Addr {
     fn from(a: ActorAddr) -> Self {
         Self::Actor(a)
     }
 }
 
-impl From<PortAddr> for Address {
+impl From<PortAddr> for Addr {
     fn from(p: PortAddr) -> Self {
         Self::Port(p)
     }
@@ -915,7 +892,7 @@ mod tests {
     #[test]
     fn test_proc_ref_display() {
         let pid = ProcId::new(
-            Uid::Instance(0xabc123),
+            Uid::Instance(0xabc123, None),
             Some(Label::new("my-proc").unwrap()),
         );
         let loc: Location = ChannelAddr::Local(42).into();
@@ -924,9 +901,45 @@ mod tests {
     }
 
     #[test]
+    fn test_proc_addr_identity_constructors() {
+        let anonymous = ProcAddr::anonymous(ChannelAddr::Local(1));
+        assert!(
+            matches!(anonymous.id().uid(), Uid::Instance(_, None)),
+            "anonymous proc addr must have an unlabeled instance id"
+        );
+        assert_eq!(anonymous.label(), None);
+        assert_eq!(*anonymous.location().addr(), ChannelAddr::Local(1));
+
+        let instance = ProcAddr::instance(ChannelAddr::Local(2), "worker");
+        assert!(
+            matches!(
+                instance.id().uid(),
+                Uid::Instance(_, Some(label)) if label.as_str() == "worker"
+            ),
+            "instance proc addr must have a labeled instance id"
+        );
+        assert_eq!(instance.label().map(|label| label.as_str()), Some("worker"));
+        assert_eq!(*instance.location().addr(), ChannelAddr::Local(2));
+
+        let singleton = ProcAddr::singleton(ChannelAddr::Local(3), "controller");
+        assert!(
+            matches!(
+                singleton.id().uid(),
+                Uid::Singleton(label) if label.as_str() == "controller"
+            ),
+            "singleton proc addr must have a singleton id"
+        );
+        assert_eq!(
+            singleton.label().map(|label| label.as_str()),
+            Some("controller")
+        );
+        assert_eq!(*singleton.location().addr(), ChannelAddr::Local(3));
+    }
+
+    #[test]
     fn test_proc_ref_debug_with_label() {
         let pid = ProcId::new(
-            Uid::Instance(0xabc123),
+            Uid::Instance(0xabc123, None),
             Some(Label::new("my-proc").unwrap()),
         );
         let loc: Location = ChannelAddr::Local(42).into();
@@ -939,7 +952,7 @@ mod tests {
 
     #[test]
     fn test_proc_ref_debug_without_label() {
-        let pid = ProcId::new(Uid::Instance(0xabc123), None);
+        let pid = ProcId::new(Uid::Instance(0xabc123, None), None);
         let loc: Location = ChannelAddr::Local(42).into();
         let pref = ProcAddr::new(pid, loc);
         assert_eq!(
@@ -951,7 +964,7 @@ mod tests {
     #[test]
     fn test_proc_ref_fromstr_roundtrip() {
         let pid = ProcId::new(
-            Uid::Instance(0xabc123),
+            Uid::Instance(0xabc123, None),
             Some(Label::new("my-proc").unwrap()),
         );
         let loc: Location = ChannelAddr::Local(42).into();
@@ -965,11 +978,11 @@ mod tests {
     fn test_proc_ref_fromstr_tcp() {
         let parsed: ProcAddr = format!(
             "{}@tcp://127.0.0.1:8080",
-            ProcId::new(Uid::Instance(0xabc123), None)
+            ProcId::new(Uid::Instance(0xabc123, None), None)
         )
         .parse()
         .unwrap();
-        assert_eq!(*parsed.id().uid(), Uid::Instance(0xabc123));
+        assert_eq!(*parsed.id().uid(), Uid::Instance(0xabc123, None));
         assert_eq!(
             *parsed.location().addr(),
             "tcp:127.0.0.1:8080".parse::<ChannelAddr>().unwrap()
@@ -985,7 +998,7 @@ mod tests {
         );
         assert_eq!(*parsed.location().addr(), ChannelAddr::Local(0));
 
-        let expected_uid = Uid::Instance(0xabc123);
+        let expected_uid = Uid::Instance(0xabc123, None);
         let parsed: ProcAddr = format!("controller{}@tcp://[::1]:2345", expected_uid)
             .parse()
             .unwrap();
@@ -1002,7 +1015,7 @@ mod tests {
 
     #[test]
     fn test_proc_ref_fromstr_missing_separator() {
-        let err = ProcId::new(Uid::Instance(0xabc123), None)
+        let err = ProcId::new(Uid::Instance(0xabc123, None), None)
             .to_string()
             .parse::<ProcAddr>()
             .unwrap_err();
@@ -1018,9 +1031,9 @@ mod tests {
     #[test]
     fn test_actor_ref_display() {
         let aid = ActorId::new(
-            Uid::Instance(0xabc123),
+            Uid::Instance(0xabc123, None),
             ProcId::new(
-                Uid::Instance(0xdef456),
+                Uid::Instance(0xdef456, None),
                 Some(Label::new("my-proc").unwrap()),
             ),
             Some(Label::new("my-actor").unwrap()),
@@ -1031,11 +1044,30 @@ mod tests {
     }
 
     #[test]
+    fn test_actor_and_port_proc_id_accessors() {
+        let proc_id = ProcId::new(
+            Uid::Instance(0xdef456, None),
+            Some(Label::new("my-proc").unwrap()),
+        );
+        let actor_id = ActorId::new(
+            Uid::Instance(0xabc123, None),
+            proc_id.clone(),
+            Some(Label::new("my-actor").unwrap()),
+        );
+        let actor_addr = ActorAddr::new(actor_id, ChannelAddr::Local(42).into());
+        let port_addr = actor_addr.port_addr(Port::from(7));
+
+        assert_eq!(actor_addr.proc_id(), &proc_id);
+        assert_eq!(port_addr.actor_id(), actor_addr.id());
+        assert_eq!(port_addr.proc_id(), &proc_id);
+    }
+
+    #[test]
     fn test_actor_ref_debug_all_labels() {
         let aid = ActorId::new(
-            Uid::Instance(0xabc123),
+            Uid::Instance(0xabc123, None),
             ProcId::new(
-                Uid::Instance(0xdef456),
+                Uid::Instance(0xdef456, None),
                 Some(Label::new("my-proc").unwrap()),
             ),
             Some(Label::new("my-actor").unwrap()),
@@ -1051,8 +1083,8 @@ mod tests {
     #[test]
     fn test_actor_ref_debug_no_labels() {
         let aid = ActorId::new(
-            Uid::Instance(0xabc123),
-            ProcId::new(Uid::Instance(0xdef456), None),
+            Uid::Instance(0xabc123, None),
+            ProcId::new(Uid::Instance(0xdef456, None), None),
             None,
         );
         let loc: Location = ChannelAddr::Local(42).into();
@@ -1066,8 +1098,8 @@ mod tests {
     #[test]
     fn test_actor_ref_debug_actor_label_only() {
         let aid = ActorId::new(
-            Uid::Instance(0xabc123),
-            ProcId::new(Uid::Instance(0xdef456), None),
+            Uid::Instance(0xabc123, None),
+            ProcId::new(Uid::Instance(0xdef456, None), None),
             Some(Label::new("my-actor").unwrap()),
         );
         let loc: Location = ChannelAddr::Local(42).into();
@@ -1081,9 +1113,9 @@ mod tests {
     #[test]
     fn test_actor_ref_debug_proc_label_only() {
         let aid = ActorId::new(
-            Uid::Instance(0xabc123),
+            Uid::Instance(0xabc123, None),
             ProcId::new(
-                Uid::Instance(0xdef456),
+                Uid::Instance(0xdef456, None),
                 Some(Label::new("my-proc").unwrap()),
             ),
             None,
@@ -1099,9 +1131,9 @@ mod tests {
     #[test]
     fn test_actor_ref_fromstr_roundtrip() {
         let aid = ActorId::new(
-            Uid::Instance(0xabc123),
+            Uid::Instance(0xabc123, None),
             ProcId::new(
-                Uid::Instance(0xdef456),
+                Uid::Instance(0xdef456, None),
                 Some(Label::new("my-proc").unwrap()),
             ),
             Some(Label::new("my-actor").unwrap()),
@@ -1120,7 +1152,7 @@ mod tests {
 
     #[test]
     fn test_actor_ref_fromstr_examples() {
-        let expected_actor_uid = Uid::Instance(0xabc123);
+        let expected_actor_uid = Uid::Instance(0xabc123, None);
         let parsed: ActorAddr = format!("controller{}.local@inproc://0", expected_actor_uid)
             .parse()
             .unwrap();
@@ -1139,8 +1171,8 @@ mod tests {
     #[test]
     fn test_actor_ref_fromstr_missing_separator() {
         let err = ActorId::new(
-            Uid::Instance(0xabc123),
-            ProcId::new(Uid::Instance(0xdef456), None),
+            Uid::Instance(0xabc123, None),
+            ProcId::new(Uid::Instance(0xdef456, None), None),
             None,
         )
         .to_string()
@@ -1160,7 +1192,7 @@ mod tests {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::Hasher;
 
-        let pid = ProcId::new(Uid::Instance(0x42), Some(Label::new("proc").unwrap()));
+        let pid = ProcId::new(Uid::Instance(0x42, None), Some(Label::new("proc").unwrap()));
         let loc: Location = ChannelAddr::Local(1).into();
         let a = ProcAddr::new(pid.clone(), loc.clone());
         let b = ProcAddr::new(pid, loc);
@@ -1176,7 +1208,7 @@ mod tests {
 
     #[test]
     fn test_proc_ref_neq_different_location() {
-        let pid = ProcId::new(Uid::Instance(0x42), Some(Label::new("proc").unwrap()));
+        let pid = ProcId::new(Uid::Instance(0x42, None), Some(Label::new("proc").unwrap()));
         let a = ProcAddr::new(pid.clone(), ChannelAddr::Local(1).into());
         let b = ProcAddr::new(pid, ChannelAddr::Local(2).into());
         assert_ne!(a, b);
@@ -1188,8 +1220,8 @@ mod tests {
         use std::hash::Hasher;
 
         let aid = ActorId::new(
-            Uid::Instance(0x42),
-            ProcId::new(Uid::Instance(0x99), Some(Label::new("proc").unwrap())),
+            Uid::Instance(0x42, None),
+            ProcId::new(Uid::Instance(0x99, None), Some(Label::new("proc").unwrap())),
             Some(Label::new("actor").unwrap()),
         );
         let loc: Location = ChannelAddr::Local(1).into();
@@ -1220,59 +1252,14 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_resource_name_formats() {
-        assert_eq!(
-            parse_resource_name("service"),
-            (
-                Uid::Singleton(Label::new("service").unwrap()),
-                Some(Label::new("service").unwrap())
-            )
-        );
-        assert_eq!(
-            parse_resource_name(&format!("worker{}", Uid::Instance(0xabc123))),
-            (Uid::Instance(0xabc123), Some(Label::new("worker").unwrap()))
-        );
-        assert_eq!(
-            parse_resource_name(&Uid::Instance(0xabc123).to_string()),
-            (Uid::Instance(0xabc123), None)
-        );
-        assert_eq!(
-            parse_resource_name("dead"),
-            (
-                Uid::Singleton(Label::new("dead").unwrap()),
-                Some(Label::new("dead").unwrap())
-            )
-        );
-    }
-
-    #[test]
-    fn test_proc_resource_name_uses_legacy_labeled_instance_format() {
-        let proc_ref = ProcAddr::new(
-            ProcId::new(Uid::Instance(0xabc123), Some(Label::new("worker").unwrap())),
-            ChannelAddr::Local(42).into(),
-        );
-
-        assert_eq!(
-            proc_ref.resource_name(),
-            format!(
-                "worker-{}",
-                Uid::Instance(0xabc123)
-                    .to_string()
-                    .trim_start_matches('<')
-                    .trim_end_matches('>')
-            )
-        );
-    }
-
-    #[test]
     fn test_reference_prefix_relationships() {
-        let proc_ref = ProcAddr::from_resource_name(ChannelAddr::Local(42), "service");
-        let actor_ref = proc_ref.actor_ref("host_agent");
-        let port_ref = actor_ref.port_ref(Port::from(7u64));
+        let proc_ref = ProcAddr::singleton(ChannelAddr::Local(42), "service");
+        let actor_ref = proc_ref.actor_addr("host_agent");
+        let port_ref = actor_ref.port_addr(Port::from(7u64));
 
-        assert!(Address::Proc(proc_ref.clone()).is_prefix_of(&Address::Actor(actor_ref.clone())));
-        assert!(Address::Proc(proc_ref.clone()).is_prefix_of(&Address::Port(port_ref.clone())));
-        assert!(Address::Actor(actor_ref.clone()).is_prefix_of(&Address::Port(port_ref)));
+        assert!(Addr::Proc(proc_ref.clone()).is_prefix_of(&Addr::Actor(actor_ref.clone())));
+        assert!(Addr::Proc(proc_ref.clone()).is_prefix_of(&Addr::Port(port_ref.clone())));
+        assert!(Addr::Actor(actor_ref.clone()).is_prefix_of(&Addr::Port(port_ref)));
     }
 
     #[test]
@@ -1286,7 +1273,7 @@ mod tests {
     #[test]
     fn test_proc_ref_serde_roundtrip() {
         let pid = ProcId::new(
-            Uid::Instance(0xabcdef),
+            Uid::Instance(0xabcdef, None),
             Some(Label::new("my-proc").unwrap()),
         );
         let loc: Location = ChannelAddr::Local(42).into();
@@ -1299,9 +1286,9 @@ mod tests {
     #[test]
     fn test_actor_ref_serde_roundtrip() {
         let aid = ActorId::new(
-            Uid::Instance(0xabcdef),
+            Uid::Instance(0xabcdef, None),
             ProcId::new(
-                Uid::Instance(0x123456),
+                Uid::Instance(0x123456, None),
                 Some(Label::new("my-proc").unwrap()),
             ),
             Some(Label::new("my-actor").unwrap()),
@@ -1317,7 +1304,7 @@ mod tests {
     fn test_proc_ref_with_metatls_location() {
         use crate::channel::TlsAddr;
 
-        let pid = ProcId::new(Uid::Instance(0x42), None);
+        let pid = ProcId::new(Uid::Instance(0x42, None), None);
         let loc: Location = ChannelAddr::MetaTls(TlsAddr::new("example.com", 443)).into();
         let pref = ProcAddr::new(pid, loc);
         let s = pref.to_string();
@@ -1329,9 +1316,9 @@ mod tests {
     #[test]
     fn test_port_ref_construction_and_accessors() {
         let aid = ActorId::new(
-            Uid::Instance(0xabc123),
+            Uid::Instance(0xabc123, None),
             ProcId::new(
-                Uid::Instance(0xdef456),
+                Uid::Instance(0xdef456, None),
                 Some(Label::new("my-proc").unwrap()),
             ),
             Some(Label::new("my-actor").unwrap()),
@@ -1347,9 +1334,9 @@ mod tests {
     #[test]
     fn test_port_ref_display() {
         let aid = ActorId::new(
-            Uid::Instance(0xabc123),
+            Uid::Instance(0xabc123, None),
             ProcId::new(
-                Uid::Instance(0xdef456),
+                Uid::Instance(0xdef456, None),
                 Some(Label::new("my-proc").unwrap()),
             ),
             Some(Label::new("my-actor").unwrap()),
@@ -1363,9 +1350,9 @@ mod tests {
     #[test]
     fn test_port_ref_debug_all_labels() {
         let aid = ActorId::new(
-            Uid::Instance(0xabc123),
+            Uid::Instance(0xabc123, None),
             ProcId::new(
-                Uid::Instance(0xdef456),
+                Uid::Instance(0xdef456, None),
                 Some(Label::new("my-proc").unwrap()),
             ),
             Some(Label::new("my-actor").unwrap()),
@@ -1382,8 +1369,8 @@ mod tests {
     #[test]
     fn test_port_ref_debug_no_labels() {
         let aid = ActorId::new(
-            Uid::Instance(0xabc123),
-            ProcId::new(Uid::Instance(0xdef456), None),
+            Uid::Instance(0xabc123, None),
+            ProcId::new(Uid::Instance(0xdef456, None), None),
             None,
         );
         let port_id = PortId::new(aid, Port::from(42));
@@ -1395,8 +1382,8 @@ mod tests {
     #[test]
     fn test_port_ref_debug_actor_label_only() {
         let aid = ActorId::new(
-            Uid::Instance(0xabc123),
-            ProcId::new(Uid::Instance(0xdef456), None),
+            Uid::Instance(0xabc123, None),
+            ProcId::new(Uid::Instance(0xdef456, None), None),
             Some(Label::new("my-actor").unwrap()),
         );
         let port_id = PortId::new(aid, Port::from(42));
@@ -1411,9 +1398,9 @@ mod tests {
     #[test]
     fn test_port_ref_debug_proc_label_only() {
         let aid = ActorId::new(
-            Uid::Instance(0xabc123),
+            Uid::Instance(0xabc123, None),
             ProcId::new(
-                Uid::Instance(0xdef456),
+                Uid::Instance(0xdef456, None),
                 Some(Label::new("my-proc").unwrap()),
             ),
             None,
@@ -1430,9 +1417,9 @@ mod tests {
     #[test]
     fn test_port_ref_fromstr_roundtrip() {
         let aid = ActorId::new(
-            Uid::Instance(0xabc123),
+            Uid::Instance(0xabc123, None),
             ProcId::new(
-                Uid::Instance(0xdef456),
+                Uid::Instance(0xdef456, None),
                 Some(Label::new("my-proc").unwrap()),
             ),
             Some(Label::new("my-actor").unwrap()),
@@ -1455,8 +1442,8 @@ mod tests {
 
     #[test]
     fn test_port_ref_fromstr_examples() {
-        let expected_actor_uid = Uid::Instance(0xabc123);
-        let expected_proc_uid = Uid::Instance(0xdef456);
+        let expected_actor_uid = Uid::Instance(0xabc123, None);
+        let expected_proc_uid = Uid::Instance(0xdef456, None);
         let parsed: PortAddr = format!(
             "{}.{}:42@tcp://[::1]:2345",
             expected_actor_uid, expected_proc_uid
@@ -1476,8 +1463,8 @@ mod tests {
     fn test_port_ref_fromstr_missing_separator() {
         let err = PortId::new(
             ActorId::new(
-                Uid::Instance(0xabc123),
-                ProcId::new(Uid::Instance(0xdef456), None),
+                Uid::Instance(0xabc123, None),
+                ProcId::new(Uid::Instance(0xdef456, None), None),
                 None,
             ),
             Port::from(42),
@@ -1496,31 +1483,27 @@ mod tests {
 
     #[test]
     fn test_reference_fromstr_specificity() {
-        let parsed: Address = "local@inproc://0".parse().unwrap();
-        assert!(matches!(parsed, Address::Proc(_)));
+        let parsed: Addr = "local@inproc://0".parse().unwrap();
+        assert!(parsed.is_proc());
 
-        let parsed: Address = "local.local@inproc://0".parse().unwrap();
-        assert!(matches!(parsed, Address::Actor(_)));
+        let parsed: Addr = "local.local@inproc://0".parse().unwrap();
+        assert!(parsed.is_actor());
 
-        let parsed: Address = "local.local:7@inproc://0".parse().unwrap();
-        assert!(matches!(parsed, Address::Port(_)));
+        let parsed: Addr = "local.local:7@inproc://0".parse().unwrap();
+        assert!(parsed.is_port());
     }
 
     #[test]
     fn test_reference_fromstr_rejects_malformed_specific_forms() {
-        assert!(
-            "local.local:not-a-port@inproc://0"
-                .parse::<Address>()
-                .is_err()
-        );
-        assert!("local.<bad!>@inproc://0".parse::<Address>().is_err());
-        assert!("local@tcp://".parse::<Address>().is_err());
+        assert!("local.local:not-a-port@inproc://0".parse::<Addr>().is_err());
+        assert!("local.<bad!>@inproc://0".parse::<Addr>().is_err());
+        assert!("local@tcp://".parse::<Addr>().is_err());
     }
 
     #[test]
     fn test_reference_fromstr_does_not_downcast_malformed_port_ref() {
         let err = "local.local:not-a-port@inproc://0"
-            .parse::<Address>()
+            .parse::<Addr>()
             .unwrap_err();
         assert!(matches!(
             err,
@@ -1530,7 +1513,7 @@ mod tests {
 
     #[test]
     fn test_reference_fromstr_does_not_downcast_malformed_actor_ref() {
-        let err = "local.<bad!>@inproc://0".parse::<Address>().unwrap_err();
+        let err = "local.<bad!>@inproc://0".parse::<Addr>().unwrap_err();
         assert!(matches!(
             err,
             AddrParseError::InvalidId(IdParseError::InvalidActorProcUid(_))
@@ -1543,8 +1526,8 @@ mod tests {
         use std::hash::Hasher;
 
         let aid = ActorId::new(
-            Uid::Instance(0x42),
-            ProcId::new(Uid::Instance(0x99), Some(Label::new("proc").unwrap())),
+            Uid::Instance(0x42, None),
+            ProcId::new(Uid::Instance(0x99, None), Some(Label::new("proc").unwrap())),
             Some(Label::new("actor").unwrap()),
         );
         let port_id = PortId::new(aid, Port::from(10));
@@ -1564,8 +1547,8 @@ mod tests {
     #[test]
     fn test_port_ref_neq_different_location() {
         let aid = ActorId::new(
-            Uid::Instance(0x42),
-            ProcId::new(Uid::Instance(0x99), Some(Label::new("proc").unwrap())),
+            Uid::Instance(0x42, None),
+            ProcId::new(Uid::Instance(0x99, None), Some(Label::new("proc").unwrap())),
             Some(Label::new("actor").unwrap()),
         );
         let port_id = PortId::new(aid, Port::from(10));
@@ -1577,9 +1560,9 @@ mod tests {
     #[test]
     fn test_port_ref_serde_roundtrip() {
         let aid = ActorId::new(
-            Uid::Instance(0xabcdef),
+            Uid::Instance(0xabcdef, None),
             ProcId::new(
-                Uid::Instance(0x123456),
+                Uid::Instance(0x123456, None),
                 Some(Label::new("my-proc").unwrap()),
             ),
             Some(Label::new("my-actor").unwrap()),

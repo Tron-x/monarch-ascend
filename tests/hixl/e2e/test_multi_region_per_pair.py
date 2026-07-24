@@ -28,6 +28,8 @@ import os
 import sys
 
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
+# This regression intentionally exercises the CANN 9.1 AICPU-kernel path.
+os.environ.setdefault("MONARCH_HIXL_USE_LOCAL_COMM_RES", "1")
 
 import torch
 
@@ -38,6 +40,7 @@ except ImportError:
     sys.exit(1)
 
 from monarch._src.rdma.xdma import alloc_aligned_tensor
+from monarch._src.actor.host_mesh import default_bootstrap_cmd
 from monarch.actor import Actor, endpoint, this_host
 from monarch.rdma import RDMABuffer
 
@@ -52,6 +55,16 @@ def npu_device(dev_id: int):
         import torch_npu  # noqa: F401
         torch.npu.set_device(0)
     return _bootstrap
+
+
+def npu_bootstrap_command(dev_id: int):
+    return default_bootstrap_cmd().with_env(
+        {
+            "ASCEND_RT_VISIBLE_DEVICES": str(dev_id),
+            "MONARCH_HIXL_USE_LOCAL_COMM_RES": "1",
+            "MONARCH_NPU_DEVICE": "0",
+        }
+    )
 
 
 class Producer(Actor):
@@ -113,8 +126,16 @@ async def main():
     print("=" * 60)
 
     host = this_host()
-    producer_mesh = host.spawn_procs(per_host={"npus": 1}, bootstrap=npu_device(0))
-    consumer_mesh = host.spawn_procs(per_host={"npus": 1}, bootstrap=npu_device(1))
+    producer_mesh = host.spawn_procs(
+        per_host={"npus": 1},
+        bootstrap=npu_device(0),
+        bootstrap_command=npu_bootstrap_command(0),
+    )
+    consumer_mesh = host.spawn_procs(
+        per_host={"npus": 1},
+        bootstrap=npu_device(1),
+        bootstrap_command=npu_bootstrap_command(1),
+    )
 
     producer = producer_mesh.spawn("producer", Producer)
     consumer = consumer_mesh.spawn("consumer", Consumer)
@@ -150,4 +171,9 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    from monarch._src.actor.actor_mesh import shutdown_context
+
+    try:
+        asyncio.run(main())
+    finally:
+        shutdown_context().get(timeout=75.0)

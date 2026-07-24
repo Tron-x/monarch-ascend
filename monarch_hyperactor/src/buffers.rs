@@ -26,6 +26,9 @@ use serde::Serialize;
 use serde_multipart::Part;
 use typeuri::Named;
 
+use crate::runtime::GilSite;
+use crate::runtime::monarch_with_gil_blocking;
+
 declare_attrs! {
     /// Threshold below which writes are copied into a contiguous buffer.
     /// Writes >= this size are stored as zero-copy references.
@@ -45,7 +48,7 @@ struct KeepPyBytesAlive {
 
 impl KeepPyBytesAlive {
     fn new(py_bytes: Py<PyBytes>) -> Self {
-        let (ptr, len) = Python::attach(|py| {
+        let (ptr, len) = monarch_with_gil_blocking(GilSite::Convert, |py| {
             let bytes_ref = py_bytes.as_bytes(py);
             (bytes_ref.as_ptr(), bytes_ref.len())
         });
@@ -136,7 +139,7 @@ impl Buffer {
     ///
     /// # Returns
     /// The number of bytes written (always equal to the length of input bytes)
-    fn write<'py>(&mut self, buff: &Bound<'py, PyBytes>) -> usize {
+    fn write(&mut self, buff: &Bound<'_, PyBytes>) -> usize {
         let bytes_written = buff.as_bytes().len();
 
         if bytes_written < self.threshold {
@@ -156,7 +159,7 @@ impl Buffer {
     /// # Returns
     /// The total number of bytes stored in the buffer
     fn __len__(&self) -> usize {
-        let fragments_len: usize = Python::attach(|py| {
+        let fragments_len: usize = monarch_with_gil_blocking(GilSite::Convert, |py| {
             self.fragments
                 .iter()
                 .map(|frag| match frag {
@@ -306,7 +309,7 @@ impl FrozenBuffer {
     /// # Returns
     /// A PyBytes object containing the bytes read from the buffer
     #[pyo3(signature=(size=-1))]
-    fn read<'py>(mut slf: PyRefMut<'py, Self>, size: i64) -> Bound<'py, PyBytes> {
+    fn read(mut slf: PyRefMut<'_, Self>, size: i64) -> Bound<'_, PyBytes> {
         let size = if size <= 0 {
             slf.inner.remaining() as i64
         } else {

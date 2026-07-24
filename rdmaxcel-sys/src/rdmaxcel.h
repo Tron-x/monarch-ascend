@@ -20,9 +20,13 @@
 #ifdef __cplusplus
 #include <atomic>
 #define _Atomic(T) std::atomic<T>
+// `noexcept` is C++-only; elide it for bindgen's C parse of this header (the
+// real guarantee is enforced where the definition is compiled as C++).
+#define RDMAXCEL_NOEXCEPT noexcept
 extern "C" {
 #else
 #include <stdatomic.h>
+#define RDMAXCEL_NOEXCEPT
 #endif
 
 typedef enum {
@@ -148,7 +152,10 @@ typedef enum {
   RDMAXCEL_COMPLETION_FAILED = -17, // Completion status not successful
   RDMAXCEL_QP_MODIFY_FAILED = -18, // ibv_modify_qp failed during connect
   RDMAXCEL_AH_CREATE_FAILED = -19, // ibv_create_ah failed
-  RDMAXCEL_UNSUPPORTED_OP = -20 // Unsupported EFA operation type
+  RDMAXCEL_UNSUPPORTED_OP = -20, // Unsupported EFA operation type
+  RDMAXCEL_EXCEPTION = -21, // C++ exception caught at the C-ABI boundary
+  RDMAXCEL_NULL_ARG = -22, // A required pointer argument was NULL
+  RDMAXCEL_DESTROY_MKEY_FAILED = -23 // mlx5dv_destroy_mkey failed
 } rdmaxcel_error_code_t;
 
 // Error/Debugging functions
@@ -164,6 +171,28 @@ int rdma_get_all_registered_segment_info(
     rdma_segment_info_t* info_array,
     int max_count);
 int deregister_segments();
+
+// mlx5dv indirect-mkey binding primitive.
+//
+// Binds the given MR list onto an indirect mkey using `qp`'s WR builder (a
+// connected loopback QP), so the bound MRs are addressable as a single flat
+// zero-based region. Creates the mkey sized to hold `mkey_max_entries` entries
+// when `*mkey` is NULL and writes it back through `mkey`; the caller reads
+// `lkey`/`rkey` off the returned `mlx5dv_mkey`. Returns 0 on success, otherwise
+// a negative `rdmaxcel_error_code_t`; the body catches any C++ exception and
+// reports it as `RDMAXCEL_EXCEPTION`. Declared `noexcept` as a hard backstop so
+// an escape terminates rather than unwinding across the C ABI into Rust.
+int rdmaxcel_bind_mr_list(
+    struct ibv_pd* pd,
+    struct ibv_qp* qp,
+    int access_flags,
+    struct ibv_mr** mrs,
+    size_t mrs_cnt,
+    size_t mkey_max_entries,
+    struct mlx5dv_mkey** mkey) RDMAXCEL_NOEXCEPT;
+
+// Destroy an mkey created by `rdmaxcel_bind_mr_list`. No-op when NULL.
+int rdmaxcel_destroy_mkey(struct mlx5dv_mkey* mkey);
 
 // Scanned segment information - minimal fields needed from external scanner
 // This is what the scanner callback fills in, separate from internal
@@ -279,13 +308,16 @@ void rdmaxcel_qp_store_rts_timestamp(rdmaxcel_qp_t* qp, uint64_t value);
 completion_cache_t* rdmaxcel_qp_get_send_cache(rdmaxcel_qp_t* qp);
 completion_cache_t* rdmaxcel_qp_get_recv_cache(rdmaxcel_qp_t* qp);
 
-// Per-device segment registration.
-// pds and qps are parallel arrays indexed by CUDA device ordinal.
-// num_devices is the length of both arrays.
+// Per-device segment registration. pds and qps are parallel arrays
+// indexed by CUDA device ordinal; num_devices is their length.
+// max_sge_override > 0 replaces ibv_query_device(...).max_sge for
+// this call (test-only knob to force RDMAXCEL_MKEY_REG_LIMIT); pass
+// 0 in production.
 int register_segments(
     struct ibv_pd** pds,
     rdmaxcel_qp_t** qps,
-    int num_devices);
+    int num_devices,
+    int32_t max_sge_override);
 
 // Completion Cache Structures and Functions
 #define MAX_CACHED_COMPLETIONS 128

@@ -30,6 +30,7 @@ use std::sync::Weak;
 use std::time::Duration;
 use std::time::SystemTime;
 
+use anyhow::Context;
 use async_trait::async_trait;
 use base64::prelude::*;
 use futures::StreamExt;
@@ -38,6 +39,9 @@ use humantime::format_duration;
 use hyperactor::ActorAddr;
 use hyperactor::ActorHandle;
 use hyperactor::ActorRef;
+use hyperactor::Endpoint as _;
+use hyperactor::Gateway;
+use hyperactor::Label;
 use hyperactor::ProcAddr;
 use hyperactor::channel;
 use hyperactor::channel::ChannelAddr;
@@ -46,11 +50,12 @@ use hyperactor::channel::ChannelTransport;
 use hyperactor::channel::Rx;
 use hyperactor::channel::Tx;
 use hyperactor::context;
+use hyperactor::id::Uid;
 use hyperactor::mailbox::IntoBoxedMailboxSender;
 use hyperactor::mailbox::MailboxClient;
 use hyperactor::mailbox::MailboxServer;
-use hyperactor::mailbox::MailboxServerHandle;
 use hyperactor::proc::Proc;
+use hyperactor_cast::cast_actor::CAST_ACTOR_NAME;
 use hyperactor_config::CONFIG;
 use hyperactor_config::ConfigAttr;
 use hyperactor_config::attrs::Attrs;
@@ -76,8 +81,8 @@ use crate::host::SingleTerminate;
 use crate::host::TerminateError;
 use crate::host::TerminateSummary;
 use crate::host::WaitError;
+use crate::host_mesh::host_agent::HOST_MESH_AGENT_ACTOR_NAME;
 use crate::host_mesh::host_agent::HostAgent;
-use crate::host_mesh::host_agent::HostAgentMode;
 use crate::logging::OutputTarget;
 use crate::logging::StreamFwder;
 use crate::proc_agent::ProcAgent;
@@ -218,7 +223,7 @@ pub async fn halt<R>() -> R {
 /// keeps its mailbox server (and Unix socket) alive so new clients can
 /// reconnect to the same address.
 pub struct HostShutdownHandle {
-    rx: tokio::sync::oneshot::Receiver<MailboxServerHandle>,
+    rx: tokio::sync::oneshot::Receiver<hyperactor::gateway::GatewayServeHandle>,
     exit_on_shutdown: bool,
 }
 
@@ -227,9 +232,12 @@ impl HostShutdownHandle {
     /// and optionally exit the process.
     pub async fn join(self) {
         match self.rx.await {
-            Ok(mailbox_handle) => {
-                mailbox_handle.stop("host shutting down");
-                let _ = mailbox_handle.await;
+            Ok(mut serve_handle) => {
+                // Stop signals the frontend server and unwinds its
+                // bookkeeping; join then awaits teardown so pending
+                // messages drain before we return.
+                serve_handle.stop("host shutdown: draining frontend mailbox server");
+                let _ = serve_handle.join().await;
             }
             Err(_) => {} // sender dropped without sending — nothing to drain
         }
@@ -239,23 +247,45 @@ impl HostShutdownHandle {
     }
 }
 
-/// Bootstrap a host in this process, returning a handle to the mesh agent.
+/// Bootstrap a host in this process using a caller-provided gateway.
 ///
-/// To obtain the local proc, use `GetLocalProc` on the returned host mesh agent,
-/// then use `GetProc` on the returned proc mesh agent.
+/// The caller passes the [`Gateway`] in — typically [`Gateway::new`],
+/// but it may have been pre-configured (e.g., via
+/// [`Gateway::serve_via`] or [`Gateway::attach`] to connect to
+/// another gateway) before this call. Host construction serves the
+/// gateway's backend and frontend endpoints, so the host's
+/// `system_proc`, `local_proc`, `HostAgent`, and handler ports
+/// snapshot the frontend location when minted. Any preconfigured
+/// `serve_via` session remains active as an outbound route and local
+/// delivery location.
 ///
-/// - `addr`: the listening address of the host; this is used to bind the frontend address;
-/// - `command`: optional bootstrap command to spawn procs, otherwise [`BootstrapProcManager::current`];
+/// Returns `(host_mesh_agent, shutdown_handle)`:
+///
+/// - `host_mesh_agent` is the [`HostAgent`] actor handle. To obtain the
+///   local proc, use `GetLocalProc` on this agent, then `GetProc` on the
+///   returned proc mesh agent.
+/// - `shutdown_handle` joins the host's accept loop and runs the
+///   drain protocol; see [`HostShutdownHandle`].
+///
+/// - `addr`: the listening address of the host; this is used for the frontend server.
+/// - `command`: optional bootstrap command to spawn procs, otherwise [`BootstrapProcManager::current`].
 /// - `config`: optional runtime config overlay.
 /// - `exit_on_shutdown`: if true, [`HostShutdownHandle::join`] will call `process::exit` after draining.
 /// - `listener`: when `Some`, it is used as the frontend listening socket
 ///   instead of binding a new one.
+/// - `gateway`: the gateway this host will multiplex traffic through.
+/// - `via`: when `Some`, attach `gateway` to this remote duplex address
+///   with `serve_via` during bootstrap — after the local serves but
+///   before any ref is minted — so refs advertise the routable `Via`
+///   location (used by out-of-cluster clients).
 pub async fn host(
     addr: ChannelAddr,
     command: Option<BootstrapCommand>,
     config: Option<Attrs>,
     exit_on_shutdown: bool,
     listener: Option<std::net::TcpListener>,
+    gateway: Gateway,
+    via: Option<ChannelAddr>,
 ) -> anyhow::Result<(ActorHandle<HostAgent>, HostShutdownHandle)> {
     if let Some(attrs) = config {
         hyperactor_config::global::set(hyperactor_config::global::Source::Runtime, attrs);
@@ -270,23 +300,28 @@ pub async fn host(
     };
     let manager = BootstrapProcManager::new(command)?;
 
-    let host = Host::new_with_default(manager, addr, None, listener).await?;
+    let host = Host::new_with_gateway(manager, addr, listener, gateway, via).await?;
     let addr = host.addr().clone();
 
-    // The ShutdownHost handler will call host.serve() inside
-    // HostAgent::init (after this.bind::<Self>(), so the actor port is bound
-    // before the frontend starts routing messages), then send the resulting
-    // MailboxServerHandle back here for draining.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<MailboxServerHandle>();
+    // The ShutdownHost handler will send the gateway serve handle back here
+    // for draining. The frontend starts before HostAgent is spawned, and the
+    // host address is published only after HostAgent binds its handler.
+    let (shutdown_tx, shutdown_rx) =
+        tokio::sync::oneshot::channel::<hyperactor::gateway::GatewayServeHandle>();
 
     let system_proc = host.system_proc().clone();
-    let host_mesh_agent = system_proc.spawn::<HostAgent>(
-        "host_agent",
-        HostAgent::new(HostAgentMode::Process {
-            host,
-            shutdown_tx: Some(shutdown_tx),
-        }),
+    let host_mesh_agent = system_proc.spawn_with_uid(
+        Uid::singleton(Label::new(HOST_MESH_AGENT_ACTOR_NAME).unwrap()),
+        HostAgent::new_process(host, Some(shutdown_tx)),
     )?;
+    HostAgent::wait_initialized(&host_mesh_agent).await?;
+
+    let cast_handle = system_proc.spawn_with_uid(
+        Uid::singleton(Label::strip(CAST_ACTOR_NAME)),
+        hyperactor_cast::cast_actor::CastActor::default(),
+    )?;
+
+    cast_handle.bind::<hyperactor_cast::cast_actor::CastActor>();
 
     tracing::info!(
         "serving host at {}, agent: {}",
@@ -338,6 +373,9 @@ pub enum Bootstrap {
     Host {
         /// The address on which to serve the host.
         addr: ChannelAddr,
+        /// Callback used to publish host readiness after the [`HostAgent`] and
+        /// cast actor are bound.
+        callback_addr: ChannelAddr,
         /// If specified, use the provided command instead of
         /// [`BootstrapCommand::current`].
         command: Option<BootstrapCommand>,
@@ -349,6 +387,51 @@ pub enum Bootstrap {
         /// If true, exit the process after handling a shutdown request.
         exit_on_shutdown: bool,
     },
+}
+
+/// Parent side of the host-bootstrap readiness callback.
+pub struct HostBootstrapReady {
+    host_addr: ChannelAddr,
+    callback_addr: ChannelAddr,
+    callback_rx: hyperactor::channel::ChannelRx<()>,
+}
+
+impl HostBootstrapReady {
+    pub fn new(host_addr: ChannelAddr) -> Result<Self, ChannelError> {
+        let (callback_addr, callback_rx) =
+            channel::serve(ChannelAddr::any(ChannelTransport::Unix))?;
+        Ok(Self {
+            host_addr,
+            callback_addr,
+            callback_rx,
+        })
+    }
+
+    pub fn callback_addr(&self) -> ChannelAddr {
+        self.callback_addr.clone()
+    }
+
+    pub async fn wait(mut self) -> anyhow::Result<()> {
+        let timeout = hyperactor_config::global::get(hyperactor::config::HOST_SPAWN_READY_TIMEOUT);
+        if timeout.is_zero() {
+            self.callback_rx.recv().await.with_context(|| {
+                format!("host {} closed its bootstrap callback", self.host_addr)
+            })?;
+        } else {
+            tokio::time::timeout(timeout, self.callback_rx.recv())
+                .await
+                .with_context(|| {
+                    format!(
+                        "host {} did not become ready within {:?}",
+                        self.host_addr, timeout
+                    )
+                })?
+                .with_context(|| {
+                    format!("host {} closed its bootstrap callback", self.host_addr)
+                })?;
+        }
+        Ok(())
+    }
 }
 
 impl Bootstrap {
@@ -473,12 +556,7 @@ impl Bootstrap {
                 }
 
                 let local_addr = proc_id.addr().clone();
-                // TODO provide a direct way to construct these
-                let serve_addr = format!(
-                    "unix:{}",
-                    socket_dir_path.join(proc_id.resource_name()).display()
-                );
-                let serve_addr = serve_addr.parse().unwrap();
+                let (serve_addr, _) = local_proc_addr(&socket_dir_path, proc_id.id())?;
 
                 // The following is a modified host::spawn_proc to support direct
                 // dialing between local procs: 1) we bind each proc to a deterministic
@@ -520,12 +598,25 @@ impl Bootstrap {
             }
             Bootstrap::Host {
                 addr,
+                callback_addr,
                 command,
                 config,
                 exit_on_shutdown,
             } => {
-                let (_agent_handle, shutdown) =
-                    host(addr, command, config, exit_on_shutdown, None).await?;
+                let (_agent_handle, shutdown) = host(
+                    addr,
+                    command,
+                    config,
+                    exit_on_shutdown,
+                    None,
+                    Gateway::global().clone(),
+                    None,
+                )
+                .await?;
+                channel::dial(callback_addr)?
+                    .send(())
+                    .await
+                    .map_err(ChannelError::from)?;
                 shutdown.join().await;
                 halt().await
             }
@@ -823,9 +914,9 @@ impl BootstrapProcHandle {
         }
     }
 
-    /// Return the logical proc identity in the mesh.
+    /// Return the logical proc address in the mesh.
     #[inline]
-    pub fn proc_id(&self) -> &ProcAddr {
+    pub fn proc_addr(&self) -> &ProcAddr {
         &self.proc_id
     }
 
@@ -1208,12 +1299,12 @@ impl BootstrapProcHandle {
         // killing the process.
         let mut agent_port = agent.port();
         agent_port.return_undeliverable(false);
-        agent_port.send(
+        agent_port.post(
             cx,
             resource::StopAll {
                 reason: reason.to_string(),
             },
-        )?;
+        );
         // The agent handling Stop should exit the process, if it doesn't within
         // the time window, we escalate to SIGTERM.
         match tokio::time::timeout(timeout, self.wait()).await {
@@ -1230,7 +1321,7 @@ impl ProcHandle for BootstrapProcHandle {
     type TerminalStatus = ProcStatus;
 
     #[inline]
-    fn proc_id(&self) -> &ProcAddr {
+    fn proc_addr(&self) -> &ProcAddr {
         &self.proc_id
     }
 
@@ -1327,7 +1418,7 @@ impl ProcHandle for BootstrapProcHandle {
                     // Variety of possible errors, proceed with launcher termination.
                     tracing::warn!(
                         "ProcAgent {} could not successfully stop all actors: {}",
-                        agent.actor_id(),
+                        agent.actor_addr(),
                         e,
                     );
                 }
@@ -1748,7 +1839,7 @@ impl BootstrapProcManager {
         if let Some(agent) = handle.agent_ref() {
             let mut agent_port = agent.port();
             agent_port.return_undeliverable(false);
-            let _ = agent_port.send(
+            let _ = agent_port.post(
                 cx,
                 resource::StopAll {
                     reason: reason.to_string(),
@@ -1800,10 +1891,10 @@ impl BootstrapProcManager {
             }
 
             // Fall back to launcher-provided tail if we didn't capture.
-            if stderr_tail.is_empty() {
-                if let Some(tail) = exit_result.stderr_tail {
-                    stderr_tail = tail;
-                }
+            if stderr_tail.is_empty()
+                && let Some(tail) = exit_result.stderr_tail
+            {
+                stderr_tail = tail;
             }
 
             let tail_str = if stderr_tail.is_empty() {
@@ -2290,6 +2381,26 @@ impl Write for Debug {
     }
 }
 
+/// Build the bind/dial [`ChannelAddr`] for a local proc within `socket_dir`.
+pub(crate) fn local_proc_addr(
+    socket_dir: &Path,
+    proc_id: &hyperactor::id::ProcId,
+) -> anyhow::Result<(ChannelAddr, PathBuf)> {
+    let path = proc_id.to_path_elem(socket_dir);
+    let addr = std::os::unix::net::SocketAddr::from_pathname(path.clone())
+        .with_context(|| {
+            format!(
+                "constructing unix socket address for proc {proc_id} \
+            at {} ({} bytes); path must fit within SUN_LEN \
+             (108 on Linux, 104 on macOS)",
+                path.display(),
+                path.as_os_str().len()
+            )
+        })?
+        .into();
+    Ok((addr, path))
+}
+
 /// Create a new runtime [`TempDir`]. The directory is created in
 /// `$XDG_RUNTIME_DIR` if set and the directory exists, otherwise
 /// falling back to the system tempdir.
@@ -2316,6 +2427,43 @@ mod tests {
     use hyperactor_config::Flattrs;
 
     use super::*;
+
+    #[tokio::test]
+    async fn test_host_bootstrap_ready_callback() {
+        let host_addr = ChannelAddr::any(ChannelTransport::Unix);
+        let ready = HostBootstrapReady::new(host_addr).expect("open readiness callback");
+        let callback_addr = ready.callback_addr();
+        let sender = tokio::spawn(async move {
+            channel::dial(callback_addr)
+                .expect("dial readiness callback")
+                .send(())
+                .await
+                .expect("send readiness callback");
+        });
+
+        ready.wait().await.expect("receive readiness callback");
+        sender.await.expect("readiness sender task");
+    }
+
+    #[tokio::test]
+    async fn test_host_bootstrap_ready_times_out_without_callback() {
+        let config = hyperactor_config::global::lock();
+        let _timeout = config.override_key(
+            hyperactor::config::HOST_SPAWN_READY_TIMEOUT,
+            Duration::from_millis(20),
+        );
+        let host_addr = ChannelAddr::any(ChannelTransport::Unix);
+        let ready = HostBootstrapReady::new(host_addr).expect("open readiness callback");
+
+        let error = ready
+            .wait()
+            .await
+            .expect_err("missing callback must fail closed");
+        assert!(
+            error.to_string().contains("did not become ready"),
+            "unexpected readiness error: {error:#}"
+        );
+    }
 
     #[test]
     fn test_bootstrap_mode_env_string_none_config_proc() {
@@ -2346,6 +2494,7 @@ mod tests {
     fn test_bootstrap_mode_env_string_none_config_host() {
         let value = Bootstrap::Host {
             addr: ChannelAddr::any(ChannelTransport::Unix),
+            callback_addr: ChannelAddr::any(ChannelTransport::Unix),
             command: None,
             config: None,
             exit_on_shutdown: false,
@@ -2405,6 +2554,7 @@ mod tests {
         {
             let original = Bootstrap::Host {
                 addr: ChannelAddr::any(ChannelTransport::Unix),
+                callback_addr: ChannelAddr::any(ChannelTransport::Unix),
                 command: None,
                 config: Some(attrs.clone()),
                 exit_on_shutdown: false,
@@ -2448,7 +2598,7 @@ mod tests {
         proc.clone().serve(proc_rx);
         let proc_ref: ProcAddr = test_proc_id("client_0");
         router.bind(proc_ref, proc_addr.clone());
-        let (client, _handle) = proc.instance("client").unwrap();
+        let client = proc.client("client");
 
         let (tap_tx, mut tap_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         test_tap::install(tap_tx);
@@ -2462,8 +2612,7 @@ mod tests {
         // Spawn the log client and disable aggregation (immediate
         // print + tap push).
         let log_client_actor = LogClientActor::new((), Flattrs::default()).await.unwrap();
-        let log_client: ActorRef<LogClientActor> =
-            proc.spawn("log_client", log_client_actor).unwrap().bind();
+        let log_client: ActorRef<LogClientActor> = proc.spawn(log_client_actor).bind();
         log_client.set_aggregate(&client, None).await.unwrap();
 
         // Spawn the forwarder in this proc (it will serve
@@ -2471,10 +2620,7 @@ mod tests {
         let log_forwarder_actor = LogForwardActor::new(log_client.clone(), Flattrs::default())
             .await
             .unwrap();
-        let _log_forwarder: ActorRef<LogForwardActor> = proc
-            .spawn("log_forwarder", log_forwarder_actor)
-            .unwrap()
-            .bind();
+        let _log_forwarder: ActorRef<LogForwardActor> = proc.spawn(log_forwarder_actor).bind();
 
         // Dial the channel but don't post until we know the forwarder
         // is receiving.
@@ -2648,8 +2794,8 @@ mod tests {
             assert!(h.mark_running(t0));
             // Build a consistent AgentRef for Ready using the
             // handle's ProcAddr.
-            let proc_id = <BootstrapProcHandle as ProcHandle>::proc_id(&h);
-            let actor_id = proc_id.actor_ref(crate::proc_agent::PROC_AGENT_ACTOR_NAME);
+            let proc_id = <BootstrapProcHandle as ProcHandle>::proc_addr(&h);
+            let actor_id = proc_id.actor_addr(crate::proc_agent::PROC_AGENT_ACTOR_NAME);
             let agent_ref: ActorRef<ProcAgent> = ActorRef::attest(actor_id);
             // Ready -> Stopping -> Stopped should be legal.
             assert!(h.mark_ready(addr, agent_ref));
@@ -2666,8 +2812,8 @@ mod tests {
             assert!(h.mark_running(t0));
             // Build a consistent AgentRef for Ready using the
             // handle's ProcAddr.
-            let proc_id = <BootstrapProcHandle as ProcHandle>::proc_id(&h);
-            let actor_id = proc_id.actor_ref(crate::proc_agent::PROC_AGENT_ACTOR_NAME);
+            let proc_id = <BootstrapProcHandle as ProcHandle>::proc_addr(&h);
+            let actor_id = proc_id.actor_addr(crate::proc_agent::PROC_AGENT_ACTOR_NAME);
             let agent: ActorRef<ProcAgent> = ActorRef::attest(actor_id);
             // Running -> Ready
             assert!(h.mark_ready(addr, agent));
@@ -2799,7 +2945,7 @@ mod tests {
         let started_at = std::time::SystemTime::now();
         assert!(handle.mark_running(started_at));
 
-        let actor_id = proc_id.actor_ref(crate::proc_agent::PROC_AGENT_ACTOR_NAME);
+        let actor_id = proc_id.actor_addr(crate::proc_agent::PROC_AGENT_ACTOR_NAME);
         let agent_ref: ActorRef<ProcAgent> = ActorRef::attest(actor_id);
 
         // Pick any addr to carry in Ready (what the child would have
@@ -2844,7 +2990,7 @@ mod tests {
         let addr = ChannelAddr::any(ChannelTransport::Unix);
         let agent = ActorRef::attest(
             test_proc_id_with_addr(addr.clone(), "proc")
-                .actor_id(crate::proc_agent::PROC_AGENT_ACTOR_NAME),
+                .actor_addr(crate::proc_agent::PROC_AGENT_ACTOR_NAME),
         );
 
         let st = ProcStatus::Ready {
@@ -2881,7 +3027,7 @@ mod tests {
                 addr: ChannelAddr::any(ChannelTransport::Unix),
                 agent: ActorRef::attest(
                     test_proc_id_with_addr(ChannelAddr::any(ChannelTransport::Unix), "x")
-                        .actor_id(crate::proc_agent::PROC_AGENT_ACTOR_NAME),
+                        .actor_addr(crate::proc_agent::PROC_AGENT_ACTOR_NAME),
                 ),
             },
             ProcStatus::Killed {
@@ -2911,7 +3057,7 @@ mod tests {
         // Synthesize Ready data
         let addr = ChannelAddr::any(ChannelTransport::Unix);
         let agent: ActorRef<ProcAgent> =
-            ActorRef::attest(proc_id.actor_ref(crate::proc_agent::PROC_AGENT_ACTOR_NAME));
+            ActorRef::attest(proc_id.actor_addr(crate::proc_agent::PROC_AGENT_ACTOR_NAME));
         assert!(handle.mark_ready(addr, agent));
 
         // Call the trait method (not ready_inner).
@@ -2963,8 +3109,9 @@ mod tests {
     /// - `backend_addr`: a mailbox address served by the **parent
     ///   (host) proc** here; the spawned bootstrap process dials this
     ///   so its messages route via the host.
+    #[cfg(fbcode_build)]
     async fn make_proc_id_and_backend_addr(
-        instance: &hyperactor::Instance<()>,
+        instance: &hyperactor::Client,
         _tag: &str,
     ) -> (ProcAddr, ChannelAddr) {
         // Serve a Unix channel as the "backend_addr" and hook it into
@@ -2988,7 +3135,7 @@ mod tests {
         // Create a root direct-addressed proc + client instance.
         let root =
             hyperactor::Proc::direct(ChannelTransport::Unix.any(), "root".to_string()).unwrap();
-        let (instance, _handle) = root.instance("client").unwrap();
+        let instance = root.client("client");
 
         let mgr = BootstrapProcManager::new(BootstrapCommand::test()).unwrap();
         let (proc_id, backend_addr) = make_proc_id_and_backend_addr(&instance, "t_term").await;
@@ -3055,7 +3202,7 @@ mod tests {
         // Root proc + client instance (so the child can dial back).
         let root =
             hyperactor::Proc::direct(ChannelTransport::Unix.any(), "root".to_string()).unwrap();
-        let (instance, _handle) = root.instance("client").unwrap();
+        let instance = root.client("client");
 
         let mgr = BootstrapProcManager::new(BootstrapCommand::test()).unwrap();
 
@@ -3108,14 +3255,16 @@ mod tests {
 
         // Create a local instance just to call the local bootstrap actor.
         // We should find a way to avoid this for local handles.
-        let temp_proc = Proc::local();
-        let (temp_instance, _) = temp_proc.instance("temp").unwrap();
+        let temp_proc = Proc::isolated();
+        let temp_instance = temp_proc.client("temp");
 
         let handle = host(
             ChannelAddr::any(ChannelTransport::Unix),
             Some(BootstrapCommand::test()),
             None,
             false,
+            None,
+            Gateway::global().clone(),
             None,
         )
         .await
@@ -3152,6 +3301,7 @@ mod tests {
     }
 
     impl DummyLauncher {
+        #[allow(dead_code)]
         fn new(marker: u64) -> Self {
             Self { marker }
         }

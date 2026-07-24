@@ -19,7 +19,6 @@ from unittest.mock import AsyncMock, patch
 import cloudpickle
 import monarch
 import pytest
-import torch
 from isolate_in_subprocess import isolate_in_subprocess
 from monarch._src.actor.actor_mesh import (
     Actor,
@@ -28,6 +27,7 @@ from monarch._src.actor.actor_mesh import (
     current_rank,
     IN_PAR,
 )
+from monarch._src.actor.concurrent import concurrent_endpoint
 from monarch._src.actor.debugger.debug_command import (
     Attach,
     Cast,
@@ -58,12 +58,6 @@ from scoped_state import scoped_state
 
 
 TActor = TypeVar("TActor", bound=Actor)
-
-
-needs_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA not available",
-)
 
 
 debug_env = {
@@ -130,7 +124,7 @@ class DebugControllerForTesting(DebugController):
         super().__init__()
         self._debug_io = DebugStdIO()
 
-    @endpoint
+    @concurrent_endpoint
     async def blocking_enter(self):
         async with self._task_lock:
             assert self._task is None
@@ -164,8 +158,8 @@ async def _test_debug(nested: bool) -> None:
             debugee = proc.spawn("debugee", DebugeeActor)
         else:
             proc = state.hosts.spawn_procs()
-            debugee = proc.spawn("debugee", DebugeeActor).nested.choose().get()
-        name = debugee.name.choose().get()
+            debugee = await proc.spawn("debugee", DebugeeActor).nested.choose()
+        name = await debugee.name.choose()
 
         input_mock = AsyncMock()
         input_mock.side_effect = [
@@ -291,6 +285,7 @@ async def _test_debug(nested: bool) -> None:
                         breakpoints[i].function
                         == "test_debugger._debugee_actor_internal"
                     )
+                    # pyrefly: ignore [unsupported-operation]
                     assert breakpoints[i].lineno == initial_linenos[i] + 2
                 else:
                     assert (
@@ -345,10 +340,6 @@ async def _test_debug(nested: bool) -> None:
 # debug controller per process, and we don't want this to interfere with
 # the other tests that access the debug controller.
 @isolate_in_subprocess(env=debug_env)
-@pytest.mark.skipif(
-    torch.cuda.device_count() < 2,
-    reason="Not enough GPUs, this test requires at least 2 GPUs",
-)
 @pytest.mark.timeout(60)
 async def test_debug():
     await _test_debug(nested=False)
@@ -356,10 +347,6 @@ async def test_debug():
 
 # See earlier comment.
 @isolate_in_subprocess(env=debug_env)
-@pytest.mark.skipif(
-    torch.cuda.device_count() < 2,
-    reason="Not enough GPUs, this test requires at least 2 GPUs",
-)
 @pytest.mark.timeout(60)
 async def test_debug_nested():
     await _test_debug(nested=True)
@@ -367,18 +354,14 @@ async def test_debug_nested():
 
 # See earlier comment
 @isolate_in_subprocess(env=debug_env)
-@pytest.mark.skipif(
-    torch.cuda.device_count() < 2,
-    reason="Not enough GPUs, this test requires at least 2 GPUs",
-)
 @pytest.mark.timeout(60)
 async def test_debug_multi_actor() -> None:
     with scoped_state(ProcessJob({"hosts": 2}), cached_path=None) as state:
         proc = state.hosts.spawn_procs(per_host={"gpus": 2})
         debugee_1 = proc.spawn("debugee_1", DebugeeActor)
         debugee_2 = proc.spawn("debugee_2", DebugeeActor)
-        name_1 = debugee_1.name.choose().get()
-        name_2 = debugee_2.name.choose().get()
+        name_1 = await debugee_1.name.choose()
+        name_2 = await debugee_2.name.choose()
 
         input_mock = AsyncMock()
         input_mock.side_effect = [
@@ -434,6 +417,7 @@ async def test_debug_multi_actor() -> None:
                     assert breakpoints[i].rank == 1
                     assert (
                         breakpoints[i].lineno
+                        # pyrefly: ignore [unsupported-operation]
                         == initial_linenos[breakpoints[i].rank] + 1
                     )
                 elif i == 6:
@@ -441,6 +425,7 @@ async def test_debug_multi_actor() -> None:
                     assert breakpoints[i].rank == 2
                     assert (
                         breakpoints[i].lineno
+                        # pyrefly: ignore [unsupported-operation]
                         == initial_linenos[breakpoints[i].rank] + 1
                     )
                 else:
@@ -800,19 +785,15 @@ async def test_debug_command_parser_invalid_inputs(invalid_input):
 
 # See earlier comment
 @isolate_in_subprocess(env={"MONARCH_CLI_BIN": cli_bin, **debug_env})
-@pytest.mark.skipif(
-    torch.cuda.device_count() < 2,
-    reason="Not enough GPUs, this test requires at least 2 GPUs",
-)
 @pytest.mark.timeout(60)
 async def test_debug_cli():
     with scoped_state(ProcessJob({"hosts": 2}), cached_path=None) as state:
         proc = state.hosts.spawn_procs(per_host={"gpus": 2})
         debugee = proc.spawn("debugee", DebugeeActor)
-        name = debugee.name.choose().get()
-        debug_controller = get_or_spawn_controller(
+        name = await debugee.name.choose()
+        debug_controller = await get_or_spawn_controller(
             "debug_controller", DebugControllerForTesting
-        ).get()
+        )
 
         fut = debugee.to_debug.call()
         # Stupidly high timeout because when CI tries to run many instances of this
@@ -829,7 +810,7 @@ async def test_debug_cli():
             assert info.function == "test_debugger._debugee_actor_internal"
             assert info.lineno == cast(int, breakpoints[0].lineno) + 5 * info.rank
 
-        port = debug_controller.server_port.call_one().get()
+        port = await debug_controller.server_port.call_one()
 
         async def create_debug_cli_proc() -> Tuple[
             Optional[asyncio.subprocess.Process],
@@ -968,6 +949,7 @@ async def test_debug_cli():
                 assert (
                     breakpoints[i].function == "test_debugger._debugee_actor_internal"
                 )
+                # pyrefly: ignore [unsupported-operation]
                 assert breakpoints[i].lineno == initial_linenos[i] + 2
             else:
                 assert (
@@ -1178,7 +1160,7 @@ async def test_debug_with_pickle_by_value():
     with scoped_state(ProcessJob({"hosts": 1}), cached_path=None) as state:
         pm = state.hosts.spawn_procs(per_host={"gpus": 1})
         debugee = pm.spawn("debugee", ClosureDebugeeActor)
-        name = debugee.name.choose().get()
+        name = await debugee.name.choose()
 
         input_mock = AsyncMock()
         input_mock.side_effect = [
@@ -1221,16 +1203,16 @@ async def test_debug_with_pickle_by_value():
                 new=output_mock,
             ),
         ):
-            debug_controller = get_or_spawn_controller(
+            debug_controller = await get_or_spawn_controller(
                 "debug_controller", DebugControllerForTesting
-            ).get()
+            )
 
             # Spawn a special source loader that knows how to retrieve the source code
             # for /tmp/monarch_test/class_closure.py and
             # /tmp/monarch_test/function_closure.py
-            get_or_spawn_controller(
+            await get_or_spawn_controller(
                 "source_loader", SourceLoaderControllerWithMockedSource
-            ).get()
+            )
 
             class_closure = load_class_closure()
             func_bp_true, func_bp_false = load_func_closure()
@@ -1240,7 +1222,7 @@ async def test_debug_with_pickle_by_value():
             assert breakpoints[0].function == "class_closure.get_arg"
             assert breakpoints[0].lineno == 14
 
-            debug_controller.blocking_enter.call_one().get()
+            await debug_controller.blocking_enter.call_one()
 
             assert (
                 "> /tmp/monarch_test/class_closure.py(14)get_arg()\n-> return self.arg"
@@ -1254,7 +1236,7 @@ async def test_debug_with_pickle_by_value():
             assert breakpoints[0].function == "class_closure.get_arg"
             assert breakpoints[0].lineno == 14
 
-            debug_controller.blocking_enter.call_one().get()
+            await debug_controller.blocking_enter.call_one()
 
             expected_backtrace = [
                 (
@@ -1278,7 +1260,7 @@ async def test_debug_with_pickle_by_value():
             assert breakpoints[0].function == "function_closure.func"
             assert breakpoints[0].lineno == 5
 
-            debug_controller.blocking_enter.call_one().get()
+            await debug_controller.blocking_enter.call_one()
 
             assert (
                 "> /tmp/monarch_test/function_closure.py(5)func()\n-> return internal().get_arg() + arg"
@@ -1294,13 +1276,13 @@ async def test_debug_with_pickle_by_value():
             assert breakpoints[0].function == "class_closure.__init__"
             assert breakpoints[0].lineno == 10
 
-            debug_controller.blocking_enter.call_one().get()
+            await debug_controller.blocking_enter.call_one()
 
             breakpoints = await _wait_for_breakpoints(debug_controller, 1)
             assert breakpoints[0].function == "class_closure.get_arg"
             assert breakpoints[0].lineno == 14
 
-            debug_controller.blocking_enter.call_one().get()
+            await debug_controller.blocking_enter.call_one()
 
             await _wait_for_breakpoints(debug_controller, 0)
 

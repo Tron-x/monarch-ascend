@@ -10,7 +10,8 @@
 7. [Error Handling in Meshes](#error-handling-in-meshes)
 8. [Advanced Patterns](#advanced-patterns)
 9. [CPU/NUMA Binding](#cpunuma-binding)
-10. [Best Practices](#best-practices)
+10. [Bootstrap Command Customization](#bootstrap-command-customization)
+11. [Best Practices](#best-practices)
 
 ---
 
@@ -159,16 +160,58 @@ sequenceDiagram
 ### 4. Termination Phase
 
 **Normal Termination:**
-- All child actors terminated
-- Mailbox drained
-- Resources cleaned up
-- Parent notified
+- Triggered by `ActorMesh.stop()`
+- Mailbox drained, `__cleanup__` runs, parent notified
 
 **Error Termination:**
-- Unhandled exception in handler
-- Propagated to supervisor
+- Triggered by an unhandled exception in a handler
+- `__cleanup__` runs, then the failure is propagated to the supervisor
 - Supervision tree handles recovery (see [Error Handling in Meshes](#error-handling-in-meshes))
-- All child actors terminated
+
+**The `__cleanup__` Method:**
+
+The same `__cleanup__` runs in both normal and error termination. The `exc` argument is `None` on a normal stop and carries the exception on an error stop.
+
+```python
+class FileWriter(Actor):
+    def __init__(self, path: str):
+        self.f = open(path, "w")
+
+    @endpoint
+    def write(self, line: str) -> None:
+        self.f.write(line)
+
+    def __cleanup__(self, exc: Exception | None) -> None:
+        # Runs on normal stop and on error termination.
+        # `exc` carries the exception that caused the stop, if any.
+        self.f.close()
+```
+
+**When It Runs:**
+- Called automatically in both normal and error termination
+- *Not* called on fatal failures such as OOMs, panics, or fatal signals (e.g., `SIGSEGV`)
+- Cancelled if it exceeds `HYPERACTOR_CLEANUP_TIMEOUT`, which puts the actor in an error state
+
+**What Has Already Happened:**
+- Every mesh this actor owns has already been stopped recursively
+- Each owned actor's `__cleanup__` has already run
+- Owned actor meshes and proc meshes are no longer usable from this method
+- For shutdown work that needs an owned mesh, expose a dedicated endpoint and call it before `stop()`
+
+**What to Clean Up Here:**
+- Open files and network connections
+- Background threads and asyncio tasks
+- Other resources the actor owns directly (not other actors or procs)
+
+**Sync vs. Async:**
+- Override with `def` or `async def`; the async-ness must match the actor's endpoints
+- Actors with sync endpoints require a sync `__cleanup__`
+- Actors with async endpoints require an async `__cleanup__`
+- An `async def` override is awaited on the actor's asyncio event loop, the same loop that runs endpoint coroutines, so it may `await` other endpoints or I/O
+- A sync override runs under `fake_sync_state` and cannot observe a running loop with `asyncio.get_running_loop`
+
+**Errors in `__cleanup__`:**
+- A raise is treated as a new supervision event chained to the one being handled, matching the `__exit__` convention for context managers
 
 ---
 
@@ -213,12 +256,15 @@ Call a single actor and get response.
 ```python
 calc = this_proc().spawn("calc", Calculator)
 
-# Synchronous wait for result
+# Synchronous wait for result (blocks the calling thread)
 result = calc.add.call_one(5, 3).get()
 print(result)  # 8
 
-# Async await
+# Async await (on an asyncio event loop)
 result = await calc.add.call_one(5, 3)
+
+# Or bridge to a standard asyncio.Future explicitly
+result = await calc.add.call_one(5, 3).as_asyncio()
 ```
 
 **Use When:**
@@ -753,7 +799,96 @@ If you own a mesh of N actors, each of which generates a supervision error, it m
 
 ## Advanced Patterns
 
-### 1. Explicit Response Ports
+### 1. Concurrent Endpoints
+
+Use `@concurrent_endpoint` when one async endpoint should continue running while
+the actor accepts later messages. This is a convenience wrapper for common
+request/response endpoints; it preserves the normal `call()`, `call_one()`, and
+`stream()` API while running the endpoint body in an `asyncio` task.
+
+For two messages sent from the same source actor to `@concurrent_endpoint`
+methods on the same target actor, the first endpoint body starts before the
+second. This is only a start-order guarantee: the first endpoint runs until its
+first `await`, not to completion, before the second starts.
+
+Warning: if you mix `@concurrent_endpoint` with normal `@endpoint` methods, a
+normal endpoint that follows a concurrent endpoint may run before the
+concurrent endpoint body has started.
+
+```python
+import asyncio
+from monarch.actor import Actor, concurrent_endpoint, endpoint
+
+class Gate(Actor):
+    def __init__(self):
+        self.ready = asyncio.Event()
+        self.unblock = asyncio.Event()
+
+    @concurrent_endpoint
+    async def wait(self) -> str:
+        self.ready.set()
+        await self.unblock.wait()
+        return "done"
+
+    @endpoint
+    async def release_when_ready(self) -> None:
+        await self.ready.wait()
+        self.unblock.set()
+```
+
+When an actor stops, `@concurrent_endpoint` cancels and awaits the outstanding
+tasks that it created before user `__cleanup__` runs. This is a cleanup-time
+guarantee only: meshes owned by the actor may already have been stopped by the
+core actor lifecycle before this cancellation runs. General pending tasks on the
+actor's asyncio loop are cancelled after user `__cleanup__` completes, when the
+loop is stopped.
+
+Pass endpoint options directly to `@concurrent_endpoint(...)`, such as
+`explicit_response_port=True`; do not stack it with `@endpoint`.
+
+There is nothing special about `@concurrent_endpoint`: it packages the
+`explicit_response_port=True` pattern with `asyncio.create_task`, result
+forwarding for non-explicit endpoints, failing the actor when an explicit-port
+endpoint lets an exception escape the function, and cleanup-time cancellation of
+the tasks it starts. You can write the simple version yourself when you want full
+control:
+
+```python
+import asyncio
+from monarch.actor import Actor, Port, endpoint
+
+class ManualGate(Actor):
+    def __init__(self):
+        self.ready = asyncio.Event()
+        self.unblock = asyncio.Event()
+
+    @endpoint(explicit_response_port=True)
+    async def wait(self, port: Port[str]) -> None:
+        async def run() -> None:
+            try:
+                self.ready.set()
+                await self.unblock.wait()
+                port.send("done")
+            except Exception as e:
+                port.exception(e)
+
+        asyncio.create_task(run())
+```
+
+This manual form intentionally has no extra task tracking; the task lifetime is
+part of the endpoint protocol you are writing. Because the body runs in a
+detached task that you own, an exception escaping it before a response is sent
+leaves the caller waiting until it times out or is cancelled, while the actor
+survives. By contrast, `@concurrent_endpoint` fails the actor with a supervision
+error in that case, following the principle of no silent errors.
+
+`@concurrent_endpoint` works on individual endpoints, including inherited
+endpoints, so an actor can mix concurrent and sequential endpoints. For protocols
+that need custom response ordering, multiple sends, or more complex lifetime
+control, use `@endpoint(explicit_response_port=True)` directly and manage the
+response port yourself.
+
+### 2. Explicit Response Ports
 
 For out-of-order responses or background processing:
 
@@ -782,7 +917,7 @@ class AsyncProcessor(Actor):
             port.send(result)
 ```
 
-### 2. Actor Supervision
+### 3. Actor Supervision
 
 Custom supervision for fine-grained error handling:
 
@@ -941,6 +1076,136 @@ procs = host.spawn_procs(per_host={"gpus": 4}, proc_bind=bindings)
 - Custom proc launchers receive the binding configuration in
   `LaunchOptions.proc_bind` and may apply it using backend-appropriate
   mechanisms (e.g., systemd unit properties, Docker `--cpuset-cpus`).
+
+---
+
+## Bootstrap Command Customization
+
+When spawning processes, you can customize the bootstrap command used to launch each proc using the `bootstrap_command` parameter on `HostMesh.spawn_procs()`. This is useful for setting environment variables like `CUDA_VISIBLE_DEVICES`, `RANK`, `LOCAL_RANK`, or customizing the program and arguments.
+
+### Uniform BootstrapCommand
+
+Pass a `BootstrapCommand` to use the same command for all spawned processes:
+
+```python
+from monarch._rust_bindings.monarch_hyperactor.host_mesh import BootstrapCommand
+from monarch.actor import this_host
+
+host = this_host()
+
+# Custom BootstrapCommand for all procs
+cmd = BootstrapCommand(
+    program="/custom/python",
+    arg0=None,
+    args=["-m", "monarch._src.actor.bootstrap_main"],
+    env={"CUDA_VISIBLE_DEVICES": "0,1,2,3", "MY_VAR": "value"},
+)
+procs = host.spawn_procs(
+    per_host={"gpus": 4},
+    bootstrap_command=cmd
+)
+```
+
+### Per-Coordinate BootstrapCommand
+
+Pass a callable to customize the bootstrap command per process. The callable receives a `Point` representing the combined coordinate across host and per_host dimensions:
+
+```python
+from monarch.actor import this_host
+from monarch._rust_bindings.monarch_hyperactor.host_mesh import BootstrapCommand
+
+host = this_host()
+
+# Set CUDA_VISIBLE_DEVICES based on coordinate
+def make_bootstrap(point):
+    return BootstrapCommand(
+        program="/usr/bin/python3",
+        arg0=None,
+        args=["-m", "monarch._src.actor.bootstrap_main"],
+        env={"CUDA_VISIBLE_DEVICES": str(point["gpus"])},
+    )
+
+procs = host.spawn_procs(
+    per_host={"gpus": 4},
+    bootstrap_command=make_bootstrap
+)
+
+# point["gpus"] is the GPU index within each host
+# point["hosts"] is the host index (if host mesh has multiple hosts)
+```
+
+This is particularly useful for:
+- Setting `CUDA_VISIBLE_DEVICES` to restrict each proc to specific GPUs
+- Configuring `RANK` and `LOCAL_RANK` for distributed training
+- Assigning different configurations based on host or device position
+- Using different Python executables or arguments per coordinate
+
+### Using with_env for Ergonomic Customization
+
+The `BootstrapCommand.with_env()` method makes it easy to create modified copies of a base command with additional environment variables. Use `default_bootstrap_cmd()` to get the default command for the current environment:
+
+```python
+from monarch.actor import default_bootstrap_cmd, this_host
+
+host = this_host()
+
+# Start with the default bootstrap command
+base = default_bootstrap_cmd()
+
+# Customize per coordinate using with_env
+def make_bootstrap(point):
+    return base.with_env({
+        "CUDA_VISIBLE_DEVICES": str(point["gpus"]),
+        "RANK": str(point["hosts"] * 4 + point["gpus"]),
+    })
+
+procs = host.spawn_procs(
+    per_host={"gpus": 4},
+    bootstrap_command=make_bootstrap
+)
+```
+
+> **Note:** `default_bootstrap_cmd()` returns the default for the *local* (client) environment. It is not guaranteed to match the bootstrap command that the actual remote hosts would use on their own — those may differ in program path, args, or env. When you pass the result of `default_bootstrap_cmd().with_env(...)` as `bootstrap_command`, the client-side default is what gets sent to the hosts, replacing whatever default they would have used. In most setups the client and host environments are equivalent, so this is usually what you want; if your hosts run with a different default, supply an explicit `BootstrapCommand` instead of starting from `default_bootstrap_cmd()`.
+
+### Non-Mutating Behavior
+
+The `bootstrap_command` parameter only affects the specific `spawn_procs` call. The original `HostMesh` is not modified, so subsequent spawns on the same mesh use the original bootstrap command:
+
+```python
+host = this_host()
+
+# First spawn with custom bootstrap command
+cmd1 = BootstrapCommand(...)
+procs1 = host.spawn_procs(
+    per_host={"gpus": 2},
+    bootstrap_command=cmd1
+)
+
+# Second spawn without bootstrap_command uses the mesh's default
+procs2 = host.spawn_procs(per_host={"gpus": 2})
+# procs2 uses the default bootstrap command
+```
+
+### Combining with with_python_executable
+
+Bootstrap commands work with other HostMesh customization methods:
+
+```python
+host = this_host()
+
+# Customize Python executable and bootstrap command
+custom_host = host.with_python_executable("/path/to/python")
+cmd = BootstrapCommand(
+    program="/path/to/python",
+    arg0=None,
+    args=["-m", "monarch._src.actor.bootstrap_main"],
+    env={"CUDA_VISIBLE_DEVICES": "0,1,2,3"},
+)
+procs = custom_host.spawn_procs(
+    per_host={"gpus": 4},
+    bootstrap_command=cmd
+)
+```
 
 ---
 

@@ -29,8 +29,11 @@
 //!   [`ConvertedNode`](crate::convert::ConvertedNode) via
 //!   [`SnapshotData::push_converted`] appends exactly one
 //!   [`NodeRow`], exactly one subtype-table row matching `kind_row`,
-//!   optionally one [`ActorFailureRow`], and all of its
-//!   [`ChildRow`]s.
+//!   optionally one [`ActorFailureRow`], optionally one
+//!   [`ActorInboundOrderingRow`] (CV-8), all of its
+//!   [`OrderingSessionRow`]s (CV-9), optionally one
+//!   [`ActorExecutionRow`] (CV-10), all of its [`ActiveHandlerRow`]s
+//!   (CV-11), and all of its [`ChildRow`]s.
 //! - **CS-6 (resolution-error-boundary):** Resolver transport/query
 //!   failure aborts capture with `Err`. Only successfully resolved
 //!   payloads with `NodeProperties::Error` populate
@@ -54,11 +57,15 @@ use crate::convert::ConvertedNode;
 use crate::convert::NodeKindRow;
 use crate::convert::convert_node;
 use crate::convert::to_micros;
+use crate::schema::ActiveHandlerRow;
+use crate::schema::ActorExecutionRow;
 use crate::schema::ActorFailureRow;
+use crate::schema::ActorInboundOrderingRow;
 use crate::schema::ActorNodeRow;
 use crate::schema::ChildRow;
 use crate::schema::HostNodeRow;
 use crate::schema::NodeRow;
+use crate::schema::OrderingSessionRow;
 use crate::schema::ProcNodeRow;
 use crate::schema::ResolutionErrorRow;
 use crate::schema::RootNodeRow;
@@ -86,6 +93,18 @@ pub struct SnapshotData {
     pub actor_nodes: Vec<ActorNodeRow>,
     /// One row per actor with `failure_info: Some(…)` (CV-3).
     pub actor_failures: Vec<ActorFailureRow>,
+    /// One row per actor with `inbound_ordering: Some(…)` (CV-8).
+    pub actor_inbound_orderings: Vec<ActorInboundOrderingRow>,
+    /// One row per RETURNED session in any actor's inbound-ordering
+    /// snapshot (CV-9). Skipped sessions are NOT enumerated; they
+    /// appear only in the parent rollup's `skipped_session_count`.
+    pub ordering_sessions: Vec<OrderingSessionRow>,
+    /// One row per actor with `execution: Some(…)` (CV-10).
+    pub actor_executions: Vec<ActorExecutionRow>,
+    /// One row per in-flight handler in any actor's execution snapshot
+    /// (CV-11). A prefix of the N oldest when truncated; empty when the
+    /// rollup's `complete == false`.
+    pub active_handlers: Vec<ActiveHandlerRow>,
     /// One row per successfully resolved `NodeProperties::Error`
     /// (CS-6: distinct from resolver transport failures).
     pub resolution_errors: Vec<ResolutionErrorRow>,
@@ -102,6 +121,14 @@ impl SnapshotData {
         if let Some(f) = converted.actor_failure {
             self.actor_failures.push(f);
         }
+        if let Some(io) = converted.actor_inbound_ordering {
+            self.actor_inbound_orderings.push(io);
+        }
+        self.ordering_sessions.extend(converted.ordering_sessions);
+        if let Some(e) = converted.actor_execution {
+            self.actor_executions.push(e);
+        }
+        self.active_handlers.extend(converted.active_handlers);
         match converted.kind_row {
             NodeKindRow::Root(r) => self.root_nodes.push(r),
             NodeKindRow::Host(h) => self.host_nodes.push(h),
@@ -139,6 +166,10 @@ where
         proc_nodes: Vec::new(),
         actor_nodes: Vec::new(),
         actor_failures: Vec::new(),
+        actor_inbound_orderings: Vec::new(),
+        ordering_sessions: Vec::new(),
+        actor_executions: Vec::new(),
+        active_handlers: Vec::new(),
         resolution_errors: Vec::new(),
     };
 
@@ -190,15 +221,15 @@ mod tests {
     // Test fixtures
 
     fn test_proc_id() -> ProcAddr {
-        ProcAddr::from_resource_name(ChannelAddr::Local(0), "worker")
+        hyperactor_mesh::mesh_id::ResourceId::proc_addr_from_name(ChannelAddr::Local(0), "worker")
     }
 
     fn test_actor_id(name: &str) -> hyperactor::ActorAddr {
-        test_proc_id().actor_id(name)
+        test_proc_id().actor_addr(name)
     }
 
     fn test_host_actor_id() -> hyperactor::ActorAddr {
-        test_proc_id().actor_id("host_agent")
+        test_proc_id().actor_addr("host_agent")
     }
 
     fn test_time() -> SystemTime {
@@ -354,8 +385,12 @@ mod tests {
                         last_message_handler: None,
                         total_processing_time_us: 0,
                         flight_recorder: None,
+                        instance_id: String::new(),
+                        queue_depth: 0,
+                        inbound_ordering: None,
                         is_system: false,
                         failure_info: None,
+                        execution: None,
                     },
                     vec![actor_b.clone()],
                 ),
@@ -372,8 +407,12 @@ mod tests {
                         last_message_handler: None,
                         total_processing_time_us: 0,
                         flight_recorder: None,
+                        instance_id: String::new(),
+                        queue_depth: 0,
+                        inbound_ordering: None,
                         is_system: false,
                         failure_info: None,
+                        execution: None,
                     },
                     vec![],
                 ),
@@ -463,8 +502,12 @@ mod tests {
                         last_message_handler: None,
                         total_processing_time_us: 0,
                         flight_recorder: None,
+                        instance_id: String::new(),
+                        queue_depth: 0,
+                        inbound_ordering: None,
                         is_system: false,
                         failure_info: None,
+                        execution: None,
                     },
                     vec![],
                 ),
@@ -481,8 +524,12 @@ mod tests {
                         last_message_handler: None,
                         total_processing_time_us: 0,
                         flight_recorder: None,
+                        instance_id: String::new(),
+                        queue_depth: 0,
+                        inbound_ordering: None,
                         is_system: false,
                         failure_info: None,
+                        execution: None,
                     },
                     vec![],
                 ),
@@ -499,8 +546,12 @@ mod tests {
                         last_message_handler: None,
                         total_processing_time_us: 0,
                         flight_recorder: None,
+                        instance_id: String::new(),
+                        queue_depth: 0,
+                        inbound_ordering: None,
                         is_system: false,
                         failure_info: None,
+                        execution: None,
                     },
                     vec![],
                 ),
@@ -592,8 +643,12 @@ mod tests {
                         last_message_handler: None,
                         total_processing_time_us: 0,
                         flight_recorder: None,
+                        instance_id: String::new(),
+                        queue_depth: 0,
+                        inbound_ordering: None,
                         is_system: false,
                         failure_info: None,
+                        execution: None,
                     },
                     vec![actor_b.clone()],
                 ),
@@ -610,8 +665,12 @@ mod tests {
                         last_message_handler: None,
                         total_processing_time_us: 0,
                         flight_recorder: None,
+                        instance_id: String::new(),
+                        queue_depth: 0,
+                        inbound_ordering: None,
                         is_system: false,
                         failure_info: None,
+                        execution: None,
                     },
                     vec![],
                 ),
@@ -672,6 +731,10 @@ mod tests {
                         started_by: "t".to_owned(),
                     }),
                     actor_failure: None,
+                    actor_inbound_ordering: None,
+                    ordering_sessions: vec![],
+                    actor_execution: None,
+                    active_handlers: vec![],
                     children: vec![ChildRow {
                         snapshot_id: "s".to_owned(),
                         parent_id: "root".to_owned(),
@@ -693,6 +756,10 @@ mod tests {
                         host_num_procs: 0,
                     }),
                     actor_failure: None,
+                    actor_inbound_ordering: None,
+                    ordering_sessions: vec![],
+                    actor_execution: None,
+                    active_handlers: vec![],
                     children: vec![],
                 },
                 "Host",
@@ -710,6 +777,10 @@ mod tests {
                         failed_actor_count: 0,
                     }),
                     actor_failure: None,
+                    actor_inbound_ordering: None,
+                    ordering_sessions: vec![],
+                    actor_execution: None,
+                    active_handlers: vec![],
                     children: vec![],
                 },
                 "Proc",
@@ -722,10 +793,12 @@ mod tests {
                         node_id: "a".to_owned(),
                         actor_status: "failed".to_owned(),
                         actor_type: "A".to_owned(),
+                        instance_id: String::new(),
                         messages_processed: 0,
                         created_at: None,
                         last_message_handler: None,
                         total_processing_time_us: 0,
+                        queue_depth: 0,
                         is_system: false,
                     }),
                     actor_failure: Some(ActorFailureRow {
@@ -737,6 +810,10 @@ mod tests {
                         failure_occurred_at: 0,
                         failure_is_propagated: false,
                     }),
+                    actor_inbound_ordering: None,
+                    ordering_sessions: vec![],
+                    actor_execution: None,
+                    active_handlers: vec![],
                     children: vec![],
                 },
                 "Actor",
@@ -751,6 +828,10 @@ mod tests {
                         error_message: "gone".to_owned(),
                     }),
                     actor_failure: None,
+                    actor_inbound_ordering: None,
+                    ordering_sessions: vec![],
+                    actor_execution: None,
+                    active_handlers: vec![],
                     children: vec![],
                 },
                 "ResolutionError",
@@ -769,6 +850,10 @@ mod tests {
             proc_nodes: Vec::new(),
             actor_nodes: Vec::new(),
             actor_failures: Vec::new(),
+            actor_inbound_orderings: Vec::new(),
+            ordering_sessions: Vec::new(),
+            actor_executions: Vec::new(),
+            active_handlers: Vec::new(),
             resolution_errors: Vec::new(),
         };
 

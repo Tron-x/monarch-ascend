@@ -9,7 +9,9 @@
 use std::time::SystemTime;
 
 use hyperactor::introspect::RecordedEvent;
+use hyperactor_mesh::introspect::Execution;
 use hyperactor_mesh::introspect::FailureInfo;
+use hyperactor_mesh::introspect::InboundOrdering;
 use hyperactor_mesh::introspect::NodePayload;
 use hyperactor_mesh::introspect::NodeProperties;
 use hyperactor_mesh::introspect::NodeRef;
@@ -39,18 +41,25 @@ use crate::format::format_system_time_iso;
 use crate::format::format_system_time_local;
 use crate::format::format_system_time_relative;
 use crate::format::format_system_time_uptime;
+use crate::format::sanitize_control;
 use crate::format_bytes;
 use crate::theme::ColorScheme;
 use crate::theme::Labels;
 
 /// Render the contextual details pane (right side).
 ///
-/// If a `NodePayload` for the current selection is available in
-/// `app.detail`, dispatches to `render_node_detail` to show a
-/// type-specific view (root/host/proc/actor). Otherwise, shows either
-/// the last fetch error (`app.detail_error`) or a neutral "select a
-/// node" placeholder message.
+/// Precedence: the help glossary (`app.show_help`, TUI-22) takes priority,
+/// then the active `app.overlay` (py-spy / config / diagnostics), then node
+/// detail. For node detail, if a `NodePayload` for the current selection is
+/// available in `app.detail`, dispatches to `render_node_detail` to show a
+/// type-specific view (root/host/proc/actor); otherwise shows either the
+/// last fetch error (`app.detail_error`) or a neutral "select a node"
+/// placeholder message.
 pub(crate) fn render_detail_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    if app.show_help {
+        render_help_overlay(frame, area, app.detail.as_ref(), &app.theme.scheme);
+        return;
+    }
     if let Some(overlay) = &app.overlay {
         render_overlay(frame, area, overlay, &app.theme.scheme);
         return;
@@ -77,6 +86,175 @@ pub(crate) fn render_detail_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app
             frame.render_widget(p, area);
         }
     }
+}
+
+/// A single field-help entry: a field name, its one-line meaning, and an
+/// optional subdued note line for caveats.
+pub(crate) struct HelpEntry {
+    pub(crate) field: &'static str,
+    pub(crate) meaning: &'static str,
+    pub(crate) note: Option<&'static str>,
+}
+
+const fn help(field: &'static str, meaning: &'static str) -> HelpEntry {
+    HelpEntry {
+        field,
+        meaning,
+        note: None,
+    }
+}
+
+const fn noted(field: &'static str, meaning: &'static str, note: &'static str) -> HelpEntry {
+    HelpEntry {
+        field,
+        meaning,
+        note: Some(note),
+    }
+}
+
+// First-pass glossary is intentionally English-only. Move into localized
+// help topics if/when the feature is promoted.
+//
+// This is a glossary of the non-obvious fields, not exhaustive row coverage:
+// one entry per confusing rendered row, at that row's granularity. Field
+// names are canonical English, independent of the localized `Labels`.
+pub(crate) fn help_content(props: &NodeProperties) -> (&'static str, &'static [HelpEntry]) {
+    // Entries live in `const` items so the returned slices are `'static`
+    // (a `&[..]` temporary built in a match arm is not promoted and would
+    // not outlive the function).
+    const ROOT: &[HelpEntry] = &[
+        help("hosts", "number of host processes in the mesh"),
+        help("started by", "identity that launched this root"),
+        help("uptime", "time since this root was started"),
+    ];
+    const HOST: &[HelpEntry] = &[
+        help("address", "network address of this host process"),
+        help("procs", "number of worker processes on this host"),
+        help("rss", "resident set size: physical RAM used by the process"),
+        help("vm size", "virtual address space reserved by the process"),
+    ];
+    const PROC: &[HelpEntry] = &[
+        help("actors", "live actors running in this process"),
+        help("rss", "resident set size: physical RAM used by the process"),
+        help("vm size", "virtual address space reserved by the process"),
+        noted(
+            "queue depth",
+            "accepted handler work not yet dequeued (total across actors; max = largest single actor)",
+            "max is a point-in-time snapshot, not a historical high-water mark",
+        ),
+        help(
+            "peak depth",
+            "maximum proc-wide queue total observed since startup",
+        ),
+        help(
+            "last busy",
+            "time since proc queue total was last observed non-zero",
+        ),
+        help(
+            "poisoned",
+            "proc has failed and should no longer be treated as healthy",
+        ),
+    ];
+    const ACTOR: &[HelpEntry] = &[
+        help(
+            "status",
+            "current actor lifecycle state: ok / degraded / failed",
+        ),
+        help("instance", "stable UUID for this actor instance"),
+        noted(
+            "queue depth",
+            "accepted handler work not yet dequeued by this actor",
+            "includes out-of-order work held by the reorder buffer",
+        ),
+        help("msgs processed", "messages handled since actor start"),
+        help(
+            "processing time",
+            "cumulative time spent in message handlers",
+        ),
+        help("last handler", "most recent handler method invoked"),
+        help("children", "actors spawned by this actor"),
+        help(
+            "ordering enabled",
+            "whether inbound sequence tracking is active",
+        ),
+        help(
+            "sessions stalled",
+            "sender sessions waiting on a missing next sequence",
+        ),
+        noted(
+            "buffered",
+            "out-of-order frames held by inbound ordering",
+            "independent diagnostic; do not compare arithmetically with queue depth",
+        ),
+    ];
+    const ERROR: &[HelpEntry] = &[
+        help("code", "error code returned when resolving this node"),
+        help("message", "error detail"),
+    ];
+    match props {
+        NodeProperties::Root { .. } => ("root", ROOT),
+        NodeProperties::Host { .. } => ("host", HOST),
+        NodeProperties::Proc { .. } => ("proc", PROC),
+        NodeProperties::Actor { .. } => ("actor", ACTOR),
+        NodeProperties::Error { .. } => ("error", ERROR),
+    }
+}
+
+/// Render the static help glossary overlay (TUI-22) into the detail pane.
+///
+/// Read-only: lists field meanings for the selected node kind, with the
+/// kind shown in the block title (e.g. " ? actor help "). Non-scrollable;
+/// content is kept short enough to fit common pane heights.
+fn render_help_overlay(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    payload: Option<&NodePayload>,
+    scheme: &ColorScheme,
+) {
+    // Title carries the node kind for context, e.g. " ? actor help ".
+    let (title, lines): (String, Vec<Line<'static>>) = match payload {
+        None => (
+            " ? help ".to_string(),
+            vec![
+                Line::from(Span::styled(
+                    "Select a node to view field help",
+                    scheme.info,
+                )),
+                Line::raw(""),
+                Line::from(Span::styled("press any key to dismiss", scheme.info)),
+            ],
+        ),
+        Some(p) => {
+            let (kind, entries) = help_content(&p.properties);
+            let mut lines = Vec::new();
+            for e in entries {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{:<22}", e.field), scheme.detail_label),
+                    Span::raw(e.meaning),
+                ]));
+                if let Some(n) = e.note {
+                    lines.push(Line::from(vec![
+                        Span::raw(format!("{:<22}", "")),
+                        Span::styled(n, scheme.info),
+                    ]));
+                }
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "press any key to dismiss",
+                scheme.info,
+            )));
+            (format!(" ? {kind} help "), lines)
+        }
+    };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(scheme.border);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 /// Render the details view for a resolved node.
@@ -138,11 +316,15 @@ pub(crate) fn render_node_detail(
         NodeProperties::Actor {
             actor_status,
             actor_type,
+            instance_id,
             messages_processed,
+            queue_depth,
             created_at,
             last_message_handler,
             total_processing_time_us,
             flight_recorder,
+            inbound_ordering,
+            execution,
             failure_info,
             ..
         } => {
@@ -152,11 +334,15 @@ pub(crate) fn render_node_detail(
                 payload,
                 actor_status,
                 actor_type,
+                instance_id,
+                *queue_depth,
                 *messages_processed,
                 created_at,
                 last_message_handler.as_deref(),
                 *total_processing_time_us,
                 flight_recorder.as_deref(),
+                inbound_ordering.as_deref(),
+                execution.as_deref(),
                 failure_info.as_ref(),
                 scheme,
                 labels,
@@ -407,6 +593,13 @@ fn render_proc_detail(
 /// stats, creation time, last handler, and child count; the bottom
 /// section parses the optional flight-recorder JSON and displays a
 /// compact, timestamped list of recent events.
+const TOP_N: usize = 10;
+const MIN_FLIGHT_RECORDER_HEIGHT: u16 = 5;
+/// A bordered pane needs border(2) + 1 row to show any content; below this it
+/// draws only a border sliver, so treat it as hidden (0 height + clip alert).
+const MIN_VISIBLE_PANE_HEIGHT: u16 = 3;
+const RED_STALL_THRESHOLD: usize = 100; // placeholder; tune later.
+
 #[allow(clippy::too_many_arguments)]
 fn render_actor_detail(
     frame: &mut ratatui::Frame<'_>,
@@ -414,19 +607,34 @@ fn render_actor_detail(
     payload: &NodePayload,
     actor_status: &str,
     actor_type: &str,
+    instance_id: &str,
+    queue_depth: u64,
     messages_processed: u64,
     created_at: &Option<SystemTime>,
     last_message_handler: Option<&str>,
     total_processing_time_us: u64,
     flight_recorder_json: Option<&str>,
+    inbound_ordering: Option<&InboundOrdering>,
+    execution: Option<&Execution>,
     failure_info: Option<&FailureInfo>,
     scheme: &ColorScheme,
     l: &Labels,
 ) {
-    let info_height = if failure_info.is_some() { 15 } else { 11 };
+    let info_height = actor_info_height(failure_info);
+    let ordering_height = compute_ordering_height(area.height, info_height, inbound_ordering);
+    // Execution section is hidden (height 0) when the actor reports no
+    // execution (None = unsupported) or nothing is in flight; its budget
+    // comes after info + ordering, preserving the flight recorder's minimum.
+    let execution_height =
+        compute_execution_height(area.height, info_height, ordering_height, execution);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(info_height), Constraint::Min(5)])
+        .constraints([
+            Constraint::Length(info_height),
+            Constraint::Length(ordering_height),
+            Constraint::Length(execution_height),
+            Constraint::Min(MIN_FLIGHT_RECORDER_HEIGHT),
+        ])
         .split(area);
 
     // Actor info
@@ -453,6 +661,8 @@ fn render_actor_detail(
             Span::styled(l.status, scheme.detail_label),
             Span::styled(actor_status, status_style),
         ]),
+        detail_line(l.instance_id_label, instance_id, scheme),
+        detail_line(l.queue_depth, queue_depth.to_string(), scheme),
         detail_line(
             l.data_as_of,
             format_system_time_relative(&payload.as_of),
@@ -501,6 +711,12 @@ fn render_actor_detail(
         .wrap(Wrap { trim: false });
     frame.render_widget(info, chunks[0]);
 
+    // Inbound ordering
+    render_inbound_ordering(frame, chunks[1], inbound_ordering, scheme, l);
+
+    // Execution (hidden via a zero-height chunk when None / active_count 0).
+    render_execution(frame, chunks[2], execution, scheme, l);
+
     // Flight recorder
     let recorder_block = Block::default()
         .title(l.pane_flight_recorder)
@@ -516,7 +732,6 @@ fn render_actor_detail(
     } else {
         recorded_events
             .iter()
-            .take(20)
             .map(|event| {
                 let level_style = match event.level.as_str() {
                     "ERROR" => scheme.error,
@@ -525,25 +740,488 @@ fn render_actor_detail(
                     "DEBUG" => scheme.info,
                     _ => scheme.detail_label,
                 };
+                // Event text is less-trusted mesh data; strip control bytes so a
+                // crafted event cannot emit terminal escape/OSC sequences into
+                // the operator's terminal.
+                let level_char = event
+                    .level
+                    .chars()
+                    .next()
+                    .filter(|c| !c.is_control())
+                    .unwrap_or('?');
                 Line::from(vec![
+                    Span::styled(format!("{level_char} "), level_style),
                     Span::styled(
-                        format!("{} ", event.level.chars().next().unwrap_or('?')),
-                        level_style,
-                    ),
-                    Span::styled(
-                        format!("{} ", format_local_time(&event.timestamp)),
+                        format!(
+                            "{} ",
+                            sanitize_control(&format_local_time(&event.timestamp))
+                        ),
                         scheme.detail_label,
                     ),
-                    Span::raw(format_event_summary(&event.name, &event.fields)),
+                    Span::raw(sanitize_control(&format_event_summary(
+                        &event.name,
+                        &event.fields,
+                    ))),
                 ])
             })
             .collect()
     };
 
-    let recorder = Paragraph::new(events)
-        .block(recorder_block)
-        .wrap(Wrap { trim: true });
-    frame.render_widget(recorder, chunks[1]);
+    // TUI-FR-1 (flight-recorder-autoscroll): events render chronologically
+    // (oldest at top) and auto-scroll so the newest row sits on the bottom line.
+    // Read line_count before attaching the block; a Paragraph carrying the block
+    // subtracts the border from the width again, over-counting and scrolling past
+    // the newest line.
+    let inner_width = chunks[3].width.saturating_sub(2);
+    let inner_height = chunks[3].height.saturating_sub(2);
+    let recorder = Paragraph::new(events).wrap(Wrap { trim: true });
+    // Guard the degenerate zero-width case: nothing renders at zero inner width,
+    // and line_count(0) has no well-defined wrap.
+    let total_rows = if inner_width == 0 {
+        0
+    } else {
+        recorder.line_count(inner_width) as u16
+    };
+    let scroll = total_rows.saturating_sub(inner_height);
+    let recorder = recorder.block(recorder_block).scroll((scroll, 0));
+    frame.render_widget(recorder, chunks[3]);
+}
+
+/// TUI-IO-1 (ordering-visibility): the inbound-ordering pane is drawn iff
+/// buffering is enabled AND either a session is stalled (`buffered_count > 0`) or
+/// the snapshot is partial. The partial case matters: the sessions we could not
+/// read (mutex held at snapshot time) may be the stalled ones, so the
+/// "(partial: N skipped)" warning must still surface. This is the single source
+/// of truth for `render_inbound_ordering` and `compute_ordering_height` so their
+/// visibility decisions cannot drift. It is a TUI presentation invariant (like
+/// the execution pane's EX-1), distinct from the external `IO-1` whose "not
+/// available" placeholder this stack removed.
+fn ordering_has_content(io: &InboundOrdering) -> bool {
+    io.enabled && (io.sessions.iter().any(|s| s.buffered_count > 0) || !io.snapshot_complete)
+}
+
+/// Height of the actor info block. Base = 13: 10 content rows (status, instance,
+/// queue depth, data-as-of, type, messages, processing time, created, last
+/// handler, children) + 2 borders + 1 slack row. A failure block adds 5 rows
+/// (spacer, error message, root cause, failed-at, propagated) and absorbs the
+/// slack: 15 content + 2 borders = 17.
+pub(crate) fn actor_info_height(failure_info: Option<&FailureInfo>) -> u16 {
+    if failure_info.is_some() { 17 } else { 13 }
+}
+
+/// TUI-CLIP-1 (content-clipped-alert): true when a content-bearing detail pane
+/// was starved below its content-visible height by a short terminal -- Execution
+/// with live handlers, or Inbound Ordering per `ordering_has_content`. Uses the
+/// same height math as `render_actor_detail` (which floors a pane with no room to
+/// 0), so the header alert can never disagree with what the layout draws.
+pub(crate) fn actor_detail_clipped(
+    area_height: u16,
+    inbound_ordering: Option<&InboundOrdering>,
+    execution: Option<&Execution>,
+    failure_info: Option<&FailureInfo>,
+) -> bool {
+    let info_height = actor_info_height(failure_info);
+    let ordering_height = compute_ordering_height(area_height, info_height, inbound_ordering);
+    let execution_height =
+        compute_execution_height(area_height, info_height, ordering_height, execution);
+    let execution_hidden = execution.is_some_and(|e| e.active_count > 0) && execution_height == 0;
+    let ordering_hidden =
+        inbound_ordering.is_some_and(ordering_has_content) && ordering_height == 0;
+    execution_hidden || ordering_hidden
+}
+
+/// Whether the current selection's detail view has content a short terminal
+/// starved to zero height (drives the header alert). False for non-actor
+/// selections and while help / an overlay replaces the detail pane.
+pub(crate) fn detail_content_clipped(app: &App, detail_height: u16) -> bool {
+    if app.show_help || app.overlay.is_some() {
+        return false;
+    }
+    let Some(payload) = app.detail.as_ref() else {
+        return false;
+    };
+    let NodeProperties::Actor {
+        inbound_ordering,
+        execution,
+        failure_info,
+        ..
+    } = &payload.properties
+    else {
+        return false;
+    };
+    actor_detail_clipped(
+        detail_height,
+        inbound_ordering.as_deref(),
+        execution.as_deref(),
+        failure_info.as_ref(),
+    )
+}
+
+/// Compute the desired height for the inbound-ordering section, or 0 to hide it
+/// (per `ordering_has_content`), capped so the flight recorder keeps
+/// `MIN_FLIGHT_RECORDER_HEIGHT`. The row budget mirrors `build_inbound_ordering_lines`
+/// exactly, the way `compute_execution_height` mirrors `build_execution_lines`.
+pub(crate) fn compute_ordering_height(
+    area_height: u16,
+    info_height: u16,
+    inbound_ordering: Option<&InboundOrdering>,
+) -> u16 {
+    let Some(io) = inbound_ordering else {
+        return 0;
+    };
+    if !ordering_has_content(io) {
+        return 0;
+    }
+    let stalled = io.sessions.iter().filter(|s| s.buffered_count > 0).count();
+    // border(2) + rollup line 1(1) + rollup line 2(0/1). A partial snapshot with
+    // no returned stalls stops there; otherwise add the table: spacer(1) +
+    // header(1) + rows + more(0/1) + footer spacer(1) + footer(1).
+    let rollup2 = u16::from(io.returned_buffered_message_count > 0);
+    let table = if stalled == 0 {
+        0
+    } else {
+        let rows = stalled.min(TOP_N) as u16;
+        let more_row = u16::from(stalled > TOP_N);
+        1 + 1 + rows + more_row + 1 + 1
+    };
+    let want = 2 + 1 + rollup2 + table;
+    let budget = area_height
+        .saturating_sub(info_height)
+        .saturating_sub(MIN_FLIGHT_RECORDER_HEIGHT);
+    let height = want.min(budget);
+    // Below one content row it is a border-only sliver -> hide it (0), so the
+    // header clip-alert fires instead of drawing a content-less box.
+    if height < MIN_VISIBLE_PANE_HEIGHT {
+        0
+    } else {
+        height
+    }
+}
+
+/// Compute the desired height for the Execution section.
+///
+/// Returns 0 when the actor reports no execution (`None` = unsupported) or
+/// nothing is in flight (`active_count == 0`), hiding the section entirely.
+/// Otherwise sizes to the rendered line count, capped against the remaining
+/// budget so the flight recorder keeps its minimum height. Must match the
+/// line count produced by `build_execution_lines`.
+pub(crate) fn compute_execution_height(
+    area_height: u16,
+    info_height: u16,
+    ordering_height: u16,
+    execution: Option<&Execution>,
+) -> u16 {
+    let Some(e) = execution else {
+        return 0;
+    };
+    if e.active_count == 0 {
+        return 0;
+    }
+    let budget = area_height
+        .saturating_sub(info_height)
+        .saturating_sub(ordering_height)
+        .saturating_sub(MIN_FLIGHT_RECORDER_HEIGHT);
+    // border(2) + count line(1) + oldest line(1 iff a row exists)
+    // + per-name rows + truncation marker(1 iff truncated).
+    let oldest_line = u16::from(!e.active_handlers.is_empty());
+    let rows = e.active_handlers.len() as u16;
+    let more_row = u16::from(e.truncated);
+    let want = 2 + 1 + oldest_line + rows + more_row;
+    let height = want.min(budget);
+    // Below one content row it is a border-only sliver -> hide it (0), so the
+    // header clip-alert fires instead of drawing a content-less box.
+    if height < MIN_VISIBLE_PANE_HEIGHT {
+        0
+    } else {
+        height
+    }
+}
+
+/// Render the Execution section: the second plane to lifecycle status,
+/// answering "what is this actor handling right now?".
+///
+/// Drawn only when the actor reports execution (`Some`) with
+/// `active_count > 0` (the caller gives this a zero-height chunk
+/// otherwise). The top-level count comes straight from `active_count` --
+/// never summed from the (possibly truncated) per-name rows (EX-3).
+fn render_execution(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    execution: Option<&Execution>,
+    scheme: &ColorScheme,
+    l: &Labels,
+) {
+    let Some(e) = execution else {
+        return;
+    };
+    if e.active_count == 0 {
+        return;
+    }
+    let block = Block::default()
+        .title(l.pane_execution)
+        .borders(Borders::ALL)
+        .border_style(scheme.border);
+    let p = Paragraph::new(build_execution_lines(e, scheme, l))
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(p, area);
+}
+
+fn build_execution_lines<'a>(
+    e: &'a Execution,
+    scheme: &ColorScheme,
+    l: &'a Labels,
+) -> Vec<Line<'a>> {
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Top-level count: read directly from active_count (EX-3).
+    lines.push(detail_line(
+        l.execution_active_handlers,
+        e.active_count.to_string(),
+        scheme,
+    ));
+
+    // Oldest live invocation: the first row (aggregated by name and sorted
+    // oldest-first upstream, EX-4). Absent when per-handler detail was
+    // momentarily unavailable on this poll (EX-2: complete == false leaves
+    // active_handlers empty while the count above stays authoritative).
+    if let Some(first) = e.active_handlers.first() {
+        lines.push(detail_line(
+            l.execution_oldest,
+            format!(
+                "{} ({})",
+                first.name,
+                format_system_time_relative(&first.oldest_since)
+            ),
+            scheme,
+        ));
+    }
+
+    // Per-name rows: "name ×active_count  age".
+    for h in &e.active_handlers {
+        lines.push(Line::from(Span::raw(format!(
+            "{} \u{00d7}{}  {}",
+            h.name,
+            h.active_count,
+            format_system_time_relative(&h.oldest_since),
+        ))));
+    }
+
+    // Truncation marker (EX-4): some of the oldest names were dropped. We
+    // don't carry a precise hidden-name count, so the marker is unqualified.
+    if e.truncated {
+        lines.push(Line::from(Span::styled(
+            l.execution_more_names,
+            scheme.detail_label,
+        )));
+    }
+
+    lines
+}
+
+/// Column widths for the per-session table. Owner column truncates
+/// long ActorAddrs (full address still observable via the API);
+/// remaining columns sized for typical seq/count widths.
+const OWNER_COL_WIDTH: usize = 30;
+const NEED_SEQ_COL_WIDTH: usize = 8;
+
+/// Drawn only when `ordering_has_content` (enabled, and either a stalled session
+/// or a partial snapshot); the caller gives this a zero-height chunk otherwise,
+/// mirroring the execution pane. Hidden states show no placeholder line.
+fn render_inbound_ordering(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    inbound_ordering: Option<&InboundOrdering>,
+    scheme: &ColorScheme,
+    l: &Labels,
+) {
+    let Some(io) = inbound_ordering else {
+        return;
+    };
+    if !ordering_has_content(io) {
+        return;
+    }
+    // Red border when actionable stalls are present; otherwise
+    // matches the rest of the chrome.
+    let border_style = if io.returned_buffered_session_count > 0 {
+        scheme.detail_alert_border
+    } else {
+        scheme.border
+    };
+    let block = Block::default()
+        .title(l.pane_inbound_ordering)
+        .borders(Borders::ALL)
+        .border_style(border_style);
+
+    let p = Paragraph::new(build_inbound_ordering_lines(io, scheme, l))
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(p, area);
+}
+
+fn build_inbound_ordering_lines<'a>(
+    io: &'a InboundOrdering,
+    scheme: &ColorScheme,
+    l: &'a Labels,
+) -> Vec<Line<'a>> {
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Filter to stalled-only, sort by severity then by oldest gap.
+    let mut stalled: Vec<&hyperactor::ordering::OrderingSessionSnapshot> = io
+        .sessions
+        .iter()
+        .filter(|s| s.buffered_count > 0)
+        .collect();
+    stalled.sort_by(|a, b| {
+        b.buffered_count.cmp(&a.buffered_count).then_with(|| {
+            match (a.oldest_buffered_seq, b.oldest_buffered_seq) {
+                (Some(ax), Some(bx)) => ax.cmp(&bx),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        })
+    });
+
+    // Rollup line 1: "enabled · 2 of 3 sessions stalled (partial: N skipped)"
+    let partial_suffix = if !io.snapshot_complete {
+        format!(
+            " {}",
+            l.ordering_sessions_partial
+                .replace("{n}", &io.skipped_session_count.to_string())
+        )
+    } else {
+        String::new()
+    };
+    lines.push(Line::from(vec![
+        Span::styled(l.ordering_buffering_enabled, scheme.detail_label),
+        Span::raw(format!(
+            " · {} {} {} {} {}{}",
+            io.returned_buffered_session_count,
+            l.ordering_sessions_known,
+            io.known_session_count,
+            l.ordering_sessions_label,
+            l.ordering_sessions_stalled,
+            partial_suffix,
+        )),
+    ]));
+
+    // Rollup line 2 only when something is buffered; a partial snapshot with no
+    // returned stalls shows just line 1 ("0 of N stalled (partial: M skipped)").
+    if io.returned_buffered_message_count > 0 {
+        lines.push(Line::from(Span::raw(format!(
+            "{} {}, {} {}{}",
+            io.returned_buffered_message_count,
+            l.ordering_buffered_label,
+            l.ordering_max_in_worst,
+            io.returned_max_buffered_count,
+            l.ordering_returned_total,
+        ))));
+    }
+
+    // Partial snapshot with nothing returned as stalled: the rollup (with its
+    // "(partial: N skipped)" suffix) is why the pane is shown, so stop before the
+    // per-session table.
+    if stalled.is_empty() {
+        return lines;
+    }
+
+    // Spacer + column header.
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{:<owner$} {:>seq$}  {}",
+            l.ordering_col_owner,
+            l.ordering_col_missing_seq,
+            l.ordering_col_buffered,
+            owner = OWNER_COL_WIDTH,
+            seq = NEED_SEQ_COL_WIDTH,
+        ),
+        scheme.detail_label,
+    )));
+
+    // Per-session rows. Color is themed: stalled rows use
+    // `scheme.detail_stalled`; severe stalls (above threshold) escalate
+    // to `scheme.detail_stalled_severe` (adds bold).
+    let visible = stalled.iter().take(TOP_N);
+    for s in visible {
+        let owner_full = match &s.sender {
+            Some(addr) => trim_owner_for_display(&addr.to_string()),
+            None => l
+                .ordering_sender_fallback
+                .replace("{id}", &short_session_id(&s.session_id.to_string())),
+        };
+        let owner = truncate_cell(&owner_full, OWNER_COL_WIDTH);
+        let buffered_cell = match (s.oldest_buffered_seq, s.newest_buffered_seq) {
+            (Some(oldest), Some(newest)) => {
+                format!("{} ({}-{})", s.buffered_count, oldest, newest)
+            }
+            _ => s.buffered_count.to_string(),
+        };
+        let row_style = if s.buffered_count > RED_STALL_THRESHOLD {
+            scheme.detail_stalled_severe
+        } else {
+            scheme.detail_stalled
+        };
+        let row_text = format!(
+            "{:<owner$} {:>seq$}  {}",
+            owner,
+            s.expected_next_seq,
+            buffered_cell,
+            owner = OWNER_COL_WIDTH,
+            seq = NEED_SEQ_COL_WIDTH,
+        );
+        lines.push(Line::from(Span::styled(row_text, row_style)));
+    }
+    if stalled.len() > TOP_N {
+        let more = stalled.len() - TOP_N;
+        lines.push(Line::from(Span::styled(
+            l.ordering_more_row.replace("{n}", &more.to_string()),
+            scheme.detail_label,
+        )));
+    }
+
+    // Footer (only with stalled sessions visible — this branch).
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        l.ordering_footer,
+        scheme.detail_label,
+    )));
+
+    lines
+}
+
+/// Strip `<base58>` instance suffixes and the `@location` tail from an
+/// `ActorAddr` string, leaving the human-meaningful
+/// `{actor_label}.{proc_label}` form. Full address is still observable
+/// via the API; this is the at-a-glance form for the TUI.
+fn trim_owner_for_display(addr: &str) -> String {
+    let pre_at = addr.split('@').next().unwrap_or(addr);
+    let mut out = String::with_capacity(pre_at.len());
+    let mut depth: i32 = 0;
+    for c in pre_at.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Truncate `s` to `width` chars; if shorter, returns owned copy.
+/// Truncation marker is `…` to make the cut visible to operators.
+fn truncate_cell(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(width.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
+fn short_session_id(s: &str) -> String {
+    s.chars().take(8).collect()
 }
 
 /// Build an `Overlay` from diagnostics state.
@@ -708,7 +1386,7 @@ fn diag_result_line(r: &DiagResult, scheme: &ColorScheme, labels: &Labels) -> Li
             DiagNodeRole::IntrospectionHandler => labels.diag_note_introspection_handler,
             DiagNodeRole::ActorLifecycleManager => labels.diag_note_actor_lifecycle_manager,
             DiagNodeRole::RootClientBridge => labels.diag_note_root_client_bridge,
-            DiagNodeRole::CommActor => labels.diag_note_comm_actor,
+            DiagNodeRole::CastActor => labels.diag_note_cast_actor,
             DiagNodeRole::ProcAgent => labels.diag_note_proc_agent,
             DiagNodeRole::UserProc => labels.diag_note_user_proc,
             DiagNodeRole::UserActor => labels.diag_note_user_actor,
@@ -779,11 +1457,13 @@ mod tests {
     use super::*;
     use crate::theme::LangName;
 
-    /// Render a detail pane into a test buffer and return the
-    /// rendered text as a single string for assertion.
-    fn render_detail_to_string(payload: &NodePayload) -> String {
+    /// Size-aware variant: render at the requested terminal dimensions.
+    /// Use a wide/tall size (e.g. 120x45) for tests that assert on
+    /// long ActorAddr substrings or top-N tables; smaller sizes for
+    /// degradation tests.
+    fn render_detail_to_string_with_size(payload: &NodePayload, width: u16, height: u16) -> String {
         let theme = crate::Theme::new(crate::ThemeName::Nord, LangName::En);
-        let backend = TestBackend::new(60, 30);
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
@@ -802,18 +1482,26 @@ mod tests {
         text
     }
 
+    /// Render a detail pane into a 60x30 test buffer and return the
+    /// rendered text as a single string for assertion. Legacy size
+    /// kept for backwards compatibility with existing host/proc/root
+    /// tests; inbound-ordering tests use the size-aware variant.
+    fn render_detail_to_string(payload: &NodePayload) -> String {
+        render_detail_to_string_with_size(payload, 60, 30)
+    }
+
     fn mock_host_ref() -> NodeRef {
-        let proc_id = hyperactor::ProcAddr::from_resource_name(
+        let proc_id = hyperactor_mesh::mesh_id::ResourceId::proc_addr_from_name(
             "unix:@test"
                 .parse::<hyperactor::channel::ChannelAddr>()
                 .unwrap(),
             "world",
         );
-        NodeRef::Host(proc_id.actor_id("host_agent"))
+        NodeRef::Host(proc_id.actor_addr("host_agent"))
     }
 
     fn mock_proc_ref() -> NodeRef {
-        let proc_id = hyperactor::ProcAddr::from_resource_name(
+        let proc_id = hyperactor_mesh::mesh_id::ResourceId::proc_addr_from_name(
             "unix:@test"
                 .parse::<hyperactor::channel::ChannelAddr>()
                 .unwrap(),
@@ -906,5 +1594,785 @@ mod tests {
             text.contains("N/A"),
             "expected N/A for unavailable memory: {text}"
         );
+    }
+
+    // ---- inbound-ordering render tests (TUI-IO-1 / IO-2 / IO-6 / IO-7) ----
+
+    fn mock_actor_addr(name: &str, proc_name: &str) -> hyperactor::ActorAddr {
+        let proc_id = hyperactor_mesh::mesh_id::ResourceId::proc_addr_from_name(
+            "unix:@test"
+                .parse::<hyperactor::channel::ChannelAddr>()
+                .unwrap(),
+            proc_name,
+        );
+        proc_id.actor_addr(name)
+    }
+
+    fn mock_actor_ref(name: &str) -> NodeRef {
+        NodeRef::Actor(mock_actor_addr(name, "world"))
+    }
+
+    fn actor_payload(inbound_ordering: Option<Box<InboundOrdering>>) -> NodePayload {
+        NodePayload {
+            identity: mock_actor_ref("stalled_receiver"),
+            properties: NodeProperties::Actor {
+                actor_status: "idle".to_string(),
+                actor_type: "monarch::test::TestActor".to_string(),
+                instance_id: "019e5661-7d33-7380-9afe-699ffc567531".to_string(),
+                messages_processed: 1,
+                created_at: None,
+                last_message_handler: None,
+                total_processing_time_us: 0,
+                queue_depth: 8,
+                flight_recorder: None,
+                is_system: false,
+                inbound_ordering,
+                failure_info: None,
+                execution: None,
+            },
+            children: vec![],
+            parent: None,
+            as_of: SystemTime::now(),
+        }
+    }
+
+    fn actor_payload_with_execution(execution: Execution) -> NodePayload {
+        let mut payload = actor_payload(None);
+        if let NodeProperties::Actor { execution: e, .. } = &mut payload.properties {
+            *e = Some(Box::new(execution));
+        }
+        payload
+    }
+
+    // EX-1: a supported-but-idle actor (Some, active_count 0) hides the
+    // Execution section -- no border title, no count line.
+    #[test]
+    fn render_actor_detail_execution_hidden_when_idle() {
+        let idle = Execution {
+            active_count: 0,
+            active_handlers: vec![],
+            complete: true,
+            truncated: false,
+        };
+        let text = render_detail_to_string_with_size(&actor_payload_with_execution(idle), 120, 45);
+        assert!(
+            !text.contains("Active handlers"),
+            "Execution section must be hidden at active_count 0: {text}"
+        );
+    }
+
+    // Populated: the count line reads active_count directly (2), the oldest
+    // line names the oldest endpoint, and the aggregated per-name row shows
+    // "hold ×2".
+    #[test]
+    fn render_actor_detail_execution_populated() {
+        let execution = Execution {
+            active_count: 2,
+            active_handlers: vec![ActiveHandler {
+                name: "hold".to_string(),
+                active_count: 2,
+                oldest_since: SystemTime::now(),
+            }],
+            complete: true,
+            truncated: false,
+        };
+        let text =
+            render_detail_to_string_with_size(&actor_payload_with_execution(execution), 120, 45);
+        assert!(
+            text.contains("Active handlers: 2"),
+            "expected count line from active_count: {text}"
+        );
+        assert!(
+            text.contains("Oldest: hold"),
+            "expected oldest endpoint name: {text}"
+        );
+        assert!(
+            text.contains("hold \u{00d7}2"),
+            "expected aggregated row 'hold ×2': {text}"
+        );
+        assert!(
+            !text.contains("more endpoint names"),
+            "no truncation marker when not truncated: {text}"
+        );
+    }
+
+    // Truncation: the count line still reads the FULL total (200); the marker
+    // appears (we carry no precise hidden-name count, so it is unqualified).
+    #[test]
+    fn render_actor_detail_execution_truncated_marker() {
+        let mut active_handlers = Vec::new();
+        for i in 0..16u64 {
+            active_handlers.push(ActiveHandler {
+                name: format!("ep_{i:02}"),
+                active_count: 1,
+                oldest_since: SystemTime::now(),
+            });
+        }
+        let execution = Execution {
+            active_count: 200,
+            active_handlers,
+            complete: true,
+            truncated: true,
+        };
+        let text =
+            render_detail_to_string_with_size(&actor_payload_with_execution(execution), 120, 60);
+        assert!(
+            text.contains("Active handlers: 200"),
+            "count line is the full total, not the row count: {text}"
+        );
+        assert!(
+            text.contains("more endpoint names"),
+            "truncation marker present when truncated: {text}"
+        );
+    }
+
+    fn session(
+        session_id: uuid::Uuid,
+        sender: Option<hyperactor::ActorAddr>,
+        buffered_count: usize,
+        last_released: u64,
+        oldest: Option<u64>,
+        newest: Option<u64>,
+    ) -> hyperactor::ordering::OrderingSessionSnapshot {
+        hyperactor::ordering::OrderingSessionSnapshot {
+            session_id,
+            sender,
+            last_released_seq: last_released,
+            expected_next_seq: last_released + 1,
+            buffered_count,
+            oldest_buffered_seq: oldest,
+            newest_buffered_seq: newest,
+        }
+    }
+
+    // TUI-IO-1: the pane is shown iff enabled AND (a session is stalled OR the
+    // snapshot is partial); every other state hides it. This arm: None hides it.
+    #[test]
+    fn render_actor_detail_inbound_ordering_none() {
+        let text = render_detail_to_string_with_size(&actor_payload(None), 120, 45);
+        assert!(
+            !text.contains("Inbound ordering"),
+            "None hides the inbound-ordering pane: {text}"
+        );
+    }
+
+    // TUI-IO-1: buffering disabled hides the pane (nothing to surface).
+    #[test]
+    fn render_actor_detail_inbound_ordering_disabled() {
+        let io = InboundOrdering {
+            enabled: false,
+            snapshot_complete: true,
+            skipped_session_count: 0,
+            known_session_count: 0,
+            returned_buffered_session_count: 0,
+            returned_buffered_message_count: 0,
+            returned_max_buffered_count: 0,
+            sessions: vec![],
+        };
+        let text = render_detail_to_string_with_size(&actor_payload(Some(Box::new(io))), 120, 45);
+        assert!(
+            !text.contains("Inbound ordering"),
+            "buffering disabled hides the inbound-ordering pane: {text}"
+        );
+    }
+
+    // TUI-IO-1: enabled, a complete snapshot, and no stalled sessions hides the pane,
+    // mirroring the execution pane. (Contrast the partial-snapshot case below.)
+    #[test]
+    fn render_actor_detail_inbound_ordering_enabled_no_stalled() {
+        let io = InboundOrdering {
+            enabled: true,
+            snapshot_complete: true,
+            skipped_session_count: 0,
+            known_session_count: 2,
+            returned_buffered_session_count: 0,
+            returned_buffered_message_count: 0,
+            returned_max_buffered_count: 0,
+            sessions: vec![
+                session(uuid::Uuid::nil(), None, 0, 5, None, None),
+                session(uuid::Uuid::from_u128(1), None, 0, 3, None, None),
+            ],
+        };
+        let text = render_detail_to_string_with_size(&actor_payload(Some(Box::new(io))), 120, 45);
+        assert!(
+            !text.contains("Inbound ordering"),
+            "no stalled sessions hides the inbound-ordering pane: {text}"
+        );
+        assert!(
+            !text.contains("sessions stalled"),
+            "no rollup line when the pane is hidden: {text}"
+        );
+    }
+
+    // TUI-IO-1: a partial snapshot with no returned stalls still shows the pane so the
+    // "(partial: N skipped)" warning survives -- the sessions we could not read
+    // may be the stalled ones.
+    #[test]
+    fn render_actor_detail_inbound_ordering_partial_no_stalls_shown() {
+        let io = InboundOrdering {
+            enabled: true,
+            snapshot_complete: false,
+            skipped_session_count: 2,
+            known_session_count: 3,
+            returned_buffered_session_count: 0,
+            returned_buffered_message_count: 0,
+            returned_max_buffered_count: 0,
+            sessions: vec![session(uuid::Uuid::nil(), None, 0, 5, None, None)],
+        };
+        let text = render_detail_to_string_with_size(&actor_payload(Some(Box::new(io))), 120, 45);
+        assert!(
+            text.contains("Inbound ordering"),
+            "partial snapshot keeps the pane visible: {text}"
+        );
+        assert!(
+            text.contains("(partial: 2 skipped)"),
+            "the skipped-session warning survives: {text}"
+        );
+        assert!(
+            !text.contains("Need seq"),
+            "no per-session table when nothing returned is stalled: {text}"
+        );
+    }
+
+    // TUI-IO-1: buffering disabled hides the pane even when a session still carries a
+    // buffered count, so the enabled gate stays load-bearing.
+    #[test]
+    fn render_actor_detail_inbound_ordering_disabled_with_buffered() {
+        let io = InboundOrdering {
+            enabled: false,
+            snapshot_complete: true,
+            skipped_session_count: 0,
+            known_session_count: 1,
+            returned_buffered_session_count: 1,
+            returned_buffered_message_count: 5,
+            returned_max_buffered_count: 5,
+            sessions: vec![session(uuid::Uuid::nil(), None, 5, 0, Some(2), Some(6))],
+        };
+        let text = render_detail_to_string_with_size(&actor_payload(Some(Box::new(io))), 120, 45);
+        assert!(
+            !text.contains("Inbound ordering"),
+            "disabled buffering hides the pane regardless of buffered sessions: {text}"
+        );
+    }
+
+    // TUI-IO-1 height side: compute_ordering_height must agree with
+    // render_inbound_ordering's visibility (0 when hidden, > 0 when shown) so a
+    // reserve-but-hide layout drift cannot slip past the render-only string tests.
+    #[test]
+    fn compute_ordering_height_matches_visibility() {
+        let mk = |enabled: bool, complete: bool, buffered: usize| InboundOrdering {
+            enabled,
+            snapshot_complete: complete,
+            skipped_session_count: if complete { 0 } else { 1 },
+            known_session_count: 1,
+            returned_buffered_session_count: if buffered > 0 { 1 } else { 0 },
+            returned_buffered_message_count: 0,
+            returned_max_buffered_count: 0,
+            sessions: vec![session(uuid::Uuid::nil(), None, buffered, 0, None, None)],
+        };
+        // Hidden -> 0.
+        assert_eq!(compute_ordering_height(45, 13, None), 0);
+        assert_eq!(
+            compute_ordering_height(45, 13, Some(&mk(false, true, 0))),
+            0
+        );
+        assert_eq!(compute_ordering_height(45, 13, Some(&mk(true, true, 0))), 0);
+        // Shown -> non-zero: a stalled session, or a partial snapshot.
+        assert!(compute_ordering_height(45, 13, Some(&mk(true, true, 5))) > 0);
+        assert!(compute_ordering_height(45, 13, Some(&mk(true, false, 0))) > 0);
+    }
+
+    // One stalled session: rollup, table row, footer all present.
+    #[test]
+    fn render_actor_detail_inbound_ordering_one_stalled() {
+        let sender = mock_actor_addr("sender_a", "sender_a_proc");
+        let io = InboundOrdering {
+            enabled: true,
+            snapshot_complete: true,
+            skipped_session_count: 0,
+            known_session_count: 1,
+            returned_buffered_session_count: 1,
+            returned_buffered_message_count: 5,
+            returned_max_buffered_count: 5,
+            sessions: vec![session(
+                uuid::Uuid::nil(),
+                Some(sender),
+                5,
+                0,
+                Some(2),
+                Some(6),
+            )],
+        };
+        let text = render_detail_to_string_with_size(&actor_payload(Some(Box::new(io))), 120, 45);
+        assert!(
+            text.contains("1 of 1 sessions stalled"),
+            "expected '1 of 1 sessions stalled': {text}"
+        );
+        assert!(text.contains("Need seq"), "expected column header: {text}");
+        assert!(text.contains("sender_a"), "expected sender label: {text}");
+        assert!(
+            text.contains("5 (2-6)"),
+            "expected buffered range '5 (2-6)': {text}"
+        );
+        assert!(
+            text.contains("Owner = SEQ_INFO session owner"),
+            "expected footer: {text}"
+        );
+    }
+
+    // IO-2: partial snapshot suffix appears.
+    #[test]
+    fn render_actor_detail_inbound_ordering_partial_snapshot() {
+        let sender = mock_actor_addr("sender_a", "sender_a_proc");
+        let io = InboundOrdering {
+            enabled: true,
+            snapshot_complete: false,
+            skipped_session_count: 2,
+            known_session_count: 3,
+            returned_buffered_session_count: 1,
+            returned_buffered_message_count: 3,
+            returned_max_buffered_count: 3,
+            sessions: vec![session(
+                uuid::Uuid::nil(),
+                Some(sender),
+                3,
+                0,
+                Some(2),
+                Some(4),
+            )],
+        };
+        let text = render_detail_to_string_with_size(&actor_payload(Some(Box::new(io))), 120, 45);
+        assert!(
+            text.contains("(partial: 2 skipped)"),
+            "expected partial-snapshot suffix: {text}"
+        );
+    }
+
+    // Top-N truncation: 12 stalled sessions render top 10 + "... and 2 more".
+    #[test]
+    fn render_actor_detail_inbound_ordering_top_n_truncation() {
+        let mut sessions = Vec::new();
+        for i in 0..12u64 {
+            let sender = mock_actor_addr(&format!("s{i}"), "p");
+            // Larger i → larger buffered_count, so sort surfaces s11 first.
+            let buffered = (i as usize) + 1;
+            sessions.push(session(
+                uuid::Uuid::from_u128(i as u128),
+                Some(sender),
+                buffered,
+                0,
+                Some(2),
+                Some(1 + buffered as u64),
+            ));
+        }
+        let total: usize = sessions.iter().map(|s| s.buffered_count).sum();
+        let max = sessions.iter().map(|s| s.buffered_count).max().unwrap_or(0);
+        let io = InboundOrdering {
+            enabled: true,
+            snapshot_complete: true,
+            skipped_session_count: 0,
+            known_session_count: 12,
+            returned_buffered_session_count: 12,
+            returned_buffered_message_count: total,
+            returned_max_buffered_count: max,
+            sessions,
+        };
+        let text = render_detail_to_string_with_size(&actor_payload(Some(Box::new(io))), 120, 45);
+        // s11 (buffered=12) is the largest; s2 (buffered=3) is the 10th largest.
+        assert!(text.contains("s11"), "expected biggest session row: {text}");
+        assert!(
+            text.contains("s2"),
+            "expected 10th-largest session row: {text}"
+        );
+        assert!(
+            !text.contains("s1 ") && !text.contains("s0 "),
+            "smallest sessions should not appear as rows: {text}"
+        );
+        assert!(
+            text.contains("and 2 more"),
+            "expected '… and 2 more' footer: {text}"
+        );
+    }
+
+    // sender == None: row uses fallback label derived from session_id.
+    #[test]
+    fn render_actor_detail_inbound_ordering_sender_none_fallback() {
+        let io = InboundOrdering {
+            enabled: true,
+            snapshot_complete: true,
+            skipped_session_count: 0,
+            known_session_count: 1,
+            returned_buffered_session_count: 1,
+            returned_buffered_message_count: 2,
+            returned_max_buffered_count: 2,
+            sessions: vec![session(uuid::Uuid::nil(), None, 2, 0, Some(2), Some(3))],
+        };
+        let text = render_detail_to_string_with_size(&actor_payload(Some(Box::new(io))), 120, 45);
+        assert!(
+            text.contains("no owner") && text.contains("00000000"),
+            "expected fallback owner label with short session id: {text}"
+        );
+    }
+
+    // Sort: larger buffered_count first; tiebreak by oldest_buffered_seq asc.
+    #[test]
+    fn render_actor_detail_inbound_ordering_sort_order() {
+        let s_large = session(
+            uuid::Uuid::from_u128(1),
+            Some(mock_actor_addr("big", "p")),
+            10,
+            0,
+            Some(2),
+            Some(11),
+        );
+        // Actor labels are lowercased by `Label::strip`, so use
+        // lowercase-stable names here to keep assertions reliable.
+        let s_small_oldest_low = session(
+            uuid::Uuid::from_u128(2),
+            Some(mock_actor_addr("small_a", "p")),
+            5,
+            0,
+            Some(2),
+            Some(6),
+        );
+        let s_small_oldest_high = session(
+            uuid::Uuid::from_u128(3),
+            Some(mock_actor_addr("small_b", "p")),
+            5,
+            0,
+            Some(50),
+            Some(54),
+        );
+        let io = InboundOrdering {
+            enabled: true,
+            snapshot_complete: true,
+            skipped_session_count: 0,
+            known_session_count: 3,
+            returned_buffered_session_count: 3,
+            returned_buffered_message_count: 20,
+            returned_max_buffered_count: 10,
+            sessions: vec![s_small_oldest_high, s_large, s_small_oldest_low],
+        };
+        let text = render_detail_to_string_with_size(&actor_payload(Some(Box::new(io))), 120, 45);
+        let big_pos = text.find("big").expect("expected 'big' in output");
+        let small_a_pos = text.find("small_a").expect("expected 'small_a' in output");
+        let small_b_pos = text.find("small_b").expect("expected 'small_b' in output");
+        assert!(
+            big_pos < small_a_pos && big_pos < small_b_pos,
+            "expected 'big' (buffered=10) first; got big@{big_pos}, small_a@{small_a_pos}, small_b@{small_b_pos}: {text}"
+        );
+        assert!(
+            small_a_pos < small_b_pos,
+            "expected small_a (oldest=2) before small_b (oldest=50): {text}"
+        );
+    }
+
+    // Info block exposes Instance: and Queue depth: scalars.
+    #[test]
+    fn render_actor_detail_info_block_shows_instance_and_queue_depth() {
+        let text = render_detail_to_string_with_size(&actor_payload(None), 120, 45);
+        assert!(
+            text.contains("Instance:") && text.contains("019e5661"),
+            "expected Instance: line with id: {text}"
+        );
+        assert!(
+            text.contains("Queue depth:") && text.contains(" 8"),
+            "expected Queue depth: 8 line: {text}"
+        );
+    }
+
+    // Workload-shape live-acceptance fixture: mirrors MIT-78 deterministic
+    // shape (known=3, two stalled sender sessions, one idle client session).
+    #[test]
+    fn render_actor_detail_inbound_ordering_workload_fixture() {
+        let client = session(uuid::Uuid::from_u128(1), None, 0, 1, None, None);
+        let sender_a = session(
+            uuid::Uuid::from_u128(2),
+            Some(mock_actor_addr("sender_a", "sender_a_proc")),
+            5,
+            0,
+            Some(2),
+            Some(6),
+        );
+        let sender_b = session(
+            uuid::Uuid::from_u128(3),
+            Some(mock_actor_addr("sender_b", "sender_b_proc")),
+            3,
+            0,
+            Some(2),
+            Some(4),
+        );
+        let io = InboundOrdering {
+            enabled: true,
+            snapshot_complete: true,
+            skipped_session_count: 0,
+            known_session_count: 3,
+            returned_buffered_session_count: 2,
+            returned_buffered_message_count: 8,
+            returned_max_buffered_count: 5,
+            sessions: vec![client, sender_a, sender_b],
+        };
+        let text = render_detail_to_string_with_size(&actor_payload(Some(Box::new(io))), 120, 45);
+
+        // Rollup line 1: stalled count of total.
+        assert!(
+            text.contains("2 of 3 sessions stalled"),
+            "expected rollup '2 of 3 sessions stalled': {text}"
+        );
+        // Rollup line 2: buffered totals.
+        assert!(
+            text.contains("8 buffered") && text.contains("max 5/session"),
+            "expected '8 buffered, max 5/session': {text}"
+        );
+
+        // Both sender rows present.
+        let pos_a = text.find("sender_a").expect("expected sender_a row");
+        let pos_b = text.find("sender_b").expect("expected sender_b row");
+        assert!(
+            pos_a < pos_b,
+            "sender_a (buffered=5) should appear before sender_b (buffered=3): {text}"
+        );
+
+        // Idle client session NOT shown as a row.
+        assert!(
+            !text.contains("(no owner"),
+            "idle client.local session must not be rendered as a row: {text}"
+        );
+
+        // Buffered cells.
+        assert!(
+            text.contains("5 (2-6)"),
+            "expected sender_a buffered '5 (2-6)': {text}"
+        );
+        assert!(
+            text.contains("3 (2-4)"),
+            "expected sender_b buffered '3 (2-4)': {text}"
+        );
+
+        // Footer present.
+        assert!(
+            text.contains("Owner = SEQ_INFO session owner"),
+            "expected footer in active-stalled state: {text}"
+        );
+    }
+
+    // Cramped height: flight recorder section preserved even when the
+    // ordering section's want exceeds the budget (closes C9 cap).
+    #[test]
+    fn render_actor_detail_inbound_ordering_cramped_height() {
+        let mut sessions = Vec::new();
+        for i in 0..10u64 {
+            sessions.push(session(
+                uuid::Uuid::from_u128(i as u128),
+                Some(mock_actor_addr(&format!("s{i}"), "p")),
+                10,
+                0,
+                Some(2),
+                Some(11),
+            ));
+        }
+        let io = InboundOrdering {
+            enabled: true,
+            snapshot_complete: true,
+            skipped_session_count: 0,
+            known_session_count: 10,
+            returned_buffered_session_count: 10,
+            returned_buffered_message_count: 100,
+            returned_max_buffered_count: 10,
+            sessions,
+        };
+        // Budget: 28 - info(13) - min_flight(5) = 10 rows for ordering,
+        // far less than the want of 2+2+1+1+10+3 = 19. Cap kicks in.
+        let text = render_detail_to_string_with_size(&actor_payload(Some(Box::new(io))), 120, 28);
+        assert!(
+            text.contains("Flight Recorder"),
+            "expected flight recorder pane still visible under cramped height: {text}"
+        );
+    }
+
+    /// Serialize `count` flight-recorder events named `evt000`..`evt{count-1}`
+    /// (oldest first). Empty `fields` make `format_event_summary` fall back to
+    /// the name, so each event renders as its own identifier.
+    fn recorder_json(count: usize) -> String {
+        let events: Vec<serde_json::Value> = (0..count)
+            .map(|i| {
+                serde_json::json!({
+                    "timestamp": "2026-07-11T00:00:00.000Z",
+                    "level": "INFO",
+                    "name": format!("evt{i:03}"),
+                    "fields": {},
+                })
+            })
+            .collect();
+        serde_json::to_string(&events).unwrap()
+    }
+
+    fn actor_payload_with_recorder(json: String) -> NodePayload {
+        let mut payload = actor_payload(None);
+        if let NodeProperties::Actor {
+            flight_recorder, ..
+        } = &mut payload.properties
+        {
+            *flight_recorder = Some(json);
+        }
+        payload
+    }
+
+    // TUI-FR-1: with more events than fit, the recorder drops the old take(20)
+    // cap, renders every event, and auto-scrolls so the newest sits on the
+    // bottom line while the oldest scrolls off. Height 24 leaves the recorder
+    // 9 inner rows for 30 events, so rows evt021..evt029 are visible.
+    #[test]
+    fn flight_recorder_autoscrolls_to_newest() {
+        let text = render_detail_to_string_with_size(
+            &actor_payload_with_recorder(recorder_json(30)),
+            120,
+            24,
+        );
+        assert!(
+            text.contains("evt029"),
+            "newest event pinned to the bottom line: {text}"
+        );
+        assert!(
+            text.contains("evt025"),
+            "an event past the old take(20) cap surfaces: {text}"
+        );
+        assert!(
+            !text.contains("evt000"),
+            "oldest event scrolled off the top: {text}"
+        );
+    }
+
+    // TUI-FR-1: when every event fits, none scroll off and they render
+    // chronologically (oldest above newest).
+    #[test]
+    fn flight_recorder_renders_chronological_without_scroll() {
+        let text = render_detail_to_string_with_size(
+            &actor_payload_with_recorder(recorder_json(3)),
+            120,
+            40,
+        );
+        let oldest = text
+            .find("evt000")
+            .expect("oldest event visible when it fits");
+        let newest = text
+            .find("evt002")
+            .expect("newest event visible when it fits");
+        assert!(
+            oldest < newest,
+            "oldest renders above newest (chronological order): {text}"
+        );
+    }
+
+    // TUI-FR-1: event text is less-trusted, so control/escape bytes are replaced
+    // with a sentinel and cannot drive the operator's terminal.
+    #[test]
+    fn flight_recorder_sanitizes_control_bytes() {
+        let json = serde_json::to_string(&vec![serde_json::json!({
+            "timestamp": "2026-07-11T00:00:00.000Z",
+            "level": "INFO",
+            "name": "n",
+            "fields": {"message": "a\u{1b}]0;pwn\u{7}b"},
+        })])
+        .unwrap();
+        let text = render_detail_to_string_with_size(&actor_payload_with_recorder(json), 120, 24);
+        assert!(
+            !text.contains('\u{1b}'),
+            "ESC byte must not reach the terminal: {text:?}"
+        );
+        assert!(
+            text.contains('\u{fffd}'),
+            "control bytes replaced with the sentinel: {text:?}"
+        );
+    }
+
+    // TUI-FR-1: a terminal so narrow the recorder has zero inner width must not
+    // panic (line_count(0) is guarded).
+    #[test]
+    fn flight_recorder_survives_zero_inner_width() {
+        let _ = render_detail_to_string_with_size(
+            &actor_payload_with_recorder(recorder_json(5)),
+            2,
+            24,
+        );
+    }
+
+    // A short terminal that starves the Execution pane to zero height must set
+    // the header "content hidden" flag; a roomy terminal must not; and an idle
+    // actor (no live handlers) must never flag, even when tiny.
+    #[test]
+    fn actor_detail_clipped_flags_starved_execution() {
+        let active = Execution {
+            active_count: 2,
+            active_handlers: vec![ActiveHandler {
+                name: "hold".to_string(),
+                active_count: 2,
+                oldest_since: SystemTime::now(),
+            }],
+            complete: true,
+            truncated: false,
+        };
+        // area 18 = info(13) + min_flight(5): no budget left, Execution starved.
+        assert!(actor_detail_clipped(18, None, Some(&active), None));
+        // Roomy terminal: Execution fits, no alert.
+        assert!(!actor_detail_clipped(45, None, Some(&active), None));
+        // Idle actor has nothing to hide -- never alert, even when tiny.
+        let idle = Execution {
+            active_count: 0,
+            active_handlers: vec![],
+            complete: true,
+            truncated: false,
+        };
+        assert!(!actor_detail_clipped(18, None, Some(&idle), None));
+    }
+
+    // TUI-CLIP-1: the ordering arm must track render_inbound_ordering
+    // (ordering_has_content) -- a stalled pane AND a partial-but-clean pane are
+    // both content-bearing; starved to zero height each flags, a roomy terminal
+    // does not, and disabled buffering never flags.
+    #[test]
+    fn actor_detail_clipped_flags_starved_ordering() {
+        let stalled = InboundOrdering {
+            enabled: true,
+            snapshot_complete: true,
+            skipped_session_count: 0,
+            known_session_count: 1,
+            returned_buffered_session_count: 1,
+            returned_buffered_message_count: 5,
+            returned_max_buffered_count: 5,
+            sessions: vec![session(uuid::Uuid::nil(), None, 5, 0, Some(2), Some(6))],
+        };
+        // area 18 = info(13) + min_flight(5): no budget, ordering starved.
+        assert!(actor_detail_clipped(18, Some(&stalled), None, None));
+        assert!(!actor_detail_clipped(45, Some(&stalled), None, None));
+
+        // Partial-but-clean snapshot is content-bearing (the "(partial: N
+        // skipped)" warning), so a starved one must also flag.
+        let partial = InboundOrdering {
+            enabled: true,
+            snapshot_complete: false,
+            skipped_session_count: 2,
+            known_session_count: 3,
+            returned_buffered_session_count: 0,
+            returned_buffered_message_count: 0,
+            returned_max_buffered_count: 0,
+            sessions: vec![],
+        };
+        assert!(actor_detail_clipped(18, Some(&partial), None, None));
+        assert!(!actor_detail_clipped(45, Some(&partial), None, None));
+
+        // Floor boundary (pins MIN_VISIBLE_PANE_HEIGHT): the partial pane wants 3
+        // rows. area 20 -> budget 2 -> a content-less sliver floored to 0 ->
+        // clipped (fails without the floor); area 21 -> budget 3 -> one content
+        // row shown -> not clipped (pins the threshold at < 3, not <= 3).
+        assert!(actor_detail_clipped(20, Some(&partial), None, None));
+        assert!(!actor_detail_clipped(21, Some(&partial), None, None));
+
+        // Disabled buffering is never content-bearing.
+        let disabled = InboundOrdering {
+            enabled: false,
+            ..partial
+        };
+        assert!(!actor_detail_clipped(18, Some(&disabled), None, None));
     }
 }

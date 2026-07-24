@@ -7,6 +7,7 @@
 # pyre-strict
 
 import unittest
+from tempfile import NamedTemporaryFile
 from unittest.mock import MagicMock, patch
 
 from kubernetes import config as k8s_config
@@ -18,6 +19,7 @@ from kubernetes.client import (
     V1PodCondition,
     V1PodSpec,
     V1PodStatus,
+    V1PodTemplateSpec,
 )
 from kubernetes.client.rest import ApiException
 from monarch._src.job.kubernetes import (
@@ -25,8 +27,10 @@ from monarch._src.job.kubernetes import (
     _MONARCHMESH_GROUP,
     _MONARCHMESH_PLURAL,
     _MONARCHMESH_VERSION,
+    _MonarchMeshPod,
     _WORKER_BOOTSTRAP_SCRIPT,
     ImageSpec,
+    KubeConfig,
     KubernetesJob,
 )
 
@@ -153,33 +157,33 @@ class TestAddMesh(unittest.TestCase):
         job = self._make_job()
         job.add_mesh("workers", num_replicas=2, image_spec=ImageSpec("myimage:latest"))
         self.assertTrue(job._meshes["workers"]["provisioned"])
-        self.assertIn("pod_spec", job._meshes["workers"])
+        self.assertIn("pod_template", job._meshes["workers"])
 
-    def test_pod_spec_marks_provisioned(self) -> None:
+    def test_pod_template_marks_provisioned(self) -> None:
         job = self._make_job()
-        spec = V1PodSpec(
-            containers=[V1Container(name="w", image="img")],
+        template = V1PodTemplateSpec(
+            spec=V1PodSpec(containers=[V1Container(name="w", image="img")]),
         )
-        job.add_mesh("workers", num_replicas=1, pod_spec=spec)
+        job.add_mesh("workers", num_replicas=1, pod_template=template)
         self.assertTrue(job._meshes["workers"]["provisioned"])
-        self.assertEqual(job._meshes["workers"]["pod_spec"], spec)
+        self.assertEqual(job._meshes["workers"]["pod_template"], template)
 
     def test_attach_only_not_provisioned(self) -> None:
         job = self._make_job()
         job.add_mesh("workers", num_replicas=1)
         self.assertFalse(job._meshes["workers"]["provisioned"])
-        self.assertNotIn("pod_spec", job._meshes["workers"])
+        self.assertNotIn("pod_template", job._meshes["workers"])
 
-    def test_image_and_pod_spec_mutually_exclusive(self) -> None:
+    def test_image_and_pod_template_mutually_exclusive(self) -> None:
         job = self._make_job()
         with self.assertRaises(
-            ValueError, msg="image and pod_sepc are mutually exclusive"
+            ValueError, msg="image and pod_template are mutually exclusive"
         ):
             job.add_mesh(
                 "workers",
                 num_replicas=1,
                 image_spec=ImageSpec("img"),
-                pod_spec=V1PodSpec(containers=[]),
+                pod_template=V1PodTemplateSpec(spec=V1PodSpec(containers=[])),
             )
 
     def test_label_selector_forbidden_with_provisioning(self) -> None:
@@ -233,6 +237,31 @@ class TestAddMesh(unittest.TestCase):
         job.add_mesh("workers", num_replicas=1, image_spec=ImageSpec("img"))
         self.assertNotIn("labels", job._meshes["workers"])
 
+    # -- annotations -----------------------------------------------------------
+
+    def test_annotations_stored_when_provisioning(self) -> None:
+        job = self._make_job()
+        annotations = {"team": "infra", "scheduler": "kueue"}
+        job.add_mesh(
+            "workers",
+            num_replicas=1,
+            image_spec=ImageSpec("img"),
+            annotations=annotations,
+        )
+        self.assertEqual(job._meshes["workers"]["annotations"], annotations)
+
+    def test_annotations_forbidden_without_provisioning(self) -> None:
+        job = self._make_job()
+        with self.assertRaises(
+            ValueError, msg="annotations can only be set when provisioning"
+        ):
+            job.add_mesh("workers", num_replicas=1, annotations={"team": "infra"})
+
+    def test_no_annotations_by_default(self) -> None:
+        job = self._make_job()
+        job.add_mesh("workers", num_replicas=1, image_spec=ImageSpec("img"))
+        self.assertNotIn("annotations", job._meshes["workers"])
+
 
 class TestCreate(unittest.TestCase):
     """Tests for KubernetesJob._create guards."""
@@ -275,18 +304,20 @@ class TestCreate(unittest.TestCase):
         mock_api = MagicMock()
         mock_custom_api_cls.return_value = mock_api
 
-        # ApiClient.sanitize_for_serialization converts V1PodSpec to dict
+        # ApiClient.sanitize_for_serialization converts V1PodTemplateSpec to dict
         mock_api_client = MagicMock()
         mock_api_client_cls.return_value = mock_api_client
         mock_api_client.sanitize_for_serialization.return_value = {
-            "containers": [
-                {
-                    "name": "worker",
-                    "image": "myimage:latest",
-                    "command": ["python", "-u", "-c", _WORKER_BOOTSTRAP_SCRIPT],
-                    "env": [{"name": "MONARCH_PORT", "value": "9999"}],
-                }
-            ]
+            "spec": {
+                "containers": [
+                    {
+                        "name": "worker",
+                        "image": "myimage:latest",
+                        "command": ["python", "-u", "-c", _WORKER_BOOTSTRAP_SCRIPT],
+                        "env": [{"name": "MONARCH_PORT", "value": "9999"}],
+                    }
+                ]
+            }
         }
 
         job._create(None)
@@ -301,7 +332,8 @@ class TestCreate(unittest.TestCase):
         self.assertEqual(body["metadata"]["name"], "workers")
         self.assertEqual(body["spec"]["replicas"], 3)
         self.assertEqual(
-            body["spec"]["podTemplate"]["containers"][0]["image"], "myimage:latest"
+            body["spec"]["podTemplate"]["spec"]["containers"][0]["image"],
+            "myimage:latest",
         )
         self.assertEqual(body["spec"]["port"], 9999)
 
@@ -330,6 +362,52 @@ class TestCreate(unittest.TestCase):
 
         body = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]
         self.assertEqual(body["metadata"]["labels"], labels)
+
+    @patch("monarch._src.job.kubernetes.client.ApiClient")
+    @patch("monarch._src.job.kubernetes.client.CustomObjectsApi")
+    @patch("monarch._src.job.kubernetes.config.load_incluster_config")
+    def test_create_includes_annotations_in_crd(
+        self,
+        mock_load_config: MagicMock,
+        mock_custom_api_cls: MagicMock,
+        mock_api_client_cls: MagicMock,
+    ) -> None:
+        job = self._make_job()
+        annotations = {"kueue.x-k8s.io/queue-name": "my-queue", "owner": "team"}
+        job.add_mesh(
+            "workers",
+            num_replicas=1,
+            image_spec=ImageSpec("img"),
+            annotations=annotations,
+        )
+
+        mock_api = MagicMock()
+        mock_custom_api_cls.return_value = mock_api
+
+        job._create(None)
+
+        body = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]
+        self.assertEqual(body["metadata"]["annotations"], annotations)
+
+    @patch("monarch._src.job.kubernetes.client.ApiClient")
+    @patch("monarch._src.job.kubernetes.client.CustomObjectsApi")
+    @patch("monarch._src.job.kubernetes.config.load_incluster_config")
+    def test_create_omits_annotations_when_not_set(
+        self,
+        mock_load_config: MagicMock,
+        mock_custom_api_cls: MagicMock,
+        mock_api_client_cls: MagicMock,
+    ) -> None:
+        job = self._make_job()
+        job.add_mesh("workers", num_replicas=1, image_spec=ImageSpec("img"))
+
+        mock_api = MagicMock()
+        mock_custom_api_cls.return_value = mock_api
+
+        job._create(None)
+
+        body = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]
+        self.assertNotIn("annotations", body["metadata"])
 
     @patch("monarch._src.job.kubernetes.client.ApiClient")
     @patch("monarch._src.job.kubernetes.client.CustomObjectsApi")
@@ -396,6 +474,36 @@ class TestCreate(unittest.TestCase):
         body = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]
         self.assertEqual(body["metadata"]["name"], "provisioned")
 
+    @patch("monarch._src.job.kubernetes.client.CustomObjectsApi")
+    @patch("monarch._src.job.kubernetes.config.load_incluster_config")
+    def test_create_preserves_pod_template_metadata(
+        self,
+        mock_load_config: MagicMock,
+        mock_custom_api_cls: MagicMock,
+    ) -> None:
+        """Pod-level labels/annotations on ``pod_template`` reach the CRD body."""
+        job = self._make_job()
+        pod_template = V1PodTemplateSpec(
+            metadata=V1ObjectMeta(
+                labels={"pod-label": "pod-value"},
+                annotations={"pod-annotation": "ann-value"},
+            ),
+            spec=V1PodSpec(containers=[V1Container(name="worker", image="img")]),
+        )
+        job.add_mesh("workers", num_replicas=1, pod_template=pod_template)
+
+        mock_api = MagicMock()
+        mock_custom_api_cls.return_value = mock_api
+
+        job._create(None)
+
+        body = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]
+        template_metadata = body["spec"]["podTemplate"]["metadata"]
+        self.assertEqual(template_metadata["labels"], {"pod-label": "pod-value"})
+        self.assertEqual(
+            template_metadata["annotations"], {"pod-annotation": "ann-value"}
+        )
+
     def test_create_noop_when_all_attach_only(self) -> None:
         """No K8s API calls when no meshes are provisioned."""
         job = self._make_job()
@@ -417,15 +525,15 @@ class TestCreate(unittest.TestCase):
             job._create(None)
 
 
-class TestBuildWorkerPodSpec(unittest.TestCase):
-    """Tests for KubernetesJob._build_worker_pod_spec."""
+class TestBuildWorkerPodTemplate(unittest.TestCase):
+    """Tests for KubernetesJob._build_worker_pod_template."""
 
-    def test_basic_pod_spec(self) -> None:
-        spec = KubernetesJob._build_worker_pod_spec(
+    def test_basic_pod_template(self) -> None:
+        template = KubernetesJob._build_worker_pod_template(
             ImageSpec("myimage:latest"), port=26600
         )
-        self.assertEqual(len(spec.containers), 1)
-        container = spec.containers[0]
+        self.assertEqual(len(template.spec.containers), 1)
+        container = template.spec.containers[0]
         self.assertEqual(container.name, "worker")
         self.assertEqual(container.image, "myimage:latest")
         self.assertEqual(
@@ -437,21 +545,88 @@ class TestBuildWorkerPodSpec(unittest.TestCase):
         self.assertIsNone(container.resources)
 
     def test_custom_port_in_env(self) -> None:
-        spec = KubernetesJob._build_worker_pod_spec(ImageSpec("img"), port=9999)
-        self.assertEqual(spec.containers[0].env[0].value, "9999")
+        template = KubernetesJob._build_worker_pod_template(ImageSpec("img"), port=9999)
+        self.assertEqual(template.spec.containers[0].env[0].value, "9999")
 
     def test_resources_set(self) -> None:
-        spec = KubernetesJob._build_worker_pod_spec(
+        template = KubernetesJob._build_worker_pod_template(
             ImageSpec(
                 "img",
                 resources={"cpu": "4", "memory": "8Gi", "nvidia.com/gpu": 2},
             ),
             port=26600,
         )
-        container = spec.containers[0]
+        container = template.spec.containers[0]
         expected = {"cpu": "4", "memory": "8Gi", "nvidia.com/gpu": "2"}
         self.assertEqual(container.resources.requests, expected)
         self.assertEqual(container.resources.limits, expected)
+
+
+class KubeConfigTest(unittest.TestCase):
+    """Tests for KubeConfig loading."""
+
+    @patch("monarch._src.job.kubernetes.client.Configuration.set_default")
+    @patch("monarch._src.job.kubernetes.client.Configuration.get_default_copy")
+    @patch("monarch._src.job.kubernetes.config.load_kube_config")
+    def test_local_load_preserves_proxy_url(
+        self,
+        mock_load_kube_config: MagicMock,
+        mock_get_default_copy: MagicMock,
+        mock_set_default: MagicMock,
+    ) -> None:
+        with NamedTemporaryFile("w") as kubeconfig:
+            kubeconfig.write(
+                """
+apiVersion: v1
+kind: Config
+current-context: test-context
+clusters:
+  - name: test-cluster
+    cluster:
+      server: https://example.invalid
+      proxy-url: http://fwdproxy:8080
+contexts:
+  - name: test-context
+    context:
+      cluster: test-cluster
+      user: test-user
+users:
+  - name: test-user
+    user:
+      token: test-token
+"""
+            )
+            kubeconfig.flush()
+            configuration = MagicMock()
+            mock_get_default_copy.return_value = configuration
+
+            KubeConfig.from_path(kubeconfig.name).load()
+
+        mock_load_kube_config.assert_called_once_with(config_file=kubeconfig.name)
+        self.assertEqual(configuration.proxy, "http://fwdproxy:8080")
+        mock_set_default.assert_called_once_with(configuration)
+
+    @patch("monarch._src.job.kubernetes.config.load_kube_config")
+    def test_local_load_malformed_kubeconfig_raises(
+        self, mock_load_kube_config: MagicMock
+    ) -> None:
+        # current-context references a context that does not exist, so proxy-url
+        # resolution fails. The error must surface as a RuntimeError, not a raw
+        # traceback from the underlying kubeconfig parsing.
+        with NamedTemporaryFile("w") as kubeconfig:
+            kubeconfig.write(
+                """
+apiVersion: v1
+kind: Config
+current-context: missing-context
+clusters: []
+contexts: []
+users: []
+"""
+            )
+            kubeconfig.flush()
+            with self.assertRaises(RuntimeError, msg="kubeconfig"):
+                KubeConfig.from_path(kubeconfig.name).load()
 
 
 class TestIsPodWorkerReady(unittest.TestCase):
@@ -584,7 +759,13 @@ class TestWaitForReadyPods(unittest.TestCase):
             pod_rank_label="apps.kubernetes.io/pod-index",
         )
 
-        self.assertEqual(result, [("10.0.0.1", 26600), ("10.0.0.2", 26600)])
+        self.assertEqual(
+            result,
+            [
+                _MonarchMeshPod(name="w-0", ip="10.0.0.1", port=26600),
+                _MonarchMeshPod(name="w-1", ip="10.0.0.2", port=26600),
+            ],
+        )
         mock_watch.stop.assert_called_once()
 
     @patch("monarch._src.job.kubernetes.watch.Watch")
@@ -615,7 +796,13 @@ class TestWaitForReadyPods(unittest.TestCase):
             pod_rank_label="apps.kubernetes.io/pod-index",
         )
 
-        self.assertEqual(result, [("10.0.0.1", 26600), ("10.0.0.2", 26600)])
+        self.assertEqual(
+            result,
+            [
+                _MonarchMeshPod(name="w-0", ip="10.0.0.1", port=26600),
+                _MonarchMeshPod(name="w-1", ip="10.0.0.2", port=26600),
+            ],
+        )
 
     @patch("monarch._src.job.kubernetes.watch.Watch")
     @patch("monarch._src.job.kubernetes.client.CoreV1Api")
@@ -650,8 +837,10 @@ class TestWaitForReadyPods(unittest.TestCase):
         )
 
         # Rank 0 should be the replacement IP.
-        self.assertEqual(result[0], ("10.0.0.3", 26600))
-        self.assertEqual(result[1], ("10.0.0.2", 26600))
+        self.assertEqual(result[0].ip, "10.0.0.3")
+        self.assertEqual(result[0].port, 26600)
+        self.assertEqual(result[1].ip, "10.0.0.2")
+        self.assertEqual(result[1].port, 26600)
 
     @patch("monarch._src.job.kubernetes.watch.Watch")
     @patch("monarch._src.job.kubernetes.client.CoreV1Api")
@@ -728,7 +917,10 @@ class TestWaitForReadyPods(unittest.TestCase):
             pod_rank_label="apps.kubernetes.io/pod-index",
         )
 
-        self.assertEqual(result, [("10.0.0.1", 26600)])
+        self.assertEqual(
+            result,
+            [_MonarchMeshPod(name="w-0", ip="10.0.0.1", port=26600)],
+        )
 
     @patch(
         "monarch._src.job.kubernetes.config.load_incluster_config",
@@ -769,7 +961,10 @@ class TestWaitForReadyPods(unittest.TestCase):
             pod_rank_label="apps.kubernetes.io/pod-index",
         )
 
-        self.assertEqual(result, [("10.0.0.1", 9999)])
+        self.assertEqual(
+            result,
+            [_MonarchMeshPod(name="w-0", ip="10.0.0.1", port=9999)],
+        )
 
 
 class TestKill(unittest.TestCase):
@@ -926,6 +1121,248 @@ class TestCanRun(unittest.TestCase):
         spec = self._make_job()
         spec.add_mesh("workers", num_replicas=1)
         self.assertFalse(job.can_run(spec))
+
+
+class TestPortForwardToPod(unittest.TestCase):
+    """Tests for KubernetesJob._port_forward_to_pod."""
+
+    @patch("monarch._src.job.kubernetes.configure")
+    def _make_job(self, mock_configure: MagicMock) -> KubernetesJob:
+        return KubernetesJob(
+            namespace="test-ns",
+            kubeconfig=KubeConfig.from_path("/tmp/kubeconfig"),
+        )
+
+    @patch("monarch._src.job.kubernetes.shutil.which", return_value=None)
+    def test_missing_kubectl_raises(self, mock_which: MagicMock) -> None:
+        job = self._make_job()
+        pod = _MonarchMeshPod(name="mesh1-0", ip="10.0.0.1", port=26600)
+        with self.assertRaises(RuntimeError, msg="kubectl"):
+            job._port_forward_to_pod(pod)
+
+    @patch("monarch._src.job.kubernetes.select.select", return_value=([1], [], []))
+    @patch("monarch._src.job.kubernetes.subprocess.Popen")
+    @patch("monarch._src.job.kubernetes.shutil.which", return_value="/usr/bin/kubectl")
+    def test_port_forward_uses_pod(
+        self, mock_which: MagicMock, mock_popen: MagicMock, mock_select: MagicMock
+    ) -> None:
+        job = self._make_job()
+        pod = _MonarchMeshPod(name="mesh1-0", ip="10.0.0.1", port=26600)
+
+        mock_process = MagicMock()
+        mock_process.stdout.readline.return_value = (
+            "Forwarding from 127.0.0.1:45678 -> 26600\n"
+        )
+        mock_popen.return_value = mock_process
+
+        result = job._port_forward_to_pod(pod)
+
+        self.assertEqual(result, "tcp://127.0.0.1:45678")
+        cmd = mock_popen.call_args[0][0]
+        self.assertIn("pod/mesh1-0", cmd)
+        self.assertIn(":26600", cmd)
+        self.assertIn("--namespace", cmd)
+        self.assertIn("test-ns", cmd)
+
+    @patch("monarch._src.job.kubernetes.select.select", return_value=([1], [], []))
+    @patch("monarch._src.job.kubernetes.subprocess.Popen")
+    @patch("monarch._src.job.kubernetes.shutil.which", return_value="/usr/bin/kubectl")
+    def test_port_forward_no_output_raises(
+        self, mock_which: MagicMock, mock_popen: MagicMock, mock_select: MagicMock
+    ) -> None:
+        job = self._make_job()
+        pod = _MonarchMeshPod(name="mesh1-0", ip="10.0.0.1", port=26600)
+
+        mock_process = MagicMock()
+        mock_process.stdout.readline.return_value = ""
+        mock_process.communicate.return_value = ("", "connection refused")
+        mock_popen.return_value = mock_process
+
+        with self.assertRaises(RuntimeError, msg="no output"):
+            job._port_forward_to_pod(pod)
+        mock_process.terminate.assert_called_once()
+
+    @patch("monarch._src.job.kubernetes.select.select", return_value=([1], [], []))
+    @patch("monarch._src.job.kubernetes.subprocess.Popen")
+    @patch("monarch._src.job.kubernetes.shutil.which", return_value="/usr/bin/kubectl")
+    def test_port_forward_unparseable_output_raises(
+        self, mock_which: MagicMock, mock_popen: MagicMock, mock_select: MagicMock
+    ) -> None:
+        job = self._make_job()
+        pod = _MonarchMeshPod(name="mesh1-0", ip="10.0.0.1", port=26600)
+
+        mock_process = MagicMock()
+        mock_process.stdout.readline.return_value = "unexpected output\n"
+        mock_process.kill.return_value = None
+        mock_process.wait.return_value = 1
+        mock_popen.return_value = mock_process
+
+        with self.assertRaises(RuntimeError, msg="could not parse"):
+            job._port_forward_to_pod(pod)
+
+    @patch("monarch._src.job.kubernetes.select.select", return_value=([], [], []))
+    @patch("monarch._src.job.kubernetes.subprocess.Popen")
+    @patch("monarch._src.job.kubernetes.shutil.which", return_value="/usr/bin/kubectl")
+    def test_port_forward_start_timeout_raises(
+        self, mock_which: MagicMock, mock_popen: MagicMock, mock_select: MagicMock
+    ) -> None:
+        job = self._make_job()
+        pod = _MonarchMeshPod(name="mesh1-0", ip="10.0.0.1", port=26600)
+
+        mock_process = MagicMock()
+        mock_popen.return_value = mock_process
+
+        # select reports the port-forward never became readable within the
+        # deadline, so we kill it and raise before ever reading stdout.
+        with self.assertRaises(RuntimeError, msg="did not start within"):
+            job._port_forward_to_pod(pod)
+        mock_process.kill.assert_called_once()
+        mock_process.stdout.readline.assert_not_called()
+
+
+class TestStateOutOfCluster(unittest.TestCase):
+    """Tests for KubernetesJob._state in out-of-cluster mode.
+
+    Covers the hello_mesh (attach-only) and hello_provision (provisioned) flows.
+    """
+
+    @patch("monarch._src.job.kubernetes.configure")
+    def _make_job(
+        self,
+        mock_configure: MagicMock,
+        attach_to: str | None = None,
+    ) -> KubernetesJob:
+        return KubernetesJob(
+            namespace="monarch-tests",
+            kubeconfig=KubeConfig.from_path("/tmp/kubeconfig"),
+            attach_to=attach_to,
+        )
+
+    def _mock_watch_for_pods(
+        self,
+        mock_watch_cls: MagicMock,
+        pods_by_call: list[list[V1Pod]],
+    ) -> None:
+        """Set up mock watch to return different pod lists for successive calls."""
+        mock_watch = MagicMock()
+        mock_watch_cls.return_value = mock_watch
+        # Each call to stream returns the next set of pods
+        mock_watch.stream.side_effect = [
+            [{"type": "ADDED", "object": pod} for pod in pods] for pods in pods_by_call
+        ]
+
+    @patch("monarch._src.job.kubernetes.attach_to_workers")
+    @patch("monarch._src.job.kubernetes.attach")
+    @patch("monarch._src.job.kubernetes.KubernetesJob._port_forward_to_pod")
+    @patch("monarch._src.job.kubernetes.watch.Watch")
+    @patch("monarch._src.job.kubernetes.client.CoreV1Api")
+    @patch("monarch._src.job.kubernetes.config.load_kube_config")
+    def test_hello_mesh_out_of_cluster_auto_forwards(
+        self,
+        mock_load_config: MagicMock,
+        mock_core_api: MagicMock,
+        mock_watch_cls: MagicMock,
+        mock_port_forward: MagicMock,
+        mock_attach: MagicMock,
+        mock_attach_to_workers: MagicMock,
+    ) -> None:
+        """hello_mesh flow: attach-only meshes auto port-forward to the first pod."""
+        job = self._make_job()
+        job.add_mesh("mesh1", 2)
+
+        self._mock_watch_for_pods(
+            mock_watch_cls,
+            [
+                [
+                    _make_pod("mesh1-0", 0, True, ip="10.0.0.1"),
+                    _make_pod("mesh1-1", 1, True, ip="10.0.0.2"),
+                ],
+            ],
+        )
+
+        mock_port_forward.return_value = "tcp://127.0.0.1:45678"
+        mock_attach.return_value = MagicMock()
+
+        job._state()
+
+        # Should port-forward to the first pod.
+        mock_port_forward.assert_called_once()
+        forwarded_pod = mock_port_forward.call_args[0][0]
+        self.assertEqual(forwarded_pod.name, "mesh1-0")
+        mock_attach.assert_called_once_with("tcp://127.0.0.1:45678")
+
+    @patch("monarch._src.job.kubernetes.attach_to_workers")
+    @patch("monarch._src.job.kubernetes.attach")
+    @patch("monarch._src.job.kubernetes.KubernetesJob._port_forward_to_pod")
+    @patch("monarch._src.job.kubernetes.watch.Watch")
+    @patch("monarch._src.job.kubernetes.client.CoreV1Api")
+    @patch("monarch._src.job.kubernetes.config.load_kube_config")
+    def test_hello_provision_out_of_cluster_auto_forwards(
+        self,
+        mock_load_config: MagicMock,
+        mock_core_api: MagicMock,
+        mock_watch_cls: MagicMock,
+        mock_port_forward: MagicMock,
+        mock_attach: MagicMock,
+        mock_attach_to_workers: MagicMock,
+    ) -> None:
+        """hello_provision flow: provisioned meshes auto port-forward."""
+        job = self._make_job()
+        job.add_mesh(
+            "mesh1", 2, image_spec=ImageSpec("ghcr.io/meta-pytorch/monarch:latest")
+        )
+
+        self._mock_watch_for_pods(
+            mock_watch_cls,
+            [
+                [
+                    _make_pod("mesh1-0", 0, True, ip="10.0.0.1"),
+                    _make_pod("mesh1-1", 1, True, ip="10.0.0.2"),
+                ],
+            ],
+        )
+
+        mock_port_forward.return_value = "tcp://127.0.0.1:55555"
+        mock_attach.return_value = MagicMock()
+
+        job._state()
+
+        mock_port_forward.assert_called_once()
+        forwarded_pod = mock_port_forward.call_args[0][0]
+        self.assertEqual(forwarded_pod.name, "mesh1-0")
+        mock_attach.assert_called_once_with("tcp://127.0.0.1:55555")
+
+    @patch("monarch._src.job.kubernetes.attach_to_workers")
+    @patch("monarch._src.job.kubernetes.attach")
+    @patch("monarch._src.job.kubernetes.KubernetesJob._port_forward_to_pod")
+    @patch("monarch._src.job.kubernetes.watch.Watch")
+    @patch("monarch._src.job.kubernetes.client.CoreV1Api")
+    @patch("monarch._src.job.kubernetes.config.load_kube_config")
+    def test_explicit_attach_to_skips_port_forward(
+        self,
+        mock_load_config: MagicMock,
+        mock_core_api: MagicMock,
+        mock_watch_cls: MagicMock,
+        mock_port_forward: MagicMock,
+        mock_attach: MagicMock,
+        mock_attach_to_workers: MagicMock,
+    ) -> None:
+        """When --attach-to is provided, no automatic port-forward should happen."""
+        job = self._make_job(attach_to="tcp://127.0.0.1:34000")
+        job.add_mesh("mesh1", 1)
+
+        self._mock_watch_for_pods(
+            mock_watch_cls,
+            [
+                [_make_pod("mesh1-0", 0, True, ip="10.0.0.1")],
+            ],
+        )
+        mock_attach.return_value = MagicMock()
+
+        job._state()
+
+        mock_port_forward.assert_not_called()
+        mock_attach.assert_called_once_with("tcp://127.0.0.1:34000")
 
 
 if __name__ == "__main__":

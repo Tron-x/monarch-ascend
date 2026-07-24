@@ -90,23 +90,17 @@ impl PdbActor {
         })
     }
 
-    fn send<'py>(&self, py: Python<'py>, action: DebuggerAction) -> PyResult<()> {
+    fn send(&self, py: Python<'_>, action: DebuggerAction) -> PyResult<()> {
         let controller_actor_ref = self.controller_actor_ref.clone();
         let instance = self.instance.clone();
-        let actor_id = instance.blocking_lock().actor_id().clone();
+        let actor_id = instance.blocking_lock().actor_addr().clone();
         signal_safe_block_on(py, async move {
-            let (instance, handle) = instance
-                .lock()
-                .await
-                .instance()
-                .child()
-                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-            let result = controller_actor_ref
+            let instance = instance.lock().await.instance().child();
+
+            controller_actor_ref
                 .debugger_message(&instance, actor_id, action)
                 .await
-                .map_err(|err| PyRuntimeError::new_err(err.to_string()));
-            let _ = handle.drain_and_stop("debugger cleanup");
-            result
+                .map_err(|err| PyRuntimeError::new_err(err.to_string()))
         })?
     }
 
@@ -155,6 +149,7 @@ mod tests {
     use hyperactor::Mailbox;
     use hyperactor::mailbox::PortReceiver;
     use hyperactor::proc::Proc;
+    use monarch_hyperactor::runtime::GilSite;
     use monarch_hyperactor::runtime::monarch_with_gil_blocking;
     use monarch_messages::controller::ControllerMessage;
     use typeuri::Named;
@@ -175,7 +170,7 @@ mod tests {
     }
 
     fn receive_on_debugger(actor: &mut PdbActor) -> DebuggerAction {
-        monarch_with_gil_blocking(|py| {
+        monarch_with_gil_blocking(GilSite::Test, |py| {
             let msg = actor.receive(py).unwrap();
             let action: DebuggerAction = msg.extract(py).unwrap();
             action
@@ -185,7 +180,7 @@ mod tests {
     fn receive_on_controller(
         rx: Arc<Mutex<PortReceiver<ControllerMessage>>>,
     ) -> (reference::ActorId, DebuggerAction) {
-        let msg = monarch_with_gil_blocking(|py| {
+        let msg = monarch_with_gil_blocking(GilSite::Test, |py| {
             signal_safe_block_on(py, async move { rx.lock().await.recv().await.unwrap() }).unwrap()
         });
         match msg {
@@ -206,7 +201,7 @@ mod tests {
     fn test_pdb_actor() {
         Python::initialize();
 
-        let proc = Proc::local();
+        let proc = Proc::isolated();
         let (_, controller_ref, controller_rx) = proc
             .attach_actor::<ControllerActor, ControllerMessage>("controller")
             .unwrap();
@@ -220,12 +215,14 @@ mod tests {
         let worker = proc.attach("worker").unwrap();
         PROC.with(|cell| cell.set(proc.clone()).ok());
         CONTROLLER_ACTOR_REF.with(|cell| cell.set(controller_ref.clone()).ok());
-        ROOT_ACTOR_ID.with(|cell| cell.set(worker.actor_id().clone()).ok());
+        ROOT_ACTOR_ID.with(|cell| cell.set(worker.actor_addr().clone()).ok());
 
         let mut actor = PdbActor::new().unwrap();
-        let debugger_actor_id = actor.instance.blocking_lock().actor_id().clone();
+        let debugger_actor_id = actor.instance.blocking_lock().actor_addr().clone();
 
-        monarch_with_gil_blocking(|py| actor.send(py, DebuggerAction::Paused()).unwrap());
+        monarch_with_gil_blocking(GilSite::Test, |py| {
+            actor.send(py, DebuggerAction::Paused()).unwrap()
+        });
 
         let (received_actor_id, action) = receive_on_controller(controller_rx.clone());
         assert_eq!(received_actor_id, debugger_actor_id);
@@ -237,7 +234,7 @@ mod tests {
         let action = receive_on_debugger(&mut actor);
         assert_eq!(action, DebuggerAction::Attach());
 
-        monarch_with_gil_blocking(|py| {
+        monarch_with_gil_blocking(GilSite::Test, |py| {
             actor
                 .send(py, DebuggerAction::Read { requested_size: 4 })
                 .unwrap()
@@ -263,7 +260,7 @@ mod tests {
             }
         );
 
-        monarch_with_gil_blocking(|py| {
+        monarch_with_gil_blocking(GilSite::Test, |py| {
             actor
                 .send(
                     py,
@@ -288,6 +285,6 @@ mod tests {
         let action = receive_on_debugger(&mut actor);
         assert_eq!(action, DebuggerAction::Detach());
 
-        monarch_with_gil_blocking(|py| actor.drain_and_stop(py).unwrap());
+        monarch_with_gil_blocking(GilSite::Test, |py| actor.drain_and_stop(py).unwrap());
     }
 }

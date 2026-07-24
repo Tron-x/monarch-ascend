@@ -145,21 +145,17 @@ fn bench_message_rates(c: &mut Criterion) {
                         let mut response_handlers: Vec<tokio::task::JoinHandle<()>> =
                             Vec::with_capacity(rate as usize);
                         for _ in 0..rate {
-                            let (return_sender, return_receiver) = oneshot::channel();
-                            tx.try_post(message.clone(), return_sender);
+                            let receipt = tx.try_post(message.clone());
 
                             let handle = tokio::spawn(async move {
-                                _ = tokio::time::timeout(
-                                    Duration::from_millis(5000),
-                                    return_receiver,
-                                )
-                                .await
-                                .unwrap();
+                                _ = tokio::time::timeout(Duration::from_millis(5000), receipt)
+                                    .await
+                                    .unwrap();
                             });
 
                             response_handlers.push(handle);
 
-                            let delay_ms = if rate > 0 { 1000 / rate } else { 0 };
+                            let delay_ms = 1000_u64.checked_div(rate).unwrap_or(0);
                             let elapsed = start.elapsed().as_millis();
                             let effective_delay = (delay_ms as u128).saturating_sub(elapsed);
                             if effective_delay > 0 {
@@ -231,7 +227,7 @@ async fn channel_ping_pong(
         });
 
     let start = Instant::now();
-    let _ = client_handle.await.unwrap().unwrap();
+    client_handle.await.unwrap().unwrap();
     start.elapsed()
 }
 
@@ -249,7 +245,7 @@ fn bench_mailbox_message_sizes(c: &mut Criterion) {
             let mut b = b.to_async(Runtime::new().unwrap());
             b.iter_custom(|iters| async move {
                 let actor_id = test_actor_id("world_0", "actor");
-                let mbox = Mailbox::new_detached(actor_id);
+                let mbox = Mailbox::new(actor_id);
                 let (port, mut receiver) = mbox.open_port::<Message>();
                 let port = port.bind();
 
@@ -279,7 +275,7 @@ fn bench_mailbox_message_rates(c: &mut Criterion) {
             let mut b = b.to_async(Runtime::new().unwrap());
             b.iter_custom(|iters| async move {
                 let actor_id = test_actor_id("world_0", "actor");
-                let mbox = Mailbox::new_detached(actor_id);
+                let mbox = Mailbox::new(actor_id);
                 let (port, mut receiver) = mbox.open_port::<Message>();
                 let port = port.bind();
 
@@ -328,7 +324,7 @@ fn bench_mailbox_message_rates(c: &mut Criterion) {
 
                         response_handlers.push(handle);
 
-                        let delay_ms = if rate > 0 { 1000 / rate } else { 0 };
+                        let delay_ms = 1000_u64.checked_div(rate).unwrap_or(0);
                         let elapsed = start.elapsed().as_millis();
                         let effective_delay = (delay_ms as u128).saturating_sub(elapsed);
                         if effective_delay > 0 {

@@ -7,9 +7,11 @@
 # pyre-strict
 
 import abc
+import asyncio
 import collections
 import contextvars
 import functools
+import importlib
 import inspect
 import logging
 import os
@@ -67,12 +69,9 @@ from monarch._rust_bindings.monarch_hyperactor.pickle import (
     PicklingState,
 )
 from monarch._rust_bindings.monarch_hyperactor.proc import ActorAddr
-from monarch._rust_bindings.monarch_hyperactor.pytokio import PythonTask, Shared
+from monarch._rust_bindings.monarch_hyperactor.pytokio import PythonTask
 from monarch._rust_bindings.monarch_hyperactor.shape import Point as HyPoint, Shape
-from monarch._rust_bindings.monarch_hyperactor.supervision import (
-    MeshFailure,
-    SupervisionError,
-)
+from monarch._rust_bindings.monarch_hyperactor.supervision import MeshFailure
 from monarch._src.actor import config
 from monarch._src.actor.debugger.pdb_wrapper import PdbWrapper
 from monarch._src.actor.endpoint import (
@@ -83,9 +82,7 @@ from monarch._src.actor.endpoint import (
     Selection,
 )
 from monarch._src.actor.future import Future
-from monarch._src.actor.mpsc import (  # noqa: F401 - import runs @rust_struct patching
-    Receiver,
-)
+from monarch._src.actor.mpsc import Receiver  # noqa: F401 - used in annotations
 from monarch._src.actor.python_extension_methods import rust_struct
 from monarch._src.actor.shape import MeshTrait, NDSlice
 from monarch._src.actor.sync_state import fake_sync_state
@@ -100,19 +97,34 @@ if TYPE_CHECKING:
         QueuedMessage,
     )
     from monarch._rust_bindings.monarch_hyperactor.actor_mesh import ActorMeshProtocol
-    from monarch._rust_bindings.monarch_hyperactor.mailbox import (
-        PortHandle,
-        PortReceiverBase,
-    )
+    from monarch._rust_bindings.monarch_hyperactor.mailbox import PortReceiverBase
     from monarch._src.actor.proc_mesh import _ControllerController, DeviceMesh, ProcMesh
 
     def _assert_implements_endpoint(x: Endpoint[..., Any]) -> None: ...
 
     def _check_actor_endpoint_satisfies_protocol(ep: ActorEndpoint[..., Any]) -> None:
+        # pyrefly: ignore [bad-argument-type]
         _assert_implements_endpoint(ep)
 
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+# `@rust_struct` (see `python_extension_methods.rust_struct`) attaches Python
+# methods to a Rust pyclass as a side effect of importing the module that
+# declares them. The queue-dispatch loop below calls `Receiver.recv` (from
+# `mpsc`), which awaits `Event.wait`/`Event.clear` (from `waker`); all three are
+# such patched methods. Under lazy imports (native-python builds) a plain
+# `from ... import` is deferred until the imported *symbol* is used, but the
+# loop only calls these methods on Rust-created *instances* and never touches
+# the symbols, so the patches never run and the calls fail with `AttributeError:
+# 'Receiver' object has no attribute 'recv'`. Force the modules to load here so
+# their patches are applied before any actor dispatches a message.
+#
+# TODO: ideally `@rust_struct` would make a patched method resolve (and run) its
+# defining module on first access, removing the need for these explicit imports.
+# That likely requires a change to the lazy-import machinery outside monarch.
+importlib.import_module("monarch._src.actor.mpsc")
+importlib.import_module("monarch._src.actor.waker")
 
 try:
     from __manifest__ import fbmake  # noqa
@@ -126,6 +138,16 @@ T2 = TypeVar("T2")
 
 
 class Point(HyPoint, collections.abc.Mapping):
+    """A coordinate within a mesh.
+
+    A ``Point`` maps each mesh dimension label (for example ``"hosts"`` or
+    ``"gpus"``) to its integer index along that dimension. It behaves as a
+    read-only mapping, so ``point["gpus"]`` is the index along the ``"gpus"``
+    dimension. ``current_rank`` and ``Context.message_rank`` return the
+    ``Point`` that locates the current actor within the mesh that received the
+    message.
+    """
+
     pass
 
 
@@ -148,7 +170,6 @@ class Instance(abc.ABC):
         # pyre-ignore[21]: mesh_controller may not be visible to pyre in this target
         from monarch.mesh_controller import spawn_tensor_engine as real_spawn
 
-        # pyre-ignore[16]: spawn_tensor_engine is defined in mesh_controller
         return real_spawn(proc_mesh)
 
     @abstractproperty
@@ -234,6 +255,31 @@ class Instance(abc.ABC):
         ...
 
     @abstractmethod
+    def _execution_start(self, name: str) -> int:
+        """
+        Producer write-side for the mesh `execution` field: record the start
+        of a handler invocation, returning its in-flight token. Returns 0
+        (a no-op sentinel) when this instance has no execution tracker.
+        """
+        ...
+
+    @abstractmethod
+    def _execution_finish(self, token: int) -> None:
+        """
+        End the handler invocation started by `_execution_start`. A no-op
+        for the 0 sentinel. Called from `_Actor.handle`'s `finally`.
+        """
+        ...
+
+    @abstractmethod
+    def kill(self, reason: Optional[str] = None) -> None:
+        """
+        Terminate the current actor with a failure. A supervision error
+        propagates to its creator.
+        """
+        ...
+
+    @abstractmethod
     def stop(self, reason: Optional[str] = None) -> None:
         """
         Stop this actor instance and its children gracefully. The
@@ -289,6 +335,13 @@ def _qualified_name(ins: "CreatorInstance | Instance | None") -> str:
 
 @rust_struct("monarch_hyperactor::context::Context")
 class Context:
+    """Runtime information about the currently executing actor.
+
+    A ``Context`` is returned by ``context()`` from within an endpoint. It
+    exposes the running actor through ``actor_instance`` and the position of the
+    current message within its broadcast through ``message_rank``.
+    """
+
     @property
     def actor_instance(self) -> Instance:
         """
@@ -316,7 +369,6 @@ class Context:
     def _from_instance(instance: Instance) -> "Context": ...
 
 
-# pyre-fixme[9]: Initialization to None confuses the type bound.
 _context: contextvars.ContextVar[Optional[Context]] = contextvars.ContextVar(
     "monarch.actor_mesh._context", default=None
 )
@@ -371,7 +423,6 @@ def _init_context_log_handler() -> None:
         if af not in hdlr.filters:
             hdlr.addFilter(af)
 
-    # pyre-ignore[8]: Intentionally monkey-patching Logger.addHandler
     logging.Logger.addHandler = _patched_addHandler
 
 
@@ -403,19 +454,27 @@ class _Lazy(Generic[T]):
         return self._val
 
 
-def _init_client_context() -> Context:
+def _init_client_context(via: Optional[str] = None) -> Context:
     """
     Create a client context that bootstraps an actor instance running on a real
     local proc mesh on a real local host mesh.
+
+    When ``via`` is a non-empty ZMQ-style address, the local client's
+    gateway is connected to the gateway serving that address: outbound
+    traffic forwards over the duplex, and the remote gateway routes
+    return traffic back over the same duplex. ``this_host()`` still
+    names the current machine; attach only controls how the host's
+    procs are reached, not the host's identity. Use ``attach``
+    to supply ``via`` before the client context is first used.
     """
     import atexit
 
     from monarch._rust_bindings.monarch_hyperactor.host_mesh import bootstrap_host
-    from monarch._src.actor.host_mesh import _bootstrap_cmd, HostMesh
+    from monarch._src.actor.host_mesh import default_bootstrap_cmd, HostMesh
     from monarch._src.actor.proc_mesh import ProcMesh
 
     hy_host_mesh, hy_proc_mesh, hy_instance = bootstrap_host(
-        _bootstrap_cmd()
+        default_bootstrap_cmd(), via=via
     ).block_on()
 
     ctx = Context._from_instance(cast(Instance, hy_instance))  # type: ignore
@@ -435,11 +494,7 @@ def _init_client_context() -> Context:
     # cleanly shut down (connections flushed, acks delivered) before the tokio
     # runtime is torn down.
     #
-    # The timeout must be short enough that the process exits before
-    # the test executor's SIGTERM grace period (~2s). Combined with
-    # the 1s shutdown_tokio_runtime timeout, total atexit budget is
-    # ~2s, so we allow 1s here.
-    atexit.register(lambda: shutdown_context().get(timeout=1.0))
+    atexit.register(_shutdown_context_at_exit)
 
     return ctx
 
@@ -447,7 +502,61 @@ def _init_client_context() -> Context:
 _client_context: _Lazy[Context] = _Lazy(_init_client_context)
 
 
+def attach(addr: str) -> None:
+    """Bootstrap this process's client by attaching its gateway to the
+    remote duplex server at ``addr`` (a ZMQ-style address, e.g.
+    ``"ipc:///tmp/sock"`` or ``"tcp://host:port"``).
+
+    Outbound client traffic is forwarded over the duplex and the remote
+    gateway routes return traffic back, so the client need not be
+    directly reachable by the procs in the mesh — e.g. a client running
+    outside a Kubernetes cluster whose procs run inside it.
+
+    Must be called before the client context is bootstrapped — i.e.
+    before the first ``context()`` / ``this_host()`` / ``this_proc()``
+    on the client — because actor and port refs snapshot their
+    location when they are created. We are working to remove this
+    sequencing dependency so attach can be configured independently of
+    first client-context use. Raises ``RuntimeError`` if the client
+    context has already been bootstrapped. ``this_host()`` still names
+    the current machine — attach only changes how this host's procs
+    are reached.
+    """
+    with _client_context._lock:
+        if _client_context._val is not None:
+            raise RuntimeError(
+                "client already bootstrapped; call attach(addr) before "
+                "the first context()/this_host()/this_proc()"
+            )
+        _client_context._val = _init_client_context(via=addr)
+
+
 _shutdown_done = False
+
+
+def _atexit_shutdown_timeout_secs() -> float:
+    value = os.environ.get("MONARCH_ATEXIT_SHUTDOWN_TIMEOUT", "5.0")
+    try:
+        return float(value)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid MONARCH_ATEXIT_SHUTDOWN_TIMEOUT=%r; using 5.0s",
+            value,
+        )
+        return 5.0
+
+
+def _shutdown_context_at_exit() -> None:
+    timeout = _atexit_shutdown_timeout_secs()
+    try:
+        shutdown_context().get(timeout=timeout)
+    except TimeoutError:
+        logger.warning(
+            "Timed out after %.1fs while shutting down Monarch actor context at exit",
+            timeout,
+        )
+    except Exception:
+        logger.exception("Failed to shut down Monarch actor context at exit")
 
 
 def shutdown_context() -> "Future[None]":
@@ -502,6 +611,12 @@ def shutdown_context() -> "Future[None]":
 
 
 def context() -> Context:
+    """Return the ``Context`` for the currently executing actor.
+
+    Call this from within an endpoint to inspect the running actor and the
+    current message's position in the mesh. Outside an actor (on the client) it
+    returns the root client context.
+    """
     c = _context.get()
     if c is None:
         from monarch._src.actor.proc_mesh import _get_controller_controller
@@ -643,6 +758,7 @@ def _check_endpoint_arguments(
     so we bind with one None placeholder for self.
     """
     match method_name:
+        # pyrefly: ignore [invalid-pattern]
         case MethodSpecifier.Init():
             # For Init, args[0] is ActorInitArgs which wraps the real constructor args
             if len(args) != 1 or not isinstance(args[0], ActorInitArgs):
@@ -650,6 +766,7 @@ def _check_endpoint_arguments(
             init_args = args[0]
             # Validate the actual constructor arguments against the signature
             signature.bind(None, *init_args.args, **kwargs)
+        # pyrefly: ignore [invalid-pattern]
         case MethodSpecifier.ExplicitPort():
             signature.bind(None, None, *args, **kwargs)
         case _:
@@ -675,16 +792,20 @@ def _create_endpoint_message(
     """
     _check_endpoint_arguments(method_name, signature, args, kwargs)
     pickling_state = pickle(
-        (args, kwargs), allow_pending_pickles=True, allow_tensor_engine_references=True
+        (args, kwargs),
+        allow_tensor_engine_references=True,
+        allow_mesh_references=True,
     )
     objects = pickling_state.tensor_engine_references()
     if not objects:
+        # pyrefly: ignore [bad-argument-count]
         message_kind = PythonMessageKind.CallMethod(method_name, port_ref)
     else:
         message_kind = create_actor_message_kind(
             method_name, proc_mesh, objects, port_ref
         )
 
+    # pyrefly: ignore [bad-argument-type]
     return PendingMessage(message_kind, pickling_state)
 
 
@@ -722,6 +843,26 @@ def as_endpoint(
     propagate: Propagator = None,
     explicit_response_port: bool = False,
 ) -> Any:
+    """Treat an actor method that is not an ``@endpoint`` as one.
+
+    Use this to call a plain method of a spawned actor through the messaging
+    adverbs when the method was not decorated with ``@endpoint``, for example
+    ``as_endpoint(actor.method).call(...)``. The options match those of
+    ``endpoint``.
+
+    Args:
+        not_an_endpoint: An unannotated method of a spawned actor.
+        propagate: Tensor-shape propagation for ``rref``; see ``endpoint``.
+        explicit_response_port: When ``True``, the method receives a ``Port``
+            as its first argument and sends its result through it; see
+            ``endpoint``.
+
+    Returns:
+        An ``Endpoint`` exposing the messaging adverbs.
+
+    Raises:
+        ValueError: If ``not_an_endpoint`` is not a method of a spawned actor.
+    """
     if not isinstance(not_an_endpoint, NotAnEndpoint):
         raise ValueError("expected an method of a spawned actor")
     kind = (
@@ -730,6 +871,7 @@ def as_endpoint(
         else MethodSpecifier.ReturnsResponse
     )
     return not_an_endpoint._ref._endpoint(
+        # pyrefly: ignore [bad-argument-count, bad-argument-type]
         kind(not_an_endpoint._name),
         getattr(not_an_endpoint._ref, not_an_endpoint._name),
         propagate,
@@ -774,7 +916,7 @@ class Accumulator(Generic[P, R, A]):
         async def impl() -> A:
             value = self._identity
             for x in gen:
-                value = self._combine(value, await x)
+                value = self._combine(value, await x._take_inner())
             return value
 
         return Future(coro=impl())
@@ -885,7 +1027,6 @@ class ValueMesh(MeshTrait, Generic[R]):
             from monarch.common.device_mesh import no_mesh
         except ImportError:
             return self.get(local_idx)
-        # pyre-ignore[16]: no_mesh type resolved at runtime
         with no_mesh.activate():
             return self.get(local_idx)
 
@@ -898,6 +1039,7 @@ class ValueMesh(MeshTrait, Generic[R]):
         """
         extent = self._shape.extent
         for i, _global_rank in enumerate(self._shape.ranks()):
+            # pyrefly: ignore [invalid-yield]
             yield Point(i, extent), self.get(i)
 
     def values(self) -> Iterable[R]:
@@ -921,6 +1063,7 @@ class ValueMesh(MeshTrait, Generic[R]):
         return self._shape.ndslice
 
     @property
+    # pyrefly: ignore [bad-override]
     def _labels(self) -> Iterable[str]:
         return self._shape.labels
 
@@ -976,6 +1119,23 @@ class Port(Generic[R]):
             obj: R-typed object to send.
         """
         ...
+
+    def send_message(self, message: PythonMessage) -> None: ...
+
+    async def resolve_and_send(self, result: object) -> None:
+        # This is Port.send with mesh-reference resolution inserted before the
+        # already-serialized Result message is posted.
+        state = pickle(
+            result,
+            allow_tensor_engine_references=False,
+            allow_mesh_references=True,
+        )
+        kind = cast(PythonMessageKind, cast(Any, PythonMessageKind.Result)(self._rank))
+        message = PendingMessage(kind, state)
+        resolved = message.try_resolve_now()
+        if resolved is None:
+            resolved = await Future(coro=cast(Any, message).resolve())
+        self.send_message(resolved)
 
     def exception(self, obj: Exception) -> None: ...
 
@@ -1059,54 +1219,28 @@ class PortReceiver(Generic[R]):
     Receiver for messages sent through a communication channel.
 
     Handles receiving R-typed objects sent from a corresponding Port.
-    Asynchronously message reception with optional supervision
-    monitoring for error handling.
     """
 
     def __init__(
         self,
         mailbox: Mailbox,
         receiver: "PortReceiverBase",
-        monitor: "Optional[Shared[Exception]]" = None,
-        endpoint: Optional[str] = None,
     ) -> None:
         self._mailbox: Mailbox = mailbox
-        self._monitor = monitor
         self._receiver = receiver
-        self._endpoint = endpoint
-
-    def _tag_supervision_error(self, error: Exception) -> None:
-        """Tag supervision error with endpoint name if available."""
-        if self._endpoint is not None and isinstance(error, SupervisionError):
-            error.endpoint = self._endpoint
 
     async def _recv(self) -> R:
-        awaitable = self._receiver.recv_task()
-        if self._monitor is None:
-            result = await awaitable
-        else:
-            try:
-                result, i = await PythonTask.select_one(
-                    # type: ignore
-                    [self._monitor.task(), awaitable]
-                )
-            except Exception as e:
-                self._tag_supervision_error(e)
-                raise e
-            if i == 0:
-                self._tag_supervision_error(result)
-                raise result
-        return self._process(result)
+        return self._process(await self._receiver.recv_task())
 
     def _process(self, msg: PythonMessage) -> R:
-        # TODO: Try to do something more structured than a cast here
-        payload = cast(R, PicklingState(msg.message).unpickle())
+        payload = cast(R, msg.decode())
         match msg.kind:
+            # pyrefly: ignore [invalid-pattern]
             case PythonMessageKind.Result():
                 return payload
+            # pyrefly: ignore [invalid-pattern]
             case PythonMessageKind.Exception():
                 e = cast(Exception, payload)
-                self._tag_supervision_error(e)
                 raise e
             case _:
                 raise ValueError(f"Unexpected message kind: {msg.kind}")
@@ -1115,25 +1249,7 @@ class PortReceiver(Generic[R]):
         return Future(coro=self._recv())
 
     def ranked(self) -> "RankedPortReceiver[R]":
-        return RankedPortReceiver[R](
-            self._mailbox, self._receiver, self._monitor, self._endpoint
-        )
-
-    def _attach_supervision(
-        self, monitor: "Optional[Shared[Exception]]", endpoint: str
-    ) -> None:
-        """
-        Attach supervision monitoring to this port receiver.
-
-        Enables the receiver to detect and report errors on any supervision events.
-
-        Args:
-            monitor: Shared exception monitor that signals supervision errors
-                from the actor mesh. None if supervision is not enabled.
-            endpoint: Full endpoint name
-        """
-        self._monitor = monitor
-        self._endpoint = endpoint
+        return RankedPortReceiver[R](self._mailbox, self._receiver)
 
 
 class RankedPortReceiver(PortReceiver[Tuple[int, R]]):
@@ -1143,6 +1259,7 @@ class RankedPortReceiver(PortReceiver[Tuple[int, R]]):
             raise ValueError(
                 f"RankedPort receiver got a message without a rank {msg}",
             )
+        # pyrefly: ignore [bad-return]
         return rank, super()._process(msg)
 
 
@@ -1169,6 +1286,64 @@ class ActorInitArgs:
     args: Tuple[Any, ...]
 
 
+class _QueuePanicFlag:
+    """Panic flag for queue dispatch mode.
+
+    Unlike the DummyPanicFlag, this one stores the exception so it can
+    be re-raised after handle() returns, ensuring proper cleanup.
+    """
+
+    def __init__(self) -> None:
+        self.panic_exception: BaseException | None = None
+
+    def signal_panic(self, ex: BaseException) -> None:
+        self.panic_exception = ex
+
+
+async def _dispatch_loop(
+    actor: Any,
+    receiver: "Receiver[QueuedMessage]",
+    self_instance: "Instance",
+) -> None:
+    """
+    Message loop for queue-dispatch mode. Called from Rust Actor::init.
+
+    Args:
+        actor: The Python actor object that implements ``handle``.
+        receiver: Channel receiver for queued messages.
+        self_instance: The actor's own Instance, used to kill self on
+            an unhandled exception.
+    """
+    while True:
+        try:
+            msg = await receiver.recv()
+            await _handle_queued_message(actor, msg)
+        except asyncio.CancelledError:
+            return
+        except BaseException as e:
+            reason = "".join(TracebackException.from_exception(e).format())
+            self_instance.kill(reason)
+            raise
+
+
+async def _handle_queued_message(actor: Any, msg: "QueuedMessage") -> None:
+    """Handle a single queued message."""
+
+    panic_flag = _QueuePanicFlag()
+    await actor.handle(
+        msg.context,
+        msg.method,
+        msg.bytes,
+        panic_flag,  # pyre-ignore[6]: _QueuePanicFlag implements PanicFlag protocol
+        msg.local_state,
+        msg.refs,
+        msg.response_port,
+    )
+    # If a panic was signaled, re-raise it after handle() has cleaned up.
+    if panic_flag.panic_exception is not None:
+        raise panic_flag.panic_exception
+
+
 class _Actor:
     """
     This is the message handling implementation of a Python actor.
@@ -1184,19 +1359,6 @@ class _Actor:
     error handling.
     """
 
-    class QueuePanicFlag:
-        """Panic flag for queue dispatch mode.
-
-        Unlike the DummyPanicFlag, this one stores the exception so it can
-        be re-raised after handle() returns, ensuring proper cleanup.
-        """
-
-        def __init__(self) -> None:
-            self.panic_exception: BaseException | None = None
-
-        def signal_panic(self, ex: BaseException) -> None:
-            self.panic_exception = ex
-
     def __init__(self) -> None:
         self.instance: object | None = None
         # TODO: (@pzhang) remove this with T229200522
@@ -1210,6 +1372,7 @@ class _Actor:
         message: FrozenBuffer,
         panic_flag: PanicFlag,
         local_state: List[Any],
+        mesh_references: List[Any],
         response_port: "PortProtocol[Any]",
     ) -> None:
         MESSAGES_HANDLED.add(1)
@@ -1225,9 +1388,12 @@ class _Actor:
 
             DebugContext.set(DebugContext())
 
-            args, kwargs = PicklingState(message, local_state).unpickle()
+            args, kwargs = PicklingState(
+                message, local_state, mesh_references
+            ).unpickle()
 
             match method:
+                # pyrefly: ignore [invalid-pattern]
                 case MethodSpecifier.Init():
                     ins = ctx.actor_instance
                     (args,) = args
@@ -1268,8 +1434,10 @@ class _Actor:
                         raise
                     response_port.send(None)
                     return
+                # pyrefly: ignore [invalid-pattern]
                 case MethodSpecifier.ReturnsResponse():
                     pass
+                # pyrefly: ignore [invalid-pattern]
                 case MethodSpecifier.ExplicitPort():
                     args = (response_port, *args)
                     response_port = DroppingPort()
@@ -1298,23 +1466,36 @@ class _Actor:
 
             the_method, should_instrument, is_coro = self._method_cache[method_name]
 
-            if is_coro:
-                if should_instrument:
-                    with span(method_name):
-                        result = await the_method(*args, **kwargs)
-                else:
-                    result = await the_method(*args, **kwargs)
-                self._maybe_exit_debugger()
-            else:
-                with fake_sync_state():
+            # Bracket the real user-method invocation so the actor reports it
+            # as in-flight (PE-2: only the invocation, never Init/plumbing).
+            # The finally drains on normal return, exception, panic, and
+            # cancellation; `_execution_start` returns 0 (a no-op token) when
+            # the instance has no tracker.
+            token = ctx.actor_instance._execution_start(method_name)
+            try:
+                if is_coro:
                     if should_instrument:
                         with span(method_name):
-                            result = the_method(*args, **kwargs)
+                            result = await the_method(*args, **kwargs)
                     else:
-                        result = the_method(*args, **kwargs)
+                        result = await the_method(*args, **kwargs)
                     self._maybe_exit_debugger()
+                else:
+                    with fake_sync_state():
+                        if should_instrument:
+                            with span(method_name):
+                                result = the_method(*args, **kwargs)
+                        else:
+                            result = the_method(*args, **kwargs)
+                        self._maybe_exit_debugger()
+            finally:
+                ctx.actor_instance._execution_finish(token)
 
-            response_port.send(result)
+            response = response_port.resolve_and_send(result)
+            if isinstance(response, PythonTask):
+                await Future(coro=response)
+            else:
+                await response
         except Exception as e:
             log_endpoint_exception(e, method_name, ctx.actor_instance.actor_id)
             self._post_mortem_debug(e.__traceback__)
@@ -1409,16 +1590,17 @@ class _Actor:
             raise AssertionError(error_message)
 
         supervise = getattr(instance, "__supervise__", None)
-        if supervise is None:
-            # If there is no __supervise__ method, the default would be to return
-            # None. That means the supervision error is not handled and will be
-            # propagated to the next owner.
+        if not _is_user_override(supervise):
+            # If there is no __supervise__ override, the default is to return
+            # None. The supervision error is not handled here and will propagate
+            # to the next owner.
             return None
 
         if inspect.iscoroutinefunction(supervise):
             return await supervise(*args, **kwargs)
         else:
             with fake_sync_state():
+                # pyrefly: ignore [not-callable]
                 return supervise(*args, **kwargs)
 
     async def __cleanup__(self, cx: Context, exc: str | Exception | None) -> None:
@@ -1431,9 +1613,9 @@ class _Actor:
             # was never constructed
             return None
 
-        # Forward a call to supervise on this actor to the user-provided instance.
+        # Forward a call to cleanup on this actor to the user-provided instance.
         cleanup = getattr(instance, "__cleanup__", None)
-        if cleanup is None:
+        if not _is_user_override(cleanup):
             return None
 
         if isinstance(exc, str):
@@ -1447,56 +1629,46 @@ class _Actor:
             return await cleanup(exc)
         else:
             with fake_sync_state():
+                # pyrefly: ignore [not-callable]
                 return cleanup(exc)
-
-    async def _dispatch_loop(
-        self,
-        receiver: "Receiver[QueuedMessage]",
-        error_port: "PortHandle",
-    ) -> None:
-        """
-        Message loop for queue-dispatch mode. Called from Rust Actor::init.
-
-        Args:
-            receiver: Channel receiver for queued messages
-            error_port: Port to send errors to for actor supervision
-        """
-        while True:
-            msg = await receiver.recv()
-            try:
-                await self._handle_queued_message(msg)
-            except BaseException as e:
-                state = pickle(
-                    e, allow_pending_pickles=False, allow_tensor_engine_references=False
-                )
-                error_msg = PythonMessage(
-                    PythonMessageKind.Exception(rank=None),
-                    state.buffer(),
-                )
-                error_port.send(msg.context.actor_instance, error_msg)
-                raise
-
-    async def _handle_queued_message(self, msg: "QueuedMessage") -> None:
-        """Handle a single queued message."""
-
-        panic_flag = self.QueuePanicFlag()
-        await self.handle(
-            msg.context,
-            msg.method,
-            msg.bytes,
-            panic_flag,  # pyre-ignore[6]: QueuePanicFlag implements PanicFlag protocol
-            msg.local_state,
-            msg.response_port,
-        )
-        # If a panic was signaled, re-raise it after handle() has cleaned up
-        if panic_flag.panic_exception is not None:
-            raise panic_flag.panic_exception
 
     def __repr__(self) -> str:
         return f"_Actor(instance={self.instance!r})"
 
 
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def _doc_stub(fn: F) -> F:
+    """Mark a method on ``Actor`` as a documentation-only stub.
+
+    The base class declares ``__cleanup__`` and ``__supervise__`` so that
+    ``help()`` and IDEs can surface the docstring, but subclasses that do
+    not override them must be treated as if they provided no implementation.
+    Runtime code that detects user overrides (the sync/async endpoint check
+    in :class:`ActorMesh` and the dispatch in :class:`_Actor`) consults this
+    marker and ignores stub-marked methods.
+    """
+    # pyre-ignore[16]: function attributes are dynamic
+    fn._monarch_doc_stub = True
+    return fn
+
+
+def _is_user_override(method: Any) -> bool:
+    """Return True if ``method`` is a real user override, not a doc stub."""
+    return method is not None and not getattr(method, "_monarch_doc_stub", False)
+
+
 class Actor(MeshTrait):
+    """Base class for actors.
+
+    Subclass ``Actor`` to define an actor, and decorate the methods that form
+    its public API with ``@endpoint``. Actors are spawned onto a ``ProcMesh``
+    (for example with ``this_proc().spawn(...)``), after which their endpoints
+    are invoked remotely through the messaging adverbs. Each actor processes its
+    messages sequentially and participates in the supervision tree.
+    """
+
     @functools.cached_property
     def logger(cls) -> logging.Logger:
         lgr = logging.getLogger(cls.__class__.__name__)
@@ -1515,6 +1687,7 @@ class Actor(MeshTrait):
             "actor implementations are not meshes, but we can't convince the typechecker of it..."
         )
 
+    # pyrefly: ignore [not-a-type]
     def _new_with_shape(self, shape: Shape) -> Self:
         raise NotImplementedError(
             "actor implementations are not meshes, but we can't convince the typechecker of it..."
@@ -1537,13 +1710,22 @@ class Actor(MeshTrait):
         # Return False to indicate that the undeliverable message was not handled.
         return False
 
+    @_doc_stub
     def __supervise__(self, failure: MeshFailure) -> bool:
-        """Called when the actor is stopped due to a failure in a resource that it
+        """Called when the actor observes a failure in a resource that it
         owns. A resource is a host, proc, actor, or meshes of these.
         If a truthy value is returned, the failure is considered handled and will not
         propagate any further. If a falsey value is returned, the failure will be
         further sent to the owner of this Actor.
         Note that this is *not* called for errors within this Actor.
+
+        Rank failures in an owned ``ActorMesh`` are reported independently. A
+        mesh with ``N`` ranks may call this method multiple times for that mesh,
+        but it will call at most once per failed rank, for at most ``N`` total
+        rank-scoped failure callbacks. Once ``N`` callbacks have arrived for a
+        mesh, no more rank-scoped failure callbacks should arrive for that mesh.
+        If only some ranks fail, the mesh remains usable through slices that
+        exclude the failed ranks.
 
         Overrides may be declared with either ``def`` or ``async def``. An
         ``async def`` override is awaited on the actor's asyncio event loop --
@@ -1553,17 +1735,45 @@ class Actor(MeshTrait):
         the exception is treated as a new supervision event chained to the
         one being handled, matching the ``__exit__`` convention of context
         managers.
-        """
-        return False
 
-    # This method can be sync or async, and thus there is no way to have a common
-    # super implementation.
-    # def __cleanup__(self, exc: str | Exception | None) -> None:
-    #     """Runs any cleanup of resources that should happen when the Actor is stopped or fails.
-    #     This is called even if there is an error.
-    #     It is *not* called in cases of fatal errors, which include (but are not limited to):
-    #     OOMs, panics, signals like SIGSEGV, etc."""
-    #     pass
+        This method is documentation-only on ``Actor``; subclasses provide the
+        real implementation.
+        """
+        ...
+
+    @_doc_stub
+    def __cleanup__(self, exc: Exception | None) -> None:
+        """Called when the actor stops, normally (via ``ActorMesh.stop()``) or
+        because of an error. The same ``__cleanup__`` runs in both cases;
+        ``exc`` is ``None`` on a normal stop and carries the exception on an
+        error stop. It is *not* called on fatal failures such as OOMs, panics,
+        or signals like ``SIGSEGV``. If it exceeds ``HYPERACTOR_CLEANUP_TIMEOUT``,
+        it is cancelled and the actor is placed in an error state.
+
+        By the time this runs, every mesh this actor owns has already been
+        stopped recursively, and each owned actor's ``__cleanup__`` has already
+        run. Owned actor meshes and proc meshes are no longer usable from this
+        method. For shutdown work that needs an owned mesh, expose a dedicated
+        endpoint and call it before ``stop()``.
+
+        Use ``__cleanup__`` to release resources the actor owns directly: open
+        files, network connections, background threads, asyncio tasks, and the
+        like -- not other actors or procs.
+
+        Overrides may be declared with either ``def`` or ``async def``; the
+        async-ness must match the actor's endpoints. Actors with sync endpoints
+        require a sync ``__cleanup__``; actors with async endpoints require an
+        async ``__cleanup__``. An ``async def`` override is awaited on the
+        actor's asyncio event loop -- the same loop that runs endpoint
+        coroutines -- so it can ``await`` other endpoints or I/O. A sync
+        override runs under ``fake_sync_state`` and cannot call
+        ``asyncio.get_running_loop``. If the override raises, the exception
+        becomes a supervision event and will notify the owner.
+
+        This method is documentation-only on ``Actor``; subclasses provide the
+        real implementation.
+        """
+        ...
 
 
 class ActorMesh(MeshTrait, Generic[T]):
@@ -1617,6 +1827,7 @@ class ActorMesh(MeshTrait, Generic[T]):
                     self,
                     attr_name,
                     self._endpoint(
+                        # pyrefly: ignore [bad-argument-count, bad-argument-type]
                         kind(attr_name),
                         attr_value._method,
                         attr_value._propagator,
@@ -1626,7 +1837,7 @@ class ActorMesh(MeshTrait, Generic[T]):
                     async_endpoints.append(attr_name)
                 else:
                     sync_endpoints.append(attr_name)
-            if attr_name == "__cleanup__" and attr_value is not None:
+            if attr_name == "__cleanup__" and _is_user_override(attr_value):
                 async_cleanup = inspect.iscoroutinefunction(attr_value)
 
         if sync_endpoints and async_endpoints:
@@ -1641,12 +1852,12 @@ class ActorMesh(MeshTrait, Generic[T]):
                 "Synchronous endpoints cannot be mixed with async endpoints because they can cause the asyncio loop to deadlock if they wait."
                 f"sync: {sync_endpoints}"
             )
-        # Check for False explicitly because None means there is no cleanup.
+        # Check for False explicitly because None means there is no override.
         if async_endpoints and async_cleanup is False:
             raise ValueError(
                 f"{self._class} has async endpoints, but a synchronous __cleanup__. Make sure __cleanup__ is also async."
                 "Synchronous endpoints cannot be mixed with async endpoints because they can cause the asyncio loop to deadlock if they wait."
-                f"sync: {sync_endpoints}"
+                f"async: {async_endpoints}"
             )
 
     def __getattr__(self, attr: str) -> NotAnEndpoint:
@@ -1686,6 +1897,7 @@ class ActorMesh(MeshTrait, Generic[T]):
         return self._shape.ndslice
 
     @property
+    # pyrefly: ignore [bad-override]
     def _labels(self) -> Iterable[str]:
         return self._shape.labels
 
@@ -1746,14 +1958,20 @@ class ActorError(Exception):
 
 
 def current_actor_name() -> str:
+    """Return the actor id of the currently executing actor as a string."""
     return str(context().actor_instance.actor_id)
 
 
 def current_rank() -> Point:
+    """Return the current message's position within its mesh as a ``Point``."""
     return context().message_rank
 
 
 def current_size() -> Dict[str, int]:
+    """Return the size of each mesh dimension for the current message.
+
+    The result maps each dimension label to the number of actors along it.
+    """
     r = context().message_rank.extent
     return {k: r[k] for k in r}
 
@@ -1771,7 +1989,7 @@ class RootClientActor(Actor):
         from monarch.actor import unhandled_fault_hook  # pyre-ignore
 
         try:
-            unhandled_fault_hook(failure)  # pyre-ignore
+            unhandled_fault_hook(failure)
         except BaseException as e:  # noqa: B036 - catch SystemExit from sys.exit; re-raised wrapped
             pid = os.getpid()
             hostname = socket.gethostname()
@@ -1784,7 +2002,7 @@ class RootClientActor(Actor):
             sys.stderr.write(message)
             sys.stderr.flush()
 
-            from monarch._rust_bindings.monarch_hyperactor.telemetry import (  # pyre-ignore
+            from monarch._rust_bindings.monarch_hyperactor.telemetry import (
                 instant_event,
             )
 
@@ -1800,7 +2018,6 @@ class RootClientActor(Actor):
         kwargs = {}
         state = pickle(
             (args, kwargs),
-            allow_pending_pickles=False,
             allow_tensor_engine_references=False,
         )
         return state.buffer()

@@ -9,15 +9,14 @@
 // RDMA requires frequent unsafe code blocks
 #![allow(clippy::undocumented_unsafe_blocks)]
 
-use std::sync::Arc;
-
-use local_memory::RdmaLocalMemory;
+use local_memory::KeepaliveLocalMemory;
 use serde::Deserialize;
 use serde::Serialize;
 
 #[macro_use]
 mod macros;
 
+mod action;
 pub mod backend;
 #[cfg(not(feature = "hixl"))]
 pub mod config;
@@ -25,9 +24,12 @@ pub mod config;
 pub mod device_selection;
 #[cfg(not(feature = "hixl"))]
 pub mod efa;
+mod errors;
 pub mod local_memory;
 mod rdma_components;
 mod rdma_manager_actor;
+mod rdma_manager_owner;
+mod rdma_runtime;
 
 #[cfg(not(feature = "hixl"))]
 pub use backend::ibverbs::primitives::*;
@@ -40,11 +42,21 @@ pub use backend::ibverbs::primitives::*;
 pub fn rdma_supported() -> bool {
     ibverbs_supported() || hyperactor_config::global::get(config::RDMA_ALLOW_TCP_FALLBACK)
 }
+pub use action::RdmaAction;
+// Re-export the CUDA segment scanner API for the extension/test crates to
+// install a process-wide scanner (see `backend::ibverbs::mlx_domain`).
+#[cfg(not(feature = "hixl"))]
+pub use backend::ibverbs::mlx_domain::CudaSegmentScanner;
+#[cfg(not(feature = "hixl"))]
+pub use backend::ibverbs::mlx_domain::ScannedSegment;
+#[cfg(not(feature = "hixl"))]
+pub use backend::ibverbs::mlx_domain::register_cuda_segment_scanner;
+pub use errors::RdmaInitError;
 pub use rdma_components::RdmaRemoteBuffer;
-pub use rdma_components::SegmentScannerFn;
-pub use rdma_components::register_segment_scanner;
 pub use rdma_components::*;
 pub use rdma_manager_actor::*;
+pub use rdma_manager_owner::*;
+// Re-export rdmaxcel_sys for extension crate to access types
 #[cfg(not(feature = "hixl"))]
 pub use rdmaxcel_sys;
 #[cfg(not(feature = "hixl"))]
@@ -61,17 +73,14 @@ pub enum RdmaOpType {
 #[derive(Debug)]
 pub struct RdmaOp {
     pub op_type: RdmaOpType,
-    pub local: Arc<dyn RdmaLocalMemory>,
+    pub local: KeepaliveLocalMemory,
     pub remote: RdmaRemoteBuffer,
 }
 
 /// Transport level for single-sided communication, ordered slowest to fastest.
 ///
-/// Used to describe or select the underlying interconnect.
-/// On GPU: typically `Nic` (RoCE/InfiniBand via rdmaxcel).
-/// On NPU: `Nic` for inter-supernode (RDMA/RoCE via HIXL),
-///          `Hccs` for intra-supernode (HCCS via HIXL),
-///          chosen automatically by the HIXL library based on topology.
+/// HiXL reports `Nic` for RoCE and `Hccs` for the Ascend intra-supernode
+/// interconnect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RdmaTransportLevel {
     /// TCP/IP sockets (fallback transport).

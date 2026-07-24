@@ -34,7 +34,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 
+use super::ActiveHandler;
+use super::Execution;
 use super::FailureInfo;
+use super::InboundOrdering;
 use super::NodePayload;
 use super::NodeProperties;
 use super::NodeRef;
@@ -149,13 +152,31 @@ pub enum NodePropertiesDto {
     Actor {
         actor_status: String,
         actor_type: String,
+        /// Stable per-instance Uuid::now_v7() identity assigned at
+        /// `Instance::new` (string form).
+        instance_id: String,
         messages_processed: u64,
         created_at: Option<String>,
         last_message_handler: Option<String>,
         total_processing_time_us: u64,
+        /// Accepted handler work not yet dequeued by the actor loop
+        /// (PD-5a/b in `hyperactor::proc`). Independent diagnostic from
+        /// `inbound_ordering`; no arithmetic contract -- see IO-3 in
+        /// `hyperactor::introspect`.
+        queue_depth: u64,
         flight_recorder: Option<String>,
         is_system: bool,
+        /// Per-session reorder-buffer state. `None` means no snapshot
+        /// callback installed (IO-1 structural absence);
+        /// `Some({enabled: false, ...})` means buffering disabled;
+        /// `Some({enabled: true, ...})` means active. See IO-1 in
+        /// `hyperactor::introspect`.
+        inbound_ordering: Option<Box<InboundOrderingDto>>,
         failure_info: Option<FailureInfoDto>,
+        /// In-flight handler execution. `null` means the actor does not
+        /// report execution (unsupported), not idle. See EX-* in
+        /// `hyperactor_mesh::introspect`.
+        execution: Option<Box<ExecutionDto>>,
     },
     /// Error sentinel returned when a child reference cannot be resolved.
     Error { code: String, message: String },
@@ -175,6 +196,92 @@ pub struct FailureInfoDto {
     pub occurred_at: String,
     /// Whether this failure was propagated from a child.
     pub is_propagated: bool,
+}
+
+/// Per-session reorder-buffer snapshot at the HTTP boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "OrderingSessionSnapshot")]
+pub struct OrderingSessionSnapshotDto {
+    /// Session identifier (UUID string form).
+    pub session_id: String,
+    /// Session owner actor address (string form; `None` only in rare
+    /// bypass paths).
+    pub sender: Option<String>,
+    /// Highest seq released from the reorder buffer into the actor
+    /// work queue.
+    pub last_released_seq: u64,
+    /// `last_released_seq.saturating_add(1)`.
+    pub expected_next_seq: u64,
+    /// Messages held in the reorder buffer waiting for a seq gap.
+    pub buffered_count: usize,
+    /// Lowest seq currently buffered. `None` when `buffered_count == 0`.
+    pub oldest_buffered_seq: Option<u64>,
+    /// Highest seq currently buffered. `None` when `buffered_count == 0`.
+    pub newest_buffered_seq: Option<u64>,
+}
+
+/// Mesh-admin presentation of inbound ordering state.
+///
+/// Rollups marked `returned_*` are computed over `sessions` only and
+/// are LOWER BOUNDS when `snapshot_complete == false` (IO-6).
+/// `known_session_count` is the only rollup that totals returned +
+/// skipped sessions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "InboundOrdering")]
+pub struct InboundOrderingDto {
+    /// `true` when reorder buffering is enabled for this sender.
+    pub enabled: bool,
+    /// IO-4: `true` iff `skipped_session_count == 0`.
+    pub snapshot_complete: bool,
+    /// Sessions held by a concurrent send at snapshot time.
+    pub skipped_session_count: usize,
+    /// IO-5: `sessions.len() + skipped_session_count`. The only rollup
+    /// that totals returned + skipped sessions.
+    pub known_session_count: usize,
+    /// IO-6: sessions with `buffered_count > 0` AMONG RETURNED
+    /// sessions. Lower bound if `!snapshot_complete`.
+    pub returned_buffered_session_count: usize,
+    /// IO-6: sum of `buffered_count` OVER RETURNED sessions.
+    /// Reorder-buffer scope only (independent of `queue_depth`; see
+    /// IO-3). Lower bound if `!snapshot_complete`.
+    pub returned_buffered_message_count: usize,
+    /// IO-6: max of `buffered_count` OVER RETURNED sessions. Lower
+    /// bound if `!snapshot_complete`.
+    pub returned_max_buffered_count: usize,
+    /// Per-session entries, sorted by `session_id`.
+    pub sessions: Vec<OrderingSessionSnapshotDto>,
+}
+
+/// One handler with in-flight invocations, at the HTTP boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "ActiveHandler")]
+pub struct ActiveHandlerDto {
+    /// Handler name (e.g. a Python endpoint method name).
+    pub name: String,
+    /// In-flight invocations of this handler.
+    pub active_count: u64,
+    /// Start time of the oldest in-flight invocation (ISO 8601 string).
+    pub oldest_since: String,
+}
+
+/// An actor's in-flight handler execution at the HTTP boundary.
+///
+/// `null` (absent) means the actor does not report execution
+/// (unsupported), not idle (EX-1). `complete == false` means the
+/// per-handler detail was momentarily unavailable on that read while
+/// `active_count` stays authoritative (EX-2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "Execution")]
+pub struct ExecutionDto {
+    /// Handler invocations currently in flight (EX-2/EX-3).
+    pub active_count: u64,
+    /// Per-handler detail, oldest-first; a prefix of the N oldest when
+    /// `truncated` (EX-4).
+    pub active_handlers: Vec<ActiveHandlerDto>,
+    /// `true` iff the per-handler detail was captured on this read.
+    pub complete: bool,
+    /// `true` iff `active_handlers` is a prefix of the N oldest.
+    pub truncated: bool,
 }
 
 // Helpers
@@ -272,23 +379,32 @@ impl From<NodeProperties> for NodePropertiesDto {
             NodeProperties::Actor {
                 actor_status,
                 actor_type,
+                instance_id,
                 messages_processed,
                 created_at,
                 last_message_handler,
                 total_processing_time_us,
+                queue_depth,
                 flight_recorder,
                 is_system,
+                inbound_ordering,
                 failure_info,
+                execution,
             } => Self::Actor {
                 actor_status,
                 actor_type,
+                instance_id,
                 messages_processed,
                 created_at: created_at.as_ref().map(format_time),
                 last_message_handler,
                 total_processing_time_us,
+                queue_depth,
                 flight_recorder,
                 is_system,
+                inbound_ordering: inbound_ordering
+                    .map(|io| Box::new(InboundOrderingDto::from(*io))),
                 failure_info: failure_info.map(Into::into),
+                execution: execution.map(|e| Box::new(ExecutionDto::from(*e))),
             },
             NodeProperties::Error { code, message } => Self::Error { code, message },
         }
@@ -303,6 +419,56 @@ impl From<FailureInfo> for FailureInfoDto {
             root_cause_name: f.root_cause_name,
             occurred_at: format_time(&f.occurred_at),
             is_propagated: f.is_propagated,
+        }
+    }
+}
+
+impl From<hyperactor::ordering::OrderingSessionSnapshot> for OrderingSessionSnapshotDto {
+    fn from(s: hyperactor::ordering::OrderingSessionSnapshot) -> Self {
+        Self {
+            session_id: s.session_id.to_string(),
+            sender: s.sender.as_ref().map(|a| a.to_string()),
+            last_released_seq: s.last_released_seq,
+            expected_next_seq: s.expected_next_seq,
+            buffered_count: s.buffered_count,
+            oldest_buffered_seq: s.oldest_buffered_seq,
+            newest_buffered_seq: s.newest_buffered_seq,
+        }
+    }
+}
+
+impl From<InboundOrdering> for InboundOrderingDto {
+    fn from(o: InboundOrdering) -> Self {
+        Self {
+            enabled: o.enabled,
+            snapshot_complete: o.snapshot_complete,
+            skipped_session_count: o.skipped_session_count,
+            known_session_count: o.known_session_count,
+            returned_buffered_session_count: o.returned_buffered_session_count,
+            returned_buffered_message_count: o.returned_buffered_message_count,
+            returned_max_buffered_count: o.returned_max_buffered_count,
+            sessions: o.sessions.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<Execution> for ExecutionDto {
+    fn from(e: Execution) -> Self {
+        Self {
+            active_count: e.active_count,
+            active_handlers: e.active_handlers.into_iter().map(Into::into).collect(),
+            complete: e.complete,
+            truncated: e.truncated,
+        }
+    }
+}
+
+impl From<ActiveHandler> for ActiveHandlerDto {
+    fn from(h: ActiveHandler) -> Self {
+        Self {
+            name: h.name,
+            active_count: h.active_count,
+            oldest_since: format_time(&h.oldest_since),
         }
     }
 }
@@ -401,16 +567,21 @@ impl TryFrom<NodePropertiesDto> for NodeProperties {
             NodePropertiesDto::Actor {
                 actor_status,
                 actor_type,
+                instance_id,
                 messages_processed,
                 created_at,
                 last_message_handler,
                 total_processing_time_us,
+                queue_depth,
                 flight_recorder,
                 is_system,
+                inbound_ordering,
                 failure_info,
+                execution,
             } => Self::Actor {
                 actor_status,
                 actor_type,
+                instance_id,
                 messages_processed,
                 created_at: created_at
                     .map(|s| {
@@ -420,12 +591,21 @@ impl TryFrom<NodePropertiesDto> for NodeProperties {
                     .transpose()?,
                 last_message_handler,
                 total_processing_time_us,
+                queue_depth,
                 flight_recorder,
                 is_system,
+                inbound_ordering: inbound_ordering
+                    .map(|dto| InboundOrdering::try_from(*dto).map(Box::new))
+                    .transpose()
+                    .context("failed to parse Actor.inbound_ordering")?,
                 failure_info: failure_info
                     .map(TryInto::try_into)
                     .transpose()
                     .context("failed to parse Actor.failure_info")?,
+                execution: execution
+                    .map(|dto| Execution::try_from(*dto).map(Box::new))
+                    .transpose()
+                    .context("failed to parse Actor.execution")?,
             },
             NodePropertiesDto::Error { code, message } => Self::Error { code, message },
         })
@@ -456,25 +636,114 @@ impl TryFrom<FailureInfoDto> for FailureInfo {
     }
 }
 
+impl TryFrom<ExecutionDto> for Execution {
+    type Error = anyhow::Error;
+
+    fn try_from(dto: ExecutionDto) -> Result<Self, Self::Error> {
+        Ok(Self {
+            active_count: dto.active_count,
+            active_handlers: dto
+                .active_handlers
+                .into_iter()
+                .map(ActiveHandler::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            complete: dto.complete,
+            truncated: dto.truncated,
+        })
+    }
+}
+
+impl TryFrom<ActiveHandlerDto> for ActiveHandler {
+    type Error = anyhow::Error;
+
+    fn try_from(dto: ActiveHandlerDto) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: dto.name,
+            active_count: dto.active_count,
+            oldest_since: humantime::parse_rfc3339(&dto.oldest_since).with_context(|| {
+                format!(
+                    "failed to parse ActiveHandler.oldest_since: {:?}",
+                    dto.oldest_since
+                )
+            })?,
+        })
+    }
+}
+
+impl TryFrom<OrderingSessionSnapshotDto> for hyperactor::ordering::OrderingSessionSnapshot {
+    type Error = anyhow::Error;
+
+    fn try_from(dto: OrderingSessionSnapshotDto) -> Result<Self, Self::Error> {
+        let session_id = dto.session_id.parse().with_context(|| {
+            format!(
+                "failed to parse OrderingSessionSnapshot.session_id: {:?}",
+                dto.session_id
+            )
+        })?;
+        let sender = dto
+            .sender
+            .as_ref()
+            .map(|s| {
+                s.parse().with_context(|| {
+                    format!("failed to parse OrderingSessionSnapshot.sender: {s:?}")
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            session_id,
+            sender,
+            last_released_seq: dto.last_released_seq,
+            expected_next_seq: dto.expected_next_seq,
+            buffered_count: dto.buffered_count,
+            oldest_buffered_seq: dto.oldest_buffered_seq,
+            newest_buffered_seq: dto.newest_buffered_seq,
+        })
+    }
+}
+
+impl TryFrom<InboundOrderingDto> for InboundOrdering {
+    type Error = anyhow::Error;
+
+    fn try_from(dto: InboundOrderingDto) -> Result<Self, Self::Error> {
+        let sessions: Vec<hyperactor::ordering::OrderingSessionSnapshot> = dto
+            .sessions
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| {
+                s.try_into()
+                    .with_context(|| format!("failed to parse InboundOrdering.sessions[{i}]"))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            enabled: dto.enabled,
+            snapshot_complete: dto.snapshot_complete,
+            skipped_session_count: dto.skipped_session_count,
+            known_session_count: dto.known_session_count,
+            returned_buffered_session_count: dto.returned_buffered_session_count,
+            returned_buffered_message_count: dto.returned_buffered_message_count,
+            returned_max_buffered_count: dto.returned_max_buffered_count,
+            sessions,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh_id::ResourceId;
 
     // Test fixtures
 
     fn test_proc_id() -> hyperactor::ProcAddr {
-        hyperactor::ProcAddr::from_resource_name(
-            hyperactor::channel::ChannelAddr::Local(0),
-            "worker",
-        )
+        ResourceId::proc_addr_from_name(hyperactor::channel::ChannelAddr::Local(0), "worker")
     }
 
     fn test_actor_id() -> hyperactor::ActorAddr {
-        test_proc_id().actor_id("actor")
+        test_proc_id().actor_addr("actor")
     }
 
     fn test_host_actor_id() -> hyperactor::ActorAddr {
-        test_proc_id().actor_id("host_agent")
+        test_proc_id().actor_addr("host_agent")
     }
 
     fn test_time() -> SystemTime {
@@ -534,19 +803,28 @@ mod tests {
         }
     }
 
+    fn test_instance_id() -> String {
+        // Stable test UUID; round-trip tests don't care about the value.
+        "01900000-0000-7000-8000-000000000001".to_string()
+    }
+
     fn make_actor_payload_no_failure() -> NodePayload {
         NodePayload {
             identity: NodeRef::Actor(test_actor_id()),
             properties: NodeProperties::Actor {
                 actor_status: "running".to_string(),
                 actor_type: "MyActor".to_string(),
+                instance_id: test_instance_id(),
                 messages_processed: 42,
                 created_at: Some(test_time()),
                 last_message_handler: Some("handle_msg".to_string()),
                 total_processing_time_us: 1500,
+                queue_depth: 0,
                 flight_recorder: None,
                 is_system: false,
+                inbound_ordering: None,
                 failure_info: None,
+                execution: None,
             },
             children: vec![],
             parent: Some(NodeRef::Proc(test_proc_id())),
@@ -560,12 +838,15 @@ mod tests {
             properties: NodeProperties::Actor {
                 actor_status: "failed".to_string(),
                 actor_type: "MyActor".to_string(),
+                instance_id: test_instance_id(),
                 messages_processed: 10,
                 created_at: Some(test_time()),
                 last_message_handler: None,
                 total_processing_time_us: 500,
+                queue_depth: 0,
                 flight_recorder: Some("trace-abc".to_string()),
                 is_system: true,
+                inbound_ordering: None,
                 failure_info: Some(FailureInfo {
                     error_message: "boom".to_string(),
                     root_cause_actor: test_actor_id(),
@@ -573,6 +854,7 @@ mod tests {
                     occurred_at: test_time_2(),
                     is_propagated: true,
                 }),
+                execution: None,
             },
             children: vec![],
             parent: Some(NodeRef::Proc(test_proc_id())),
@@ -586,13 +868,112 @@ mod tests {
             properties: NodeProperties::Actor {
                 actor_status: "idle".to_string(),
                 actor_type: "MinimalActor".to_string(),
+                instance_id: test_instance_id(),
                 messages_processed: 0,
                 created_at: None,
                 last_message_handler: None,
                 total_processing_time_us: 0,
+                queue_depth: 0,
                 flight_recorder: None,
                 is_system: false,
+                inbound_ordering: None,
                 failure_info: None,
+                execution: None,
+            },
+            children: vec![],
+            parent: Some(NodeRef::Proc(test_proc_id())),
+            as_of: test_time(),
+        }
+    }
+
+    fn make_ordering_session(
+        session_id: uuid::Uuid,
+        last_released_seq: u64,
+        buffered_count: usize,
+    ) -> hyperactor::ordering::OrderingSessionSnapshot {
+        let (oldest, newest) = if buffered_count > 0 {
+            (
+                Some(last_released_seq + 2),
+                Some(last_released_seq + 1 + buffered_count as u64),
+            )
+        } else {
+            (None, None)
+        };
+        hyperactor::ordering::OrderingSessionSnapshot {
+            session_id,
+            sender: Some(test_actor_id()),
+            last_released_seq,
+            expected_next_seq: last_released_seq.saturating_add(1),
+            buffered_count,
+            oldest_buffered_seq: oldest,
+            newest_buffered_seq: newest,
+        }
+    }
+
+    fn make_actor_payload_inbound_ordering_complete() -> NodePayload {
+        NodePayload {
+            identity: NodeRef::Actor(test_actor_id()),
+            properties: NodeProperties::Actor {
+                actor_status: "running".to_string(),
+                actor_type: "MyActor".to_string(),
+                instance_id: test_instance_id(),
+                messages_processed: 17,
+                created_at: Some(test_time()),
+                last_message_handler: Some("handle_msg".to_string()),
+                total_processing_time_us: 900,
+                queue_depth: 5,
+                flight_recorder: None,
+                is_system: false,
+                inbound_ordering: Some(Box::new(InboundOrdering {
+                    enabled: true,
+                    snapshot_complete: true,
+                    skipped_session_count: 0,
+                    known_session_count: 2,
+                    returned_buffered_session_count: 1,
+                    returned_buffered_message_count: 3,
+                    returned_max_buffered_count: 3,
+                    sessions: vec![
+                        make_ordering_session(uuid::Uuid::from_u128(1), 7, 0),
+                        make_ordering_session(uuid::Uuid::from_u128(2), 1, 3),
+                    ],
+                })),
+                failure_info: None,
+                execution: None,
+            },
+            children: vec![],
+            parent: Some(NodeRef::Proc(test_proc_id())),
+            as_of: test_time(),
+        }
+    }
+
+    fn make_actor_payload_inbound_ordering_partial() -> NodePayload {
+        NodePayload {
+            identity: NodeRef::Actor(test_actor_id()),
+            properties: NodeProperties::Actor {
+                actor_status: "running".to_string(),
+                actor_type: "MyActor".to_string(),
+                instance_id: test_instance_id(),
+                messages_processed: 17,
+                created_at: Some(test_time()),
+                last_message_handler: Some("handle_msg".to_string()),
+                total_processing_time_us: 900,
+                queue_depth: 5,
+                flight_recorder: None,
+                is_system: false,
+                inbound_ordering: Some(Box::new(InboundOrdering {
+                    enabled: true,
+                    snapshot_complete: false,
+                    skipped_session_count: 2,
+                    // IO-5: 1 returned + 2 skipped = 3.
+                    known_session_count: 3,
+                    // IO-6: rollups over the one returned session only.
+                    returned_buffered_session_count: 1,
+                    returned_buffered_message_count: 4,
+                    returned_max_buffered_count: 4,
+                    sessions: vec![make_ordering_session(uuid::Uuid::from_u128(7), 0, 4)],
+                })),
+                failure_info: None,
+                execution: None,
             },
             children: vec![],
             parent: Some(NodeRef::Proc(test_proc_id())),
@@ -656,6 +1037,80 @@ mod tests {
     #[test]
     fn test_round_trip_actor_minimal() {
         assert_round_trip(&make_actor_payload_minimal());
+    }
+
+    /// HB-1 + HB-2 + IO-4 + IO-5: Actor with a complete inbound-ordering
+    /// snapshot round-trips. Exercises the `Some({enabled: true,
+    /// snapshot_complete: true, ...})` branch of IO-1 plus the IO-4
+    /// derivation and IO-5 totality (`known_session_count ==
+    /// sessions.len()` when no skipped).
+    #[test]
+    fn test_round_trip_actor_inbound_ordering_complete() {
+        let payload = make_actor_payload_inbound_ordering_complete();
+        // Assert the fixture itself satisfies IO-4 / IO-5 before
+        // round-tripping, so a bug in the fixture can't pass for the
+        // wrong reason.
+        if let NodeProperties::Actor {
+            inbound_ordering: Some(io),
+            ..
+        } = &payload.properties
+        {
+            assert_eq!(io.snapshot_complete, io.skipped_session_count == 0); // IO-4
+            assert_eq!(
+                io.known_session_count,
+                io.sessions.len() + io.skipped_session_count
+            ); // IO-5
+        } else {
+            panic!("fixture must be Actor with Some(inbound_ordering)");
+        }
+        assert_round_trip(&payload);
+    }
+
+    /// HB-1 + HB-2 + IO-4 + IO-5 + IO-6: Actor with a PARTIAL
+    /// inbound-ordering snapshot round-trips and the rollups reflect
+    /// returned sessions only. `skipped_session_count > 0` forces
+    /// IO-4's `snapshot_complete == false`, IO-5's
+    /// `known_session_count == returned + skipped`, and IO-6's
+    /// returned-only rollups (NOT computed over the skipped sessions
+    /// the snapshot doesn't carry).
+    #[test]
+    fn test_round_trip_actor_inbound_ordering_partial() {
+        let payload = make_actor_payload_inbound_ordering_partial();
+        if let NodeProperties::Actor {
+            inbound_ordering: Some(io),
+            ..
+        } = &payload.properties
+        {
+            // IO-4: false because skipped > 0.
+            assert!(!io.snapshot_complete);
+            assert_eq!(io.snapshot_complete, io.skipped_session_count == 0);
+            // IO-5: total includes skipped.
+            assert_eq!(
+                io.known_session_count,
+                io.sessions.len() + io.skipped_session_count
+            );
+            // IO-6: rollups over RETURNED sessions only -- NOT over
+            // returned + skipped.
+            assert_eq!(
+                io.returned_buffered_session_count,
+                io.sessions.iter().filter(|s| s.buffered_count > 0).count()
+            );
+            assert_eq!(
+                io.returned_buffered_message_count,
+                io.sessions.iter().map(|s| s.buffered_count).sum::<usize>()
+            );
+            assert_eq!(
+                io.returned_max_buffered_count,
+                io.sessions
+                    .iter()
+                    .map(|s| s.buffered_count)
+                    .max()
+                    .unwrap_or(0)
+            );
+        } else {
+            panic!("fixture must be Actor with Some(inbound_ordering)");
+        }
+        assert_round_trip(&payload);
     }
 
     /// HB-2: Error variant round-trips.
